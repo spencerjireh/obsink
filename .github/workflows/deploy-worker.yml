@@ -1,0 +1,109 @@
+name: Deploy Worker
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'worker/**'
+      - 'infra/terraform/**'
+      - 'scripts/render-worker-config.sh'
+      - '.github/workflows/deploy-worker.yml'
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: |
+            worker/package-lock.json
+            desktop/package-lock.json
+      - name: Install Linux dependencies for Tauri
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libappindicator3-dev librsvg2-dev patchelf
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Test core
+        run: cargo test -p obsink-core
+      - name: Install worker dependencies
+        working-directory: worker
+        run: npm ci
+      - name: Typecheck worker
+        working-directory: worker
+        run: npm run typecheck
+      - name: Test worker
+        working-directory: worker
+        run: npm test
+      - name: Install desktop dependencies
+        working-directory: desktop
+        run: npm ci
+      - name: Build desktop frontend
+        working-directory: desktop
+        run: npm run build
+      - name: Check desktop Rust shell
+        run: cargo check -p obsink-desktop
+      - name: Terraform validate
+        uses: hashicorp/setup-terraform@v3
+      - name: Terraform fmt
+        working-directory: infra/terraform
+        run: terraform fmt -check
+      - name: Terraform init
+        working-directory: infra/terraform
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          TF_VAR_cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TF_VAR_worker_name: ${{ vars.WORKER_NAME }}
+          TF_VAR_r2_bucket_name: ${{ vars.R2_BUCKET_NAME }}
+          TF_VAR_kv_namespace_title: ${{ vars.KV_NAMESPACE_TITLE }}
+          TF_VAR_max_batch_inline_bytes: ${{ vars.MAX_BATCH_INLINE_BYTES || '52428800' }}
+        run: terraform init -input=false
+      - name: Terraform validate config
+        working-directory: infra/terraform
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          TF_VAR_cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TF_VAR_worker_name: ${{ vars.WORKER_NAME }}
+          TF_VAR_r2_bucket_name: ${{ vars.R2_BUCKET_NAME }}
+          TF_VAR_kv_namespace_title: ${{ vars.KV_NAMESPACE_TITLE }}
+          TF_VAR_max_batch_inline_bytes: ${{ vars.MAX_BATCH_INLINE_BYTES || '52428800' }}
+        run: terraform plan -input=false -lock=false
+
+  deploy:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: worker
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      WORKER_NAME: ${{ vars.WORKER_NAME }}
+      KV_NAMESPACE_ID: ${{ vars.KV_NAMESPACE_ID }}
+      R2_BUCKET_NAME: ${{ vars.R2_BUCKET_NAME }}
+      MAX_BATCH_INLINE_BYTES: ${{ vars.MAX_BATCH_INLINE_BYTES || '52428800' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: worker/package-lock.json
+      - name: Install worker dependencies
+        run: npm ci
+      - name: Render Wrangler config
+        working-directory: .
+        run: ./scripts/render-worker-config.sh worker/wrangler.toml
+      - name: Sync Worker secret
+        run: printf '%s' "${{ secrets.WORKER_API_KEY }}" | npx wrangler secret put API_KEY
+      - name: Deploy Worker
+        run: npx wrangler deploy

@@ -8,7 +8,7 @@ id = "replace-with-kv-namespace-id"
 
 [[r2_buckets]]
 binding = "FILES"
-bucket_name = "obsink-files"
+bucket_name = "replace-with-r2-bucket-name"
 
 [vars]
 MAX_BATCH_INLINE_BYTES = 52428800

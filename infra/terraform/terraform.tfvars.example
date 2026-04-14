@@ -1,0 +1,5 @@
+cloudflare_account_id = "replace-with-account-id"
+worker_name           = "obsink-worker"
+r2_bucket_name        = "obsink-files-production"
+kv_namespace_title    = "obsink-meta-production"
+max_batch_inline_bytes = 52428800

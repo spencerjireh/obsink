@@ -1,6 +1,12 @@
 /target/
 /worker/node_modules/
 /worker/.wrangler/
+/worker/wrangler.toml
 /desktop/node_modules/
 /desktop/dist/
 /desktop/src-tauri/gen/
+/.terraform/
+*.tfstate
+*.tfstate.*
+/infra/terraform/.terraform/
+/infra/terraform/terraform.tfvars

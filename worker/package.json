@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
+    "render-config": "../scripts/render-worker-config.sh wrangler.toml",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
