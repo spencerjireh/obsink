@@ -1,0 +1,17 @@
+name = "obsink-worker"
+main = "src/index.ts"
+compatibility_date = "2026-04-14"
+
+[[kv_namespaces]]
+binding = "META"
+id = "replace-with-kv-namespace-id"
+
+[[r2_buckets]]
+binding = "FILES"
+bucket_name = "obsink-files"
+
+[vars]
+MAX_BATCH_INLINE_BYTES = 52428800
+
+[triggers]
+crons = ["0 3 * * *", "30 3 * * *"]

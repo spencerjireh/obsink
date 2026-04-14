@@ -1,0 +1,6 @@
+/target/
+/worker/node_modules/
+/worker/.wrangler/
+/desktop/node_modules/
+/desktop/dist/
+/desktop/src-tauri/gen/
