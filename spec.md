@@ -35,7 +35,8 @@ ObSink is a free, self-hosted, end-to-end encrypted sync engine for Obsidian vau
 
 - **Rust** — core sync library (encryption, hashing, manifest diffing, conflict detection, Cloudflare API client)
 - **TypeScript** — Cloudflare Worker backend
-- **Tauri v2 + web frontend** — desktop apps (macOS, Windows, Linux) and Android app; UI in HTML/CSS/JS (framework TBD: Svelte, React, or Vue)
+- **Tauri v2 + React** — desktop apps (macOS, Windows, Linux); UI in HTML/CSS/TS
+- **Tauri v2 + web frontend** — Android remains a candidate path, with React Native + Rust as fallback
 - **Swift + SwiftUI** — iOS main app + File Provider extension, calling Rust core via UniFFI bindings
 - **Cloudflare** — Worker (compute), R2 (object storage), KV (manifest metadata), Cron Triggers (pruning)
 
@@ -394,37 +395,37 @@ obsink/
 │       └── types.rs          shared types (SyncResult, Conflict, FileEntry, etc.)
 ├── worker/                   Cloudflare Worker
 │   ├── package.json
-│   ├── wrangler.toml
+│   ├── wrangler.toml.example
 │   └── src/
 │       └── index.ts
+├── infra/                    Cloudflare provisioning
+│   └── terraform/
+│       ├── main.tf
+│       ├── outputs.tf
+│       ├── variables.tf
+│       └── terraform.tfvars.example
 ├── desktop/                  Tauri desktop app
 │   ├── src-tauri/
 │   │   ├── Cargo.toml        depends on ../core
 │   │   └── src/
 │   │       └── main.rs       Tauri commands wrapping core
-│   └── src/                  web UI (Svelte/React/Vue TBD)
-│       ├── App.[ext]
-│       ├── SyncButton.[ext]
-│       ├── ConflictResolver.[ext]
-│       └── Settings.[ext]
-├── ios/                      Xcode project
-│   ├── ObSink/               main app (SwiftUI)
-│   │   ├── ObSinkApp.swift
-│   │   ├── SyncView.swift
-│   │   ├── ConflictView.swift
-│   │   └── SettingsView.swift
-│   ├── FileProvider/          extension target
-│   │   ├── FileProviderExtension.swift
-│   │   └── FileProviderItem.swift
-│   └── RustCore/              UniFFI generated Swift bindings
-├── android/                   Tauri mobile (or React Native fallback)
-│   └── ...
+│   └── src/                  React UI
+│       ├── App.tsx
+│       ├── main.tsx
+│       └── styles.css
 ├── cli/                       Rust CLI tool for testing/debugging
 │   ├── Cargo.toml
 │   └── src/
 │       └── main.rs
-└── README.md
+├── scripts/
+│   └── render-worker-config.sh
+└── .github/
+    └── workflows/
+        ├── ci.yml
+        └── deploy-worker.yml
 ```
+
+The iOS and Android sections above remain target architecture. Those platform directories are not in the repo yet.
 
 ---
 

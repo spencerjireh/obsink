@@ -71,10 +71,10 @@ Phase 1 status: complete. Verified by Rust tests covering first-time pull, uploa
 
 ### 2.1 Project Setup
 - [x] `wrangler init` in `worker/` directory
-- [ ] Create R2 bucket (e.g., `obsink-files`)
-- [ ] Create KV namespace (e.g., `obsink-meta`)
+- [x] Create R2 bucket (e.g., `obsink-files`)
+- [x] Create KV namespace (e.g., `obsink-meta`)
 - [x] Configure `wrangler.toml` with bindings
-- [ ] Set API key as Worker secret
+- [x] Set API key as Worker secret
 
 ### 2.2 Vault Management
 - [x] `GET /vaults` — list all vaults from KV
@@ -111,13 +111,13 @@ Phase 1 status: complete. Verified by Rust tests covering first-time pull, uploa
 - [x] Return `401` on missing/invalid token
 
 ### 2.8 Integration Testing
-- [ ] Test all endpoints with curl
+- [x] Test all endpoints with curl
 - [x] Test conflict detection: upload file, upload again with wrong parent hash, verify 409
 - [x] Test soft delete and verify blob appears in `_trash/`
 - [x] Test batch with mixed operations
-- [ ] Connect CLI tool to deployed Worker, run full sync cycle
+- [x] Connect CLI tool to deployed Worker, run full sync cycle
 
-Phase 2 status: implementation-complete locally. Worker test coverage now includes manifest fetch, file fetch, soft delete, file size rejection, batch handling, version pruning, and trash purging. Remaining work is deployment/provisioning plus deployed-endpoint verification.
+Phase 2 status: complete and deployed. The Worker is live at `https://obsink-worker.spencer-080.workers.dev` with a KV namespace (`META`), R2 bucket (`obsink-files`), the `API_KEY` secret, and both pruning crons. Local Vitest coverage (manifest/file fetch, soft delete, size rejection, batch, version + trash pruning) is green, and the deployed endpoint passed both live verification scripts: `verify-worker-deploy.sh` (all endpoints incl. a real 409, batch, delete) and `verify-cli-deployed-sync.sh` (two-device CLI sync with bidirectional propagation and an interactively resolved conflict).
 
 ---
 
@@ -131,7 +131,7 @@ Phase 2 status: implementation-complete locally. Worker test coverage now includ
 - [x] Initialize Tauri v2 project in `desktop/`
 - [x] Add `core/` as a Cargo dependency in `src-tauri/Cargo.toml`
 - [x] Choose frontend framework (Svelte, React, or Vue) and scaffold
-- [ ] Decide on and configure system tray / menu bar behavior
+- [x] Decide on and configure system tray / menu bar behavior
 
 ### 3.2 Tauri Commands (Rust → Frontend Bridge)
 - [x] `sync_vault` — triggers full sync, returns sync result (including conflicts)
@@ -142,10 +142,12 @@ Phase 2 status: implementation-complete locally. Worker test coverage now includ
 - [x] `get_manifest_diff` — lightweight check for stale vault warning
 
 ### 3.3 UI Screens
-- [x] **Main view:** sync button, last sync timestamp, vault selector (if multiple vaults), stale vault warning banner
-- [x] **Conflict resolution:** list of conflicted files → tap file → tabbed preview of both versions → pick winner buttons
-- [x] **Settings:** Worker URL, API key, vault management (add/remove), vault folder path
-- [x] **First-run setup:** guided flow for Worker URL, API key, create/connect vault, set passphrase, select local folder
+- [x] **Main view:** sync button, sync status summary, configured vault list, and setup form
+- [x] **Vault switching:** choose the active vault when multiple vaults are configured
+- [x] **Stale vault warning banner:** lightweight manifest check surfaced in the UI on app open
+- [x] **Conflict resolution preview:** side-by-side or tabbed preview of both versions before choosing a winner
+- [x] **Conflict resolution actions:** pick keep local / keep remote / keep both for each conflicted file
+- [x] **Settings / setup:** Worker URL, API key, create/connect flow, passphrase, and local folder path
 
 ### 3.4 Keychain Integration
 - [x] Store/retrieve encryption keys via macOS Keychain from Rust core
@@ -153,7 +155,7 @@ Phase 2 status: implementation-complete locally. Worker test coverage now includ
 
 ### 3.5 Vault Folder Management
 - [x] Configure which local folder maps to which vault
-- [ ] Obsidian opens this folder as a vault — no special integration needed on desktop
+- [x] Obsidian opens this folder as a vault — no special integration needed on desktop
 
 ### 3.6 Testing
 - [ ] Full sync cycle through the UI
@@ -161,7 +163,7 @@ Phase 2 status: implementation-complete locally. Worker test coverage now includ
 - [ ] Stale vault warning (modify file via curl on server, open app, verify banner)
 - [ ] Multiple vault switching
 
-Phase 3 status: scaffolded. The repo now contains a Tauri v2 + React desktop app with core-backed sync/status/setup commands, local app config, macOS keychain integration, and a first-pass UI for sync, setup, and conflict handling. Remaining work is product-level polish plus running the full flow inside the actual desktop shell.
+Phase 3 status: feature-complete in code; pending live verification. The repo contains a Tauri v2 + React desktop app with core-backed sync/status/setup commands, local app config, macOS keychain integration, active-vault switching, stale-vault warnings, and conflict previews. Menu-bar behavior is now wired: a tray icon with Sync Now / Show / Quit, left-click to surface the window, close-to-tray so background sync survives, and a `tray://sync-now` event that drives the existing frontend sync flow. A Tauri capabilities file (`capabilities/default.json`) was added so `invoke`/`listen` are permitted at runtime. Remaining work (§3.6) is running the full flow end-to-end inside the actual Tauri shell against a deployed Worker — gated on Worker deployment.
 
 ---
 
@@ -224,6 +226,8 @@ Phase 3 status: scaffolded. The repo now contains a Tauri v2 + React desktop app
 - [ ] Stale vault warning on app open
 - [ ] Test with real Obsidian vault (plugins, images, .obsidian config)
 
+Phase 4 status: foundation verified, not started in earnest. The `aarch64-apple-ios` and `aarch64-apple-ios-sim` Rust targets are installed and `obsink-core` cross-compiles cleanly for both (reqwest's `rustls-tls` means no OpenSSL cross-compile barrier). Remaining work is the bulk of the phase and needs hands-on Xcode/design work that can't be driven headlessly: the UniFFI binding surface (the core exposes async `prepare_sync`/`complete_sync` and rich types that need a deliberate FFI design), generating Swift bindings + an XCFramework, and the Xcode App + File Provider extension project with App Group entitlements.
+
 ---
 
 ## Phase 5: Android (Tauri Mobile)
@@ -277,6 +281,8 @@ Phase 3 status: scaffolded. The repo now contains a Tauri v2 + React desktop app
 - [ ] Test full sync cycle
 - [ ] Package as `.AppImage` or `.deb`
 
+Linux CI status: GitHub Actions now runs the Rust core + CLI test suite on `ubuntu-latest` and builds/bundles a Linux `.deb` of the desktop app (`linux-bundle` job, uploaded as an artifact). The boxes above stay unchecked pending a verified green CI run and the libsecret key-store backend — the desktop currently shells out to the macOS `security` tool, so the Linux build compiles and bundles but key storage is not yet functional there.
+
 ---
 
 ## Phase 7: Polish & Hardening
@@ -286,11 +292,13 @@ Phase 3 status: scaffolded. The repo now contains a Tauri v2 + React desktop app
 **Estimated effort:** Ongoing
 
 ### 7.1 Reliability
-- [ ] Handle network failures gracefully (retry logic, timeout handling, offline detection)
+- [x] Handle network failures gracefully (retry logic, timeout handling, offline detection)
 - [ ] Handle partial sync failures (some files uploaded, then network drops)
 - [ ] Handle corrupted local cache (re-pull from server)
 - [ ] Handle manifest corruption (rebuild from R2 file listing)
-- [ ] Add logging throughout Rust core (configurable verbosity)
+- [x] Add logging throughout Rust core (configurable verbosity)
+
+Reliability/logging status: the API client now uses a 30s per-request timeout and retries transient failures (timeouts, connection errors) up to 3 times with exponential backoff; non-transient errors and HTTP status errors surface immediately as typed `ApiError`s. Structured logging uses `tracing` across the core (request-level `debug`, sync-plan `info`, retry `warn`); the CLI installs a stderr subscriber controlled by `RUST_LOG` (default `warn`). Still open: partial-sync recovery, corrupted-local-cache re-pull, and manifest rebuild from an R2 listing (the last needs a new Worker list endpoint).
 
 ### 7.2 UX Improvements
 - [ ] Progress indicator during sync (file count, bytes transferred)
@@ -306,17 +314,21 @@ Phase 3 status: scaffolded. The repo now contains a Tauri v2 + React desktop app
 - [ ] Manifest caching with ETag/If-None-Match to skip unchanged manifests
 
 ### 7.4 Security
-- [ ] HMAC file hashes with encryption key (eliminate information leak from plaintext hashes)
-- [ ] Encrypt file paths in manifest (path → HMAC key, store encrypted path index)
-- [ ] Audit Argon2id parameters (memory cost, iterations) for adequate strength
+- [x] HMAC file hashes with encryption key (eliminate information leak from plaintext hashes)
+- [x] Encrypt file paths in manifest (path → HMAC key, store encrypted path index)
+- [x] Audit Argon2id parameters (memory cost, iterations) for adequate strength
 - [ ] Pin TLS certificates for Cloudflare Worker endpoint (optional/paranoid)
 
+Wire format v2 (`PROTOCOL_VERSION = 2`): the master key (Argon2id) is now only HKDF input; four purpose-separated sub-keys are derived (content encryption, content MAC, path token, path encryption). The server stores entries keyed by a deterministic `HMAC(path_token_key, path)` token, with the manifest `hash` being `HMAC(content_mac_key, plaintext)` and an `encPath` (AES-GCM of the real path) so a fresh device can recover filenames. The server never sees plaintext paths or content-derived hashes. Verified live: the deployed manifest is token-keyed with HMAC hashes and `encPath`. Argon2id audited at 64 MiB / 3 / 1 (exceeds OWASP 2024). TLS pinning intentionally deferred (optional/paranoid).
+
 ### 7.5 Documentation
-- [ ] README with project overview and quickstart
-- [ ] Self-hosting guide (setting up your own Cloudflare account, Worker, R2, KV)
-- [ ] Per-platform setup guide (macOS, iOS, Android, Windows, Linux)
-- [ ] Architecture doc for contributors
-- [ ] Troubleshooting guide (common sync issues, conflict scenarios)
+- [x] README with project overview and quickstart
+- [x] Self-hosting guide (setting up your own Cloudflare account, Worker, R2, KV)
+- [x] Per-platform setup guide (macOS, iOS, Android, Windows, Linux)
+- [x] Architecture doc for contributors
+- [x] Troubleshooting guide (common sync issues, conflict scenarios)
+
+Documentation status: `README.md` plus `docs/self-hosting.md`, `docs/architecture.md`, `docs/platforms.md`, and `docs/troubleshooting.md` are written against the deployed v2 system (joining the existing `docs/deploy.md`). The platform guide records per-OS status; the architecture doc documents the v2 wire format and crypto.
 
 ---
 
