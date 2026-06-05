@@ -4,10 +4,10 @@ use std::{
     time::UNIX_EPOCH,
 };
 
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 use walkdir::WalkDir;
 
+use crate::crypto::{content_hmac, CryptoKeys, KeyBytes};
 use crate::types::{FileEntry, Manifest};
 
 #[derive(Debug, Error)]
@@ -22,18 +22,21 @@ pub enum HasherError {
     InvalidModifiedTime { path: PathBuf },
 }
 
-pub fn hash_bytes(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hex::encode(hasher.finalize())
+/// Keyed content hash (HMAC-SHA256) of raw bytes, hex-encoded.
+pub fn hash_bytes(mac_key: &KeyBytes, bytes: &[u8]) -> String {
+    content_hmac(mac_key, bytes)
 }
 
-pub fn hash_file(path: &Path) -> Result<String, HasherError> {
+/// Keyed content hash of a file's contents.
+pub fn hash_file(mac_key: &KeyBytes, path: &Path) -> Result<String, HasherError> {
     let bytes = fs::read(path)?;
-    Ok(hash_bytes(&bytes))
+    Ok(hash_bytes(mac_key, &bytes))
 }
 
-pub fn build_manifest_from_dir(root: &Path) -> Result<Manifest, HasherError> {
+/// Build a manifest of the directory, keyed by real path. Entry hashes are
+/// keyed HMACs; `enc_path` is left empty because the local manifest is already
+/// keyed by the real path (the server populates `enc_path` on upload).
+pub fn build_manifest_from_dir(root: &Path, keys: &CryptoKeys) -> Result<Manifest, HasherError> {
     let mut manifest = Manifest::new();
 
     for entry in WalkDir::new(root) {
@@ -67,10 +70,11 @@ pub fn build_manifest_from_dir(root: &Path) -> Result<Manifest, HasherError> {
         manifest.insert(
             relative_key,
             FileEntry {
-                hash: hash_file(path)?,
+                hash: hash_file(&keys.content_mac, path)?,
                 modified,
                 size: metadata.len(),
                 deleted: false,
+                enc_path: String::new(),
             },
         );
     }
@@ -85,38 +89,49 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{build_manifest_from_dir, hash_bytes};
+    use crate::crypto::{derive_key, derive_keys, CryptoKeys};
+
+    fn test_keys() -> CryptoKeys {
+        derive_keys(&derive_key("hunter2", b"obsink-salt").unwrap())
+    }
 
     #[test]
     fn hashing_is_deterministic() {
-        let first = hash_bytes(b"obsink");
-        let second = hash_bytes(b"obsink");
+        let keys = test_keys();
+        let first = hash_bytes(&keys.content_mac, b"obsink");
+        let second = hash_bytes(&keys.content_mac, b"obsink");
 
         assert_eq!(first, second);
     }
 
     #[test]
     fn handles_empty_file() {
+        let keys = test_keys();
         let dir = tempdir().unwrap();
         let file = dir.path().join("empty.md");
         fs::write(&file, []).unwrap();
 
-        let manifest = build_manifest_from_dir(dir.path()).unwrap();
+        let manifest = build_manifest_from_dir(dir.path(), &keys).unwrap();
         let entry = manifest.get("empty.md").unwrap();
 
         assert_eq!(entry.size, 0);
-        assert_eq!(entry.hash, hash_bytes(b""));
+        assert_eq!(entry.hash, hash_bytes(&keys.content_mac, b""));
     }
 
     #[test]
     fn handles_binary_file() {
+        let keys = test_keys();
         let dir = tempdir().unwrap();
         let file = dir.path().join("image.bin");
         fs::write(&file, [0, 159, 146, 150, 255]).unwrap();
 
-        let manifest = build_manifest_from_dir(dir.path()).unwrap();
+        let manifest = build_manifest_from_dir(dir.path(), &keys).unwrap();
         let entry = manifest.get("image.bin").unwrap();
 
         assert_eq!(entry.size, 5);
-        assert_eq!(entry.hash, hash_bytes(&[0, 159, 146, 150, 255]));
+        assert_eq!(
+            entry.hash,
+            hash_bytes(&keys.content_mac, &[0, 159, 146, 150, 255])
+        );
     }
 }

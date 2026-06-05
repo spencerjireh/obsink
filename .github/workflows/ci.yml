@@ -8,6 +8,7 @@ on:
 
 jobs:
   core:
+    name: core + CLI (linux)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -15,8 +16,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check formatting
         run: cargo fmt --all --check
-      - name: Test core
-        run: cargo test -p obsink-core
+      - name: Test core and CLI on Linux
+        run: cargo test -p obsink-core -p obsink
 
   worker:
     runs-on: ubuntu-latest
@@ -60,6 +61,36 @@ jobs:
         run: npm run build
       - name: Check desktop Rust shell
         run: cargo check -p obsink-desktop
+
+  linux-bundle:
+    name: desktop bundle (linux .deb)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - name: Install Linux dependencies for Tauri
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libappindicator3-dev librsvg2-dev patchelf
+      - name: Install frontend dependencies
+        working-directory: desktop
+        run: npm ci
+      - name: Build Linux .deb bundle
+        working-directory: desktop
+        run: npm run tauri build -- --bundles deb
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: obsink-linux-deb
+          # Cargo workspace: bundles land in the workspace-root target/, not desktop/src-tauri/target/.
+          path: target/release/bundle/deb/*.deb
+          if-no-files-found: error
 
   terraform-plan:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository

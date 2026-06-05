@@ -10,3 +10,6 @@
 *.tfstate.*
 /infra/terraform/.terraform/
 /infra/terraform/terraform.tfvars
+
+# macOS
+.DS_Store

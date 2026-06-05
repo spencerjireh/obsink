@@ -10,6 +10,9 @@ export interface FileEntry {
   modified: number
   size: number
   deleted?: boolean
+  /** AES-GCM-encrypted real path (base64), supplied by the client on upload so
+   * a fresh device can recover filenames from the token-keyed manifest. */
+  encPath?: string
 }
 
 export type Manifest = Record<string, FileEntry>
@@ -37,6 +40,7 @@ type BatchOperation =
       parentHash?: string
       contentHash: string
       content: string
+      encPath?: string
     }
   | {
       action: 'delete'
@@ -206,6 +210,7 @@ async function putFile(
   const current = manifest[filePath]
   const parentHash = request.headers.get('X-Parent-Hash')
   const contentHash = request.headers.get('X-Content-Hash')
+  const encPath = request.headers.get('X-Enc-Path') ?? current?.encPath ?? ''
 
   if (!contentHash) {
     throw new HttpError(400, 'missing X-Content-Hash header')
@@ -230,6 +235,7 @@ async function putFile(
     modified: nowSeconds(),
     size: body.byteLength,
     deleted: false,
+    encPath,
   }
   await writeManifest(env, vaultId, manifest)
 
@@ -263,6 +269,7 @@ async function deleteFile(
     modified: nowSeconds(),
     size: current?.size ?? 0,
     deleted: true,
+    encPath: current?.encPath ?? '',
   }
   await writeManifest(env, vaultId, manifest)
 
@@ -292,6 +299,7 @@ async function batch(request: Request, env: Env, vaultId: string): Promise<Respo
             headers: {
               'X-Parent-Hash': operation.parentHash ?? '',
               'X-Content-Hash': operation.contentHash,
+              'X-Enc-Path': operation.encPath ?? '',
             },
             body: content,
           }),

@@ -8,10 +8,16 @@ use std::{
 };
 
 use dirs::home_dir;
+use tauri::{
+    menu::{Menu, MenuItem, PredefinedMenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    AppHandle, Emitter, Manager, WindowEvent,
+};
+
 use obsink_core::{
-    build_working_manifest_for_path, complete_sync, derive_key, diff_local_and_remote,
-    prepare_sync, sync_manifest_path, ApiClient, Conflict, ConflictResolution,
-    CreateVaultRequest, KeyBytes, SyncPlan, SyncResult, VaultConfig,
+    build_working_manifest_for_path, complete_sync, derive_key, derive_keys, diff_local_and_remote,
+    prepare_sync, sync_manifest_path, ApiClient, Conflict, ConflictResolution, CreateVaultRequest,
+    KeyBytes, SyncPlan, SyncResult, VaultConfig,
 };
 use serde::{Deserialize, Serialize};
 
@@ -90,6 +96,15 @@ struct SyncCommandResponse {
     pending_conflicts: Vec<Conflict>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ConflictPreview {
+    path: String,
+    local_text: String,
+    remote_text: String,
+    local_deleted: bool,
+    remote_deleted: bool,
+}
+
 #[tauri::command]
 fn get_vaults() -> Result<Vec<LocalVaultSummary>, String> {
     let config = load_app_config().map_err(err_string)?;
@@ -104,6 +119,28 @@ fn get_vaults() -> Result<Vec<LocalVaultSummary>, String> {
             active: config.active_vault_id.as_deref() == Some(vault.id.as_str()),
         })
         .collect())
+}
+
+#[tauri::command]
+fn set_active_vault(vault_id: String) -> Result<LocalVaultSummary, String> {
+    let mut config = load_app_config().map_err(err_string)?;
+    let vault = config
+        .vaults
+        .iter()
+        .find(|vault| vault.id == vault_id)
+        .cloned()
+        .ok_or_else(|| format!("vault {} not configured locally", vault_id))?;
+
+    config.active_vault_id = Some(vault.id.clone());
+    save_app_config(&config).map_err(err_string)?;
+
+    Ok(LocalVaultSummary {
+        id: vault.id,
+        name: vault.name,
+        worker_url: vault.worker_url,
+        local_path: vault.local_path,
+        active: true,
+    })
 }
 
 #[tauri::command]
@@ -176,12 +213,13 @@ async fn get_status() -> Result<SyncStatus, String> {
 
     let local_root = PathBuf::from(&vault.local_path);
     let manifest_path = sync_manifest_path(&local_root);
+    let keys = derive_keys(&load_key_from_keychain(&vault.id).map_err(err_string)?);
     let vault_config = to_vault_config(vault);
     let remote_manifest = ApiClient::new(vault_config)
-        .get_manifest()
+        .get_manifest(&keys)
         .await
         .map_err(err_string)?;
-    let local_manifest = build_working_manifest_for_path(&local_root).map_err(err_string)?;
+    let local_manifest = build_working_manifest_for_path(&local_root, &keys).map_err(err_string)?;
     let diff = diff_local_and_remote(&local_manifest, &remote_manifest);
 
     Ok(SyncStatus {
@@ -199,10 +237,11 @@ async fn get_status() -> Result<SyncStatus, String> {
 #[tauri::command]
 async fn get_manifest_diff(vault_id: Option<String>) -> Result<SyncResult, String> {
     let vault = selected_vault(vault_id).map_err(err_string)?;
+    let keys = derive_keys(&load_key_from_keychain(&vault.id).map_err(err_string)?);
     let local_manifest =
-        build_working_manifest_for_path(Path::new(&vault.local_path)).map_err(err_string)?;
+        build_working_manifest_for_path(Path::new(&vault.local_path), &keys).map_err(err_string)?;
     let remote_manifest = ApiClient::new(to_vault_config(&vault))
-        .get_manifest()
+        .get_manifest(&keys)
         .await
         .map_err(err_string)?;
     Ok(diff_local_and_remote(&local_manifest, &remote_manifest))
@@ -262,6 +301,59 @@ async fn resolve_conflict(
         .map_err(err_string)
 }
 
+#[tauri::command]
+async fn get_conflict_preview(
+    vault_id: String,
+    path: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<ConflictPreview, String> {
+    let vault = selected_vault(Some(vault_id.clone())).map_err(err_string)?;
+    let conflict = {
+        let pending_plans = state
+            .pending_plans
+            .lock()
+            .map_err(|_| "pending plan lock poisoned".to_string())?;
+        let plan = pending_plans
+            .get(&vault_id)
+            .ok_or_else(|| format!("no pending conflict set for {}", vault_id))?;
+        plan.conflicts
+            .iter()
+            .find(|conflict| conflict.path == path)
+            .cloned()
+            .ok_or_else(|| format!("no pending conflict preview for {}", path))?
+    };
+
+    let keys = derive_keys(&load_key_from_keychain(&vault.id).map_err(err_string)?);
+    let client = ApiClient::new(to_vault_config(&vault));
+
+    let local_text = if conflict.local.deleted {
+        String::new()
+    } else {
+        let bytes =
+            fs::read(Path::new(&vault.local_path).join(&conflict.path)).map_err(err_string)?;
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+
+    let remote_text = if conflict.remote.deleted {
+        String::new()
+    } else {
+        let blob = client
+            .get_file(&conflict.path, &keys)
+            .await
+            .map_err(err_string)?;
+        let bytes = obsink_core::decrypt(&keys.content_enc, &blob).map_err(err_string)?;
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+
+    Ok(ConflictPreview {
+        path: conflict.path,
+        local_text,
+        remote_text,
+        local_deleted: conflict.local.deleted,
+        remote_deleted: conflict.remote.deleted,
+    })
+}
+
 fn validate_request(request: &AddVaultRequest) -> Result<(), String> {
     if request.worker_url.trim().is_empty() {
         return Err("worker URL is required".into());
@@ -288,11 +380,12 @@ fn validate_request(request: &AddVaultRequest) -> Result<(), String> {
 }
 
 async fn validate_passphrase(vault: &StoredVault, key: &KeyBytes) -> Result<(), String> {
+    let keys = derive_keys(key);
     let client = ApiClient::new(to_vault_config(vault));
-    let manifest = client.get_manifest().await.map_err(err_string)?;
+    let manifest = client.get_manifest(&keys).await.map_err(err_string)?;
     if let Some((path, _)) = manifest.iter().find(|(_, entry)| !entry.deleted) {
-        let blob = client.get_file(path).await.map_err(err_string)?;
-        obsink_core::decrypt(key, &blob).map_err(err_string)?;
+        let blob = client.get_file(path, &keys).await.map_err(err_string)?;
+        obsink_core::decrypt(&keys.content_enc, &blob).map_err(err_string)?;
     }
     Ok(())
 }
@@ -454,17 +547,86 @@ fn manifest_timestamp(path: &Path) -> Option<u64> {
         .map(|duration| duration.as_secs())
 }
 
+/// Bring the main window to the foreground, creating no new windows.
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+/// Build the menu-bar tray icon and wire its menu and click behavior.
+fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
+    let sync_now = MenuItem::with_id(app, "sync_now", "Sync Now", true, None::<&str>)?;
+    let show = MenuItem::with_id(app, "show", "Show ObSink", true, None::<&str>)?;
+    let separator = PredefinedMenuItem::separator(app)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit ObSink", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&sync_now, &show, &separator, &quit])?;
+
+    let mut builder = TrayIconBuilder::with_id("obsink-tray")
+        .tooltip("ObSink")
+        .menu(&menu)
+        // Left click toggles the window; the menu stays on right click.
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "sync_now" => {
+                // The frontend owns the sync flow (conflict state, refresh),
+                // so the tray just asks it to run and surfaces the window.
+                let _ = app.emit("tray://sync-now", ());
+                show_main_window(app);
+            }
+            "show" => show_main_window(app),
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main_window(tray.app_handle());
+            }
+        });
+
+    if let Some(icon) = app.default_window_icon() {
+        // Template rendering makes the icon adopt the macOS menu-bar tint.
+        builder = builder.icon(icon.clone()).icon_as_template(true);
+    }
+
+    builder.build(app)?;
+    Ok(())
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             add_vault,
+            get_conflict_preview,
             get_manifest_diff,
             get_status,
             get_vaults,
             resolve_conflict,
+            set_active_vault,
             sync_vault,
         ])
+        .setup(|app| {
+            setup_tray(app.handle())?;
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            // Menu-bar behavior: closing the window hides it to the tray
+            // instead of quitting, so background sync keeps working.
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main" {
+                    let _ = window.hide();
+                    api.prevent_close();
+                }
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

@@ -8,7 +8,7 @@ use thiserror::Error;
 
 use crate::{
     api_client::{ApiClient, ApiError},
-    crypto::{decrypt, encrypt, CryptoError, KeyBytes},
+    crypto::{decrypt, derive_keys, encrypt, CryptoError, CryptoKeys, KeyBytes},
     hasher::{build_manifest_from_dir, hash_file, HasherError},
     manifest::{diff_manifests, ManifestDiff},
     types::{
@@ -62,23 +62,34 @@ pub fn diff_local_and_remote(local: &Manifest, remote: &Manifest) -> ManifestDif
     diff_manifests(local, remote)
 }
 
-pub fn build_working_manifest_for_path(local_root: &Path) -> Result<Manifest, SyncEngineError> {
+pub fn build_working_manifest_for_path(
+    local_root: &Path,
+    keys: &CryptoKeys,
+) -> Result<Manifest, SyncEngineError> {
     let previous_manifest = load_manifest_from_disk(&sync_manifest_path(local_root))?;
-    build_working_manifest(local_root, &previous_manifest)
+    build_working_manifest(local_root, &previous_manifest, keys)
 }
 
 pub async fn prepare_sync(
     config: &VaultConfig,
     key: &KeyBytes,
 ) -> Result<SyncPlan, SyncEngineError> {
+    let keys = derive_keys(key);
     let client = ApiClient::new(config.clone());
     let local_root = Path::new(&config.local_path);
-    let working_manifest = build_working_manifest_for_path(local_root)?;
-    let remote_manifest = client.get_manifest().await?;
+    let working_manifest = build_working_manifest_for_path(local_root, &keys)?;
+    let remote_manifest = client.get_manifest(&keys).await?;
     let diff = diff_manifests(&working_manifest, &remote_manifest);
 
-    apply_downloads(local_root, key, &client, &diff.download).await?;
+    apply_downloads(local_root, &keys, &client, &diff.download).await?;
 
+    tracing::info!(
+        vault = %config.vault_id,
+        uploads = diff.upload.len(),
+        downloads = diff.download.len(),
+        conflicts = diff.conflicts.len(),
+        "prepared sync plan"
+    );
     Ok(SyncPlan {
         upload: diff.upload,
         download: diff.download,
@@ -92,6 +103,7 @@ pub async fn complete_sync(
     plan: &SyncPlan,
     resolutions: &[ConflictResolution],
 ) -> Result<SyncResult, SyncEngineError> {
+    let keys = derive_keys(key);
     let client = ApiClient::new(config.clone());
     let local_root = Path::new(&config.local_path);
 
@@ -112,20 +124,24 @@ pub async fn complete_sync(
                 pending_uploads.push(conflict_to_upload(conflict));
             }
             ConflictResolutionChoice::KeepRemote => {
-                apply_keep_remote(local_root, key, &client, conflict).await?;
+                apply_keep_remote(local_root, &keys, &client, conflict).await?;
             }
             ConflictResolutionChoice::KeepBoth => {
                 let duplicate_path =
-                    write_conflict_copy(local_root, key, &client, conflict).await?;
+                    write_conflict_copy(local_root, &keys, &client, conflict).await?;
                 pending_uploads.push(conflict_to_upload(conflict));
-                pending_uploads.push(build_upload_action_for_path(local_root, &duplicate_path)?);
+                pending_uploads.push(build_upload_action_for_path(
+                    local_root,
+                    &duplicate_path,
+                    &keys,
+                )?);
             }
         }
     }
 
     let mut late_conflicts = Vec::new();
     for action in &pending_uploads {
-        if let Err(error) = apply_upload(local_root, key, &client, action).await {
+        if let Err(error) = apply_upload(local_root, &keys, &client, action).await {
             match error {
                 SyncEngineError::Api(ApiError::Conflict { path, conflict }) => {
                     if let Some(remote) = conflict.current {
@@ -134,6 +150,7 @@ pub async fn complete_sync(
                             modified: 0,
                             size: 0,
                             deleted: false,
+                            enc_path: String::new(),
                         });
                         late_conflicts.push(Conflict {
                             path,
@@ -155,7 +172,7 @@ pub async fn complete_sync(
         });
     }
 
-    let remote_manifest = client.get_manifest().await?;
+    let remote_manifest = client.get_manifest(&keys).await?;
     save_manifest_to_disk(&sync_manifest_path(local_root), &remote_manifest)?;
 
     Ok(SyncResult {
@@ -168,8 +185,9 @@ pub async fn complete_sync(
 fn build_working_manifest(
     local_root: &Path,
     previous_manifest: &Manifest,
+    keys: &CryptoKeys,
 ) -> Result<Manifest, SyncEngineError> {
-    let mut current = build_manifest_from_dir(local_root)?;
+    let mut current = build_manifest_from_dir(local_root, keys)?;
     let seen_paths = current.keys().cloned().collect::<BTreeSet<_>>();
 
     for (path, previous_entry) in previous_manifest {
@@ -184,6 +202,7 @@ fn build_working_manifest(
                 modified: now_seconds(),
                 size: previous_entry.size,
                 deleted: true,
+                enc_path: previous_entry.enc_path.clone(),
             },
         );
     }
@@ -193,15 +212,15 @@ fn build_working_manifest(
 
 async fn apply_downloads(
     local_root: &Path,
-    key: &KeyBytes,
+    keys: &CryptoKeys,
     client: &ApiClient,
     downloads: &[SyncAction],
 ) -> Result<(), SyncEngineError> {
     for action in downloads {
         match action.kind {
             SyncActionKind::Download => {
-                let blob = client.get_file(&action.path).await?;
-                let plaintext = decrypt(key, &blob)?;
+                let blob = client.get_file(&action.path, keys).await?;
+                let plaintext = decrypt(&keys.content_enc, &blob)?;
                 write_local_file(local_root, &action.path, &plaintext)?;
             }
             SyncActionKind::DeleteLocal => {
@@ -216,15 +235,15 @@ async fn apply_downloads(
 
 async fn apply_keep_remote(
     local_root: &Path,
-    key: &KeyBytes,
+    keys: &CryptoKeys,
     client: &ApiClient,
     conflict: &Conflict,
 ) -> Result<(), SyncEngineError> {
     if conflict.remote.deleted {
         delete_local_file(local_root, &conflict.path)?;
     } else {
-        let blob = client.get_file(&conflict.path).await?;
-        let plaintext = decrypt(key, &blob)?;
+        let blob = client.get_file(&conflict.path, keys).await?;
+        let plaintext = decrypt(&keys.content_enc, &blob)?;
         write_local_file(local_root, &conflict.path, &plaintext)?;
     }
 
@@ -233,7 +252,7 @@ async fn apply_keep_remote(
 
 async fn write_conflict_copy(
     local_root: &Path,
-    key: &KeyBytes,
+    keys: &CryptoKeys,
     client: &ApiClient,
     conflict: &Conflict,
 ) -> Result<String, SyncEngineError> {
@@ -242,15 +261,15 @@ async fn write_conflict_copy(
     }
 
     let duplicate_path = conflict_copy_path(&conflict.path);
-    let blob = client.get_file(&conflict.path).await?;
-    let plaintext = decrypt(key, &blob)?;
+    let blob = client.get_file(&conflict.path, keys).await?;
+    let plaintext = decrypt(&keys.content_enc, &blob)?;
     write_local_file(local_root, &duplicate_path, &plaintext)?;
     Ok(duplicate_path)
 }
 
 async fn apply_upload(
     local_root: &Path,
-    key: &KeyBytes,
+    keys: &CryptoKeys,
     client: &ApiClient,
     action: &SyncAction,
 ) -> Result<(), SyncEngineError> {
@@ -258,17 +277,18 @@ async fn apply_upload(
         SyncActionKind::Upload => {
             let path = local_root.join(&action.path);
             let plaintext = fs::read(path)?;
-            let ciphertext = encrypt(key, &plaintext)?;
+            let ciphertext = encrypt(&keys.content_enc, &plaintext)?;
             client
                 .put_file(
                     &action.path,
                     action.remote.as_ref().map(|entry| entry.hash.as_str()),
-                    &action
+                    action
                         .local
                         .as_ref()
                         .map(|entry| entry.hash.as_str())
                         .unwrap_or_default(),
                     ciphertext,
+                    keys,
                 )
                 .await
                 .map_err(SyncEngineError::Api)
@@ -277,6 +297,7 @@ async fn apply_upload(
             .delete_file(
                 &action.path,
                 action.remote.as_ref().map(|entry| entry.hash.as_str()),
+                keys,
             )
             .await
             .map_err(SyncEngineError::Api),
@@ -287,6 +308,7 @@ async fn apply_upload(
 fn build_upload_action_for_path(
     local_root: &Path,
     path: &str,
+    keys: &CryptoKeys,
 ) -> Result<SyncAction, SyncEngineError> {
     let absolute_path = local_root.join(path);
     let metadata = fs::metadata(&absolute_path)?;
@@ -294,7 +316,7 @@ fn build_upload_action_for_path(
         path: path.to_string(),
         kind: SyncActionKind::Upload,
         local: Some(FileEntry {
-            hash: hash_file(&absolute_path)?,
+            hash: hash_file(&keys.content_mac, &absolute_path)?,
             modified: metadata
                 .modified()?
                 .duration_since(std::time::UNIX_EPOCH)
@@ -302,6 +324,7 @@ fn build_upload_action_for_path(
                 .as_secs(),
             size: metadata.len(),
             deleted: false,
+            enc_path: String::new(),
         }),
         remote: None,
     })
@@ -398,9 +421,31 @@ mod tests {
         save_manifest_to_disk, sync_manifest_path,
     };
     use crate::{
-        crypto::encrypt,
+        crypto::{content_hmac, derive_keys, encrypt, encrypt_path, path_token, CryptoKeys},
         types::{ConflictResolution, ConflictResolutionChoice, FileEntry, Manifest, VaultConfig},
     };
+
+    /// Build the JSON the server would return for a single-file manifest:
+    /// keyed by the path token, with an HMAC hash and recoverable `encPath`.
+    fn server_manifest(
+        keys: &CryptoKeys,
+        path: &str,
+        content: &[u8],
+        modified: u64,
+        deleted: bool,
+    ) -> serde_json::Value {
+        let token = path_token(&keys.path_token, path);
+        let enc_path = encrypt_path(&keys.path_enc, path).unwrap();
+        serde_json::json!({
+            token: {
+                "hash": content_hmac(&keys.content_mac, content),
+                "modified": modified,
+                "size": content.len(),
+                "deleted": deleted,
+                "encPath": enc_path,
+            }
+        })
+    }
 
     #[test]
     fn loads_missing_manifest_as_empty() {
@@ -424,6 +469,7 @@ mod tests {
                 modified: 1,
                 size: 5,
                 deleted: false,
+                enc_path: String::new(),
             },
         );
 
@@ -458,7 +504,8 @@ mod tests {
         fs::write(dir.path().join(".obsink/manifest.json"), "{}".as_bytes()).unwrap();
         fs::write(dir.path().join("note.md"), "hello".as_bytes()).unwrap();
 
-        let manifest = crate::build_manifest_from_dir(dir.path()).unwrap();
+        let keys = derive_keys(&[3_u8; 32]);
+        let manifest = crate::build_manifest_from_dir(dir.path(), &keys).unwrap();
 
         assert_eq!(manifest.len(), 1);
         assert!(manifest.contains_key("note.md"));
@@ -478,34 +525,26 @@ mod tests {
         let dir = tempdir().unwrap();
         let server = MockServer::start_async().await;
         let key = [7_u8; 32];
-        let encrypted = encrypt(&key, b"hello remote").unwrap();
+        let keys = derive_keys(&key);
+        let encrypted = encrypt(&keys.content_enc, b"hello remote").unwrap();
+        let token = path_token(&keys.path_token, "note.md");
+        let manifest_json = server_manifest(&keys, "note.md", b"hello remote", 10, false);
 
+        let body = manifest_json.clone();
         server
-            .mock_async(|when, then| {
+            .mock_async(move |when, then| {
                 when.method(GET)
                     .path("/vaults/vault_123/manifest")
                     .header("authorization", "Bearer token");
-                then.status(200).json_body_obj(&serde_json::json!({
-                    "note.md": { "hash": "h1", "modified": 10, "size": 12, "deleted": false }
-                }));
+                then.status(200).json_body_obj(&body);
             })
             .await;
         server
-            .mock_async(|when, then| {
+            .mock_async(move |when, then| {
                 when.method(GET)
-                    .path("/vaults/vault_123/files/note.md")
+                    .path(format!("/vaults/vault_123/files/{token}"))
                     .header("authorization", "Bearer token");
                 then.status(200).body(encrypted.clone());
-            })
-            .await;
-        server
-            .mock_async(|when, then| {
-                when.method(GET)
-                    .path("/vaults/vault_123/manifest")
-                    .header("authorization", "Bearer token");
-                then.status(200).json_body_obj(&serde_json::json!({
-                    "note.md": { "hash": "h1", "modified": 10, "size": 12, "deleted": false }
-                }));
             })
             .await;
 
@@ -529,6 +568,9 @@ mod tests {
         fs::write(dir.path().join("local.md"), "hello local").unwrap();
         let server = MockServer::start_async().await;
         let key = [5_u8; 32];
+        let keys = derive_keys(&key);
+        let token = path_token(&keys.path_token, "local.md");
+        let manifest_after = server_manifest(&keys, "local.md", b"hello local", 10, false);
 
         server
             .mock_async(|when, then| {
@@ -537,19 +579,18 @@ mod tests {
             })
             .await;
         let put_mock = server
-            .mock_async(|when, then| {
+            .mock_async(move |when, then| {
                 when.method(PUT)
-                    .path("/vaults/vault_123/files/local.md")
-                    .header_exists("x-content-hash");
+                    .path(format!("/vaults/vault_123/files/{token}"))
+                    .header_exists("x-content-hash")
+                    .header_exists("x-enc-path");
                 then.status(200);
             })
             .await;
         server
-            .mock_async(|when, then| {
+            .mock_async(move |when, then| {
                 when.method(GET).path("/vaults/vault_123/manifest");
-                then.status(200).json_body_obj(&serde_json::json!({
-                    "local.md": { "hash": crate::hash_bytes(b"hello local"), "modified": 10, "size": 11, "deleted": false }
-                }));
+                then.status(200).json_body_obj(&manifest_after);
             })
             .await;
 
@@ -570,42 +611,38 @@ mod tests {
         set_file_mtime(&note_path, FileTime::from_unix_time(1, 0)).unwrap();
         let server = MockServer::start_async().await;
         let key = [9_u8; 32];
-        let encrypted = encrypt(&key, b"remote version").unwrap();
+        let keys = derive_keys(&key);
+        let encrypted = encrypt(&keys.content_enc, b"remote version").unwrap();
+        let token = path_token(&keys.path_token, "note.md");
+        let remote_manifest = server_manifest(&keys, "note.md", b"remote version", 1, false);
 
         save_manifest_to_disk(
             &sync_manifest_path(dir.path()),
             &Manifest::from([(
                 "note.md".to_string(),
                 FileEntry {
-                    hash: crate::hash_bytes(b"base"),
+                    hash: content_hmac(&keys.content_mac, b"base"),
                     modified: 1,
                     size: 4,
                     deleted: false,
+                    enc_path: String::new(),
                 },
             )]),
         )
         .unwrap();
 
+        let body = remote_manifest.clone();
         server
-            .mock_async(|when, then| {
+            .mock_async(move |when, then| {
                 when.method(GET).path("/vaults/vault_123/manifest");
-                then.status(200).json_body_obj(&serde_json::json!({
-                    "note.md": { "hash": crate::hash_bytes(b"remote version"), "modified": 1, "size": 14, "deleted": false }
-                }));
+                then.status(200).json_body_obj(&body);
             })
             .await;
         server
-            .mock_async(|when, then| {
-                when.method(GET).path("/vaults/vault_123/files/note.md");
+            .mock_async(move |when, then| {
+                when.method(GET)
+                    .path(format!("/vaults/vault_123/files/{token}"));
                 then.status(200).body(encrypted.clone());
-            })
-            .await;
-        server
-            .mock_async(|when, then| {
-                when.method(GET).path("/vaults/vault_123/manifest");
-                then.status(200).json_body_obj(&serde_json::json!({
-                    "note.md": { "hash": crate::hash_bytes(b"remote version"), "modified": 1, "size": 14, "deleted": false }
-                }));
             })
             .await;
 

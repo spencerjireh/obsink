@@ -2,9 +2,11 @@
 
 This repo uses:
 
-- Terraform for Cloudflare infrastructure
+- Terraform for Cloudflare storage primitives
 - Wrangler for Worker code deploys
 - GitHub Actions for CI and automatic deploys on `main`
+
+Terraform currently provisions the R2 bucket and KV namespace. The Worker config file is generated at deploy time, and the Worker code plus secret are deployed with Wrangler.
 
 ## Important Limitation
 
@@ -94,6 +96,26 @@ cd worker
 npx wrangler deploy
 ```
 
+10. Verify the deployed Worker with the scripted live checks.
+
+```bash
+export WORKER_URL="https://your-worker.example.workers.dev"
+export WORKER_API_KEY="..."
+./scripts/verify-worker-deploy.sh
+```
+
+The verification script exercises `GET /vaults`, `POST /vaults`, `GET /manifest`, file upload and download, a real `409 Conflict`, batch mixed results, and delete handling against the deployed endpoint.
+
+11. Verify the deployed CLI end-to-end flow.
+
+```bash
+export WORKER_URL="https://your-worker.example.workers.dev"
+export WORKER_API_KEY="..."
+./scripts/verify-cli-deployed-sync.sh
+```
+
+The CLI verification script runs two isolated local vaults against the deployed Worker, checks upload and download propagation, and forces a conflict that the CLI resolves interactively through scripted stdin.
+
 ## CI Behavior
 
 ### Pull requests
@@ -105,6 +127,7 @@ npx wrangler deploy
 
 ### Pushes to `main`
 
+- The deploy workflow only runs when changes touch `worker/**`, `infra/terraform/**`, `scripts/render-worker-config.sh`, or `.github/workflows/deploy-worker.yml`
 - Re-run verification
 - Generate `worker/wrangler.toml` from repository variables
 - Sync the `API_KEY` Worker secret
