@@ -8,7 +8,7 @@ ObSink shares one Rust core across every client. This page covers per-platform s
 | macOS desktop | ✅ Feature-complete in code | Tauri v2 menu-bar app |
 | Linux desktop | 🟡 Builds in CI | `.deb` bundled in CI; keychain backend (libsecret) not yet wired |
 | Windows desktop | ⬜ Planned | Needs DPAPI/Credential Manager keychain |
-| iOS | 🟡 Core cross-compiles | App + File Provider extension not yet built |
+| iOS | 🟡 App builds + runs on simulator | SwiftUI app syncs via Rust core (verified); File Provider is a scaffold; TestFlight needs signing |
 | Android | ⬜ Planned | Tauri mobile (React Native + Rust fallback) |
 
 ## CLI
@@ -57,16 +57,32 @@ cd desktop && npm ci && npm run tauri build -- --bundles deb
 
 > Known gap: key storage currently shells out to the macOS `security` tool. A Linux secret-store backend (libsecret/kwallet) is still to be implemented, so the Linux build compiles and bundles but key storage is not yet functional there.
 
-## iOS (in progress)
+## iOS
 
-The Rust core cross-compiles to `aarch64-apple-ios` and `aarch64-apple-ios-sim`:
+The `mobile/` crate exposes the core to Swift via UniFFI. Build everything (staticlibs, bindings, XCFramework, Xcode project) with:
 
 ```bash
-rustup target add aarch64-apple-ios aarch64-apple-ios-sim
-cargo build -p obsink-core --target aarch64-apple-ios
+brew install xcodegen          # one-time
+./scripts/build-ios.sh
 ```
 
-Still to do: a UniFFI binding layer over the (async) core API, an XCFramework, and the Xcode App + File Provider extension targets with an App Group. See spec.md §11 for the File Provider design.
+Then build/run on a simulator:
+
+```bash
+xcodebuild -project ios/ObSink.xcodeproj -scheme ObSink -sdk iphonesimulator \
+  -destination 'platform=iOS Simulator,name=iPhone 17 Pro' CODE_SIGNING_ALLOWED=NO build
+```
+
+The SwiftUI app (sync button, status, vault setup, conflict resolution) talks to the Rust core through the generated `VaultClient`. Files sync into the App Group container (`group.com.obsink.shared`), which the File Provider extension exposes to Obsidian/Files.
+
+Run the on-simulator integration tests (the live-sync test reads `TEST_RUNNER_OBSINK_TEST_*` env for a worker URL, API key, vault ID, and passphrase):
+
+```bash
+xcodebuild test -project ios/ObSink.xcodeproj -scheme ObSink -sdk iphonesimulator \
+  -destination 'platform=iOS Simulator,name=iPhone 17 Pro' CODE_SIGNING_ALLOWED=NO
+```
+
+Remaining: iOS Keychain key storage, a full replicated File Provider (UUID identifiers, change tracking, `signalEnumerator`), and code-signing + TestFlight (select your team in Xcode — the project uses automatic signing). See spec.md §11 for the File Provider design.
 
 ## Android & Windows (planned)
 

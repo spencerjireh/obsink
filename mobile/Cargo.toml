@@ -1,0 +1,19 @@
+[package]
+name = "obsink-mobile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "obsink_mobile"
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dependencies]
+obsink-core = { path = "../core" }
+uniffi = { version = "0.28", features = ["cli"] }
+tokio = { version = "1", features = ["rt", "macros", "time", "net"] }
+thiserror = "1"

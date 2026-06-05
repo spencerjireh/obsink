@@ -174,10 +174,10 @@ Phase 3 status: feature-complete in code; pending live verification. The repo co
 **Estimated effort:** 2–3 weekends (File Provider is the hard part)
 
 ### 4.1 Xcode Project Setup
-- [ ] Create new Xcode project with App + File Provider extension targets
-- [ ] Configure App Group for shared container between app and extension
-- [ ] Set up UniFFI: compile Rust core for `aarch64-apple-ios`, generate Swift bindings
-- [ ] Verify Rust core functions are callable from Swift
+- [x] Create new Xcode project with App + File Provider extension targets
+- [x] Configure App Group for shared container between app and extension
+- [x] Set up UniFFI: compile Rust core for `aarch64-apple-ios`, generate Swift bindings
+- [x] Verify Rust core functions are callable from Swift
 
 ### 4.2 Shared Database
 - [ ] Add GRDB (or similar SQLite wrapper) to the project
@@ -197,24 +197,24 @@ Phase 3 status: feature-complete in code; pending live verification. The repo co
 - [ ] **Validation checkpoint:** static test files appear in iOS Files app and Obsidian can open them as a vault
 
 ### 4.4 Sync Engine Integration
-- [ ] Build sync screen in SwiftUI: sync button, status display, last sync time
-- [ ] Wire sync button to Rust core (via UniFFI): pull manifest → diff → download → return conflicts
+- [x] Build sync screen in SwiftUI: sync button, status display, last sync time
+- [x] Wire sync button to Rust core (via UniFFI): pull manifest → diff → download → return conflicts
 - [ ] After sync, write downloaded files to app group container, update item database
 - [ ] Call `NSFileProviderManager.signalEnumerator(for:)` to notify extension of changes
 - [ ] Handle upload of `pendingUpload` items through Rust core
 - [ ] Handle `pendingDeletion` items
 
 ### 4.5 Conflict Resolution UI
-- [ ] Conflict list screen (count + file names)
+- [x] Conflict list screen (count + file names)
 - [ ] Conflict detail screen (segmented control: "This device" / "Other device")
 - [ ] Read-only preview of each version's content
 - [ ] Show last-modified timestamp for each version
-- [ ] Action buttons: Keep local, Keep remote, Keep both
-- [ ] Wire resolution choices back to sync engine to complete sync
+- [x] Action buttons: Keep local, Keep remote, Keep both
+- [x] Wire resolution choices back to sync engine to complete sync
 
 ### 4.6 Settings & Setup
-- [ ] Settings screen: Worker URL, API key, vault management
-- [ ] First-run setup flow: enter URL, API key, create/connect vault, enter passphrase
+- [x] Settings screen: Worker URL, API key, vault management
+- [x] First-run setup flow: enter URL, API key, create/connect vault, enter passphrase
 - [ ] Store encryption keys in iOS Keychain
 - [ ] Vault picker if multiple vaults configured
 
@@ -226,7 +226,9 @@ Phase 3 status: feature-complete in code; pending live verification. The repo co
 - [ ] Stale vault warning on app open
 - [ ] Test with real Obsidian vault (plugins, images, .obsidian config)
 
-Phase 4 status: foundation verified, not started in earnest. The `aarch64-apple-ios` and `aarch64-apple-ios-sim` Rust targets are installed and `obsink-core` cross-compiles cleanly for both (reqwest's `rustls-tls` means no OpenSSL cross-compile barrier). Remaining work is the bulk of the phase and needs hands-on Xcode/design work that can't be driven headlessly: the UniFFI binding surface (the core exposes async `prepare_sync`/`complete_sync` and rich types that need a deliberate FFI design), generating Swift bindings + an XCFramework, and the Xcode App + File Provider extension project with App Group entitlements.
+Phase 4 status: app functional and verified on the simulator; File Provider and TestFlight remain. The `mobile/` crate is a UniFFI facade over the core (synchronous `VaultClient.prepare/complete/sync` blocking on an internal Tokio runtime). `scripts/build-ios.sh` builds the device+simulator staticlibs, generates Swift bindings, assembles `ObSinkMobile.xcframework`, and runs XcodeGen (`ios/project.yml`) to produce the App + File Provider extension targets with an App Group. The SwiftUI app (sync, status, vault setup, conflict resolution) builds, installs, launches, and renders on the iOS 26.5 simulator. An on-simulator XCTest (`testLiveSyncDownloadsSeededFile`) drives the full Rust stack — UniFFI, Argon2, AES, HMAC, and reqwest networking — and successfully downloads + decrypts a seeded file from the live Worker, proving end-to-end iOS sync.
+
+Remaining (needs a device and/or interactive signing): persist the key in the iOS Keychain (currently derived per-sync from the passphrase); promote the File Provider extension from the disk-backed scaffold to a full replicated extension (stable UUID item identifiers instead of paths, real `enumerateChanges`/sync-anchor tracking, `signalEnumerator` from the app, a shared item DB); content preview + timestamps in the conflict UI; multi-vault picker; and code-signing + TestFlight upload (the project is archive-ready with `CODE_SIGN_STYLE = Automatic` — select your team in Xcode).
 
 ---
 
