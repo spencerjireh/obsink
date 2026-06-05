@@ -88,7 +88,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: obsink-linux-deb
-          path: desktop/src-tauri/target/release/bundle/deb/*.deb
+          # Cargo workspace: bundles land in the workspace-root target/, not desktop/src-tauri/target/.
+          path: target/release/bundle/deb/*.deb
           if-no-files-found: error
 
   terraform-plan:
