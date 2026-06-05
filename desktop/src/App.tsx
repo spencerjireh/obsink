@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
 
 type SyncAction = {
   path: string
@@ -40,6 +41,14 @@ type SyncResponse = {
   pending_conflicts: Conflict[]
 }
 
+type ConflictPreview = {
+  path: string
+  local_text: string
+  remote_text: string
+  local_deleted: boolean
+  remote_deleted: boolean
+}
+
 type AddVaultMode = 'create' | 'connect'
 type ResolutionChoice = 'KeepLocal' | 'KeepRemote' | 'KeepBoth'
 
@@ -65,6 +74,10 @@ function formatUnix(value: number): string {
   return new Date(value * 1000).toLocaleString()
 }
 
+function countRemoteChanges(diff: SyncResult): number {
+  return diff.download.length + diff.conflicts.length
+}
+
 function App() {
   const [vaults, setVaults] = useState<LocalVault[]>([])
   const [status, setStatus] = useState<SyncStatus | null>(null)
@@ -74,6 +87,11 @@ function App() {
   const [syncResult, setSyncResult] = useState<SyncResult | null>(null)
   const [conflicts, setConflicts] = useState<Conflict[]>([])
   const [choices, setChoices] = useState<Record<string, ResolutionChoice>>({})
+  const [staleRemoteChanges, setStaleRemoteChanges] = useState(0)
+  const [selectedConflictPath, setSelectedConflictPath] = useState<string | null>(null)
+  const [conflictPreview, setConflictPreview] = useState<ConflictPreview | null>(null)
+  const [previewBusy, setPreviewBusy] = useState(false)
+  const handleSyncRef = useRef<() => Promise<void>>(async () => {})
 
   const activeVault = useMemo(
     () => vaults.find((vault) => vault.active) ?? null,
@@ -85,6 +103,15 @@ function App() {
       call<LocalVault[]>('get_vaults'),
       call<SyncStatus>('get_status'),
     ])
+
+    const nextActiveVault = nextVaults.find((vault) => vault.active) ?? null
+    if (nextActiveVault) {
+      const diff = await call<SyncResult>('get_manifest_diff', { vaultId: nextActiveVault.id })
+      setStaleRemoteChanges(countRemoteChanges(diff))
+    } else {
+      setStaleRemoteChanges(0)
+    }
+
     setVaults(nextVaults)
     setStatus(nextStatus)
   }
@@ -92,6 +119,53 @@ function App() {
   useEffect(() => {
     refresh().catch((error) => setMessage(String(error)))
   }, [])
+
+  useEffect(() => {
+    if (conflicts.length === 0) {
+      setSelectedConflictPath(null)
+      setConflictPreview(null)
+      return
+    }
+
+    if (!selectedConflictPath || !conflicts.some((conflict) => conflict.path === selectedConflictPath)) {
+      setSelectedConflictPath(conflicts[0].path)
+    }
+  }, [conflicts, selectedConflictPath])
+
+  useEffect(() => {
+    if (!activeVault || !selectedConflictPath) {
+      setConflictPreview(null)
+      return
+    }
+
+    let cancelled = false
+    setPreviewBusy(true)
+
+    call<ConflictPreview>('get_conflict_preview', {
+      vaultId: activeVault.id,
+      path: selectedConflictPath,
+    })
+      .then((preview) => {
+        if (!cancelled) {
+          setConflictPreview(preview)
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setMessage(String(error))
+          setConflictPreview(null)
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setPreviewBusy(false)
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [activeVault, selectedConflictPath])
 
   async function handleAddVault() {
     setBusy(true)
@@ -119,6 +193,7 @@ function App() {
       })
       setSyncResult(response.completed_result)
       setConflicts(response.pending_conflicts)
+      setSelectedConflictPath(response.pending_conflicts[0]?.path ?? null)
       setChoices(
         Object.fromEntries(
           response.pending_conflicts.map((conflict) => [conflict.path, 'KeepLocal']),
@@ -137,6 +212,19 @@ function App() {
       setBusy(false)
     }
   }
+
+  // Keep the ref pointed at the latest handleSync so the tray listener,
+  // registered once, always runs the current closure (with fresh activeVault).
+  handleSyncRef.current = handleSync
+
+  useEffect(() => {
+    const unlisten = listen('tray://sync-now', () => {
+      void handleSyncRef.current()
+    })
+    return () => {
+      void unlisten.then((dispose) => dispose())
+    }
+  }, [])
 
   async function handleResolveConflicts() {
     if (!activeVault) {
@@ -157,7 +245,28 @@ function App() {
       setSyncResult(result)
       setConflicts([])
       setChoices({})
+      setSelectedConflictPath(null)
+      setConflictPreview(null)
       setMessage('Conflict resolutions applied.')
+      await refresh()
+    } catch (error) {
+      setMessage(String(error))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function handleSetActiveVault(vaultId: string) {
+    setBusy(true)
+    setMessage('')
+
+    try {
+      await call<LocalVault>('set_active_vault', { vaultId })
+      setSyncResult(null)
+      setConflicts([])
+      setChoices({})
+      setSelectedConflictPath(null)
+      setConflictPreview(null)
       await refresh()
     } catch (error) {
       setMessage(String(error))
@@ -191,6 +300,13 @@ function App() {
             <strong>{status?.last_sync_manifest_path ?? 'Not synced yet'}</strong>
           </div>
         </div>
+
+        {staleRemoteChanges > 0 ? (
+          <div className="notice notice--warning">
+            {staleRemoteChanges} file{staleRemoteChanges === 1 ? '' : 's'} changed on another device.
+            Sync before editing.
+          </div>
+        ) : null}
       </section>
 
       <section className="grid">
@@ -229,6 +345,16 @@ function App() {
                 </header>
                 <p>{vault.worker_url}</p>
                 <code>{vault.local_path}</code>
+                <div className="vault-card__actions">
+                  <button
+                    className="button button--ghost"
+                    disabled={busy || vault.active}
+                    onClick={() => handleSetActiveVault(vault.id)}
+                    type="button"
+                  >
+                    {vault.active ? 'Current Vault' : 'Set Active'}
+                  </button>
+                </div>
               </article>
             ))}
           </div>
@@ -316,11 +442,35 @@ function App() {
               Apply Decisions
             </button>
           </div>
+          {selectedConflictPath && conflictPreview ? (
+            <div className="preview-panel">
+              <div className="preview-panel__header">
+                <strong>{selectedConflictPath}</strong>
+                <span>{previewBusy ? 'Refreshing preview...' : 'Read-only preview'}</span>
+              </div>
+              <div className="preview-columns">
+                <PreviewColumn
+                  title="This device"
+                  deleted={conflictPreview.local_deleted}
+                  content={conflictPreview.local_text}
+                />
+                <PreviewColumn
+                  title="Other device"
+                  deleted={conflictPreview.remote_deleted}
+                  content={conflictPreview.remote_text}
+                />
+              </div>
+            </div>
+          ) : null}
           {conflicts.length === 0 ? (
             <p className="empty-state">Conflicts will appear here when sync pauses for review.</p>
           ) : (
             conflicts.map((conflict) => (
-              <article key={conflict.path} className="conflict-card">
+              <article
+                key={conflict.path}
+                className={`conflict-card${selectedConflictPath === conflict.path ? ' conflict-card--selected' : ''}`}
+                onClick={() => setSelectedConflictPath(conflict.path)}
+              >
                 <header>
                   <h3>{conflict.path}</h3>
                   <span>
@@ -363,6 +513,15 @@ function ResultColumn({ title, items }: { title: string; items: SyncAction[] }) 
           <span>{item.kind}</span>
         </article>
       ))}
+    </div>
+  )
+}
+
+function PreviewColumn({ title, deleted, content }: { title: string; deleted: boolean; content: string }) {
+  return (
+    <div className="preview-column">
+      <h3>{title}</h3>
+      {deleted ? <p className="empty-state">Deleted in this version.</p> : <pre>{content || 'Empty file.'}</pre>}
     </div>
   )
 }

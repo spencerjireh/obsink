@@ -8,9 +8,9 @@ use std::{
 use clap::{Parser, Subcommand};
 use dirs::home_dir;
 use obsink_core::{
-    build_manifest_from_dir, complete_sync, derive_key, diff_local_and_remote, prepare_sync,
-    sync_manifest_path, ApiClient, Conflict, ConflictResolution, ConflictResolutionChoice,
-    CreateVaultRequest, KeyBytes, VaultConfig,
+    build_manifest_from_dir, complete_sync, derive_key, derive_keys, diff_local_and_remote,
+    prepare_sync, sync_manifest_path, ApiClient, Conflict, ConflictResolution,
+    ConflictResolutionChoice, CreateVaultRequest, KeyBytes, VaultConfig,
 };
 use rpassword::prompt_password;
 use serde::{Deserialize, Serialize};
@@ -80,8 +80,20 @@ fn main() {
     }
 }
 
+/// Logs go to stderr (stdout stays clean for scripted parsing). Verbosity is
+/// controlled by `RUST_LOG` (e.g. `RUST_LOG=obsink_core=debug`); default warn.
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
 #[tokio::main]
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    init_tracing();
     let cli = Cli::parse();
 
     match cli.command {
@@ -162,8 +174,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Status { directory } => {
             let stored = load_config()?;
+            let keys = derive_keys(&load_key_from_keychain(&stored.vault_id)?);
             let directory = directory.unwrap_or_else(|| PathBuf::from(&stored.local_path));
-            let manifest = build_manifest_from_dir(&directory)?;
+            let manifest = build_manifest_from_dir(&directory, &keys)?;
             let total_size: u64 = manifest.values().map(|entry| entry.size).sum();
 
             println!("directory: {}", directory.display());
@@ -171,7 +184,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("bytes: {total_size}");
 
             let remote = ApiClient::new(to_vault_config(&stored))
-                .get_manifest()
+                .get_manifest(&keys)
                 .await?;
             let diff = diff_local_and_remote(&manifest, &remote);
             println!("upload: {}", diff.upload.len());
@@ -257,12 +270,13 @@ async fn validate_passphrase(
     config: &CliConfig,
     key: &KeyBytes,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let keys = derive_keys(key);
     let client = ApiClient::new(to_vault_config(config));
-    let manifest = client.get_manifest().await?;
+    let manifest = client.get_manifest(&keys).await?;
 
     if let Some((path, entry)) = manifest.iter().find(|(_, entry)| !entry.deleted) {
-        let blob = client.get_file(path).await?;
-        obsink_core::decrypt(key, &blob)?;
+        let blob = client.get_file(path, &keys).await?;
+        obsink_core::decrypt(&keys.content_enc, &blob)?;
         println!("validated passphrase against {path}");
         println!("remote size: {} bytes", entry.size);
     }
@@ -292,9 +306,14 @@ fn to_vault_config(config: &CliConfig) -> VaultConfig {
 }
 
 fn config_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let home = home_dir()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory not found"))?;
-    Ok(home.join(CONFIG_FILE))
+    // OBSINK_HOME overrides the config location without touching HOME, so tests
+    // can isolate per-device config while leaving macOS keychain resolution intact.
+    let base = match std::env::var_os("OBSINK_HOME") {
+        Some(value) => PathBuf::from(value),
+        None => home_dir()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory not found"))?,
+    };
+    Ok(base.join(CONFIG_FILE))
 }
 
 fn save_config(config: &CliConfig) -> Result<(), Box<dyn std::error::Error>> {
