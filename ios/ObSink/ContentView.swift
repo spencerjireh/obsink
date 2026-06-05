@@ -1,0 +1,88 @@
+import SwiftUI
+
+struct ContentView: View {
+    @StateObject private var model = SyncModel()
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Status") {
+                    Text(model.status)
+                        .font(.callout)
+                        .foregroundStyle(model.status.hasPrefix("Error") ? .red : .primary)
+                    Button(action: model.sync) {
+                        HStack {
+                            if model.busy { ProgressView() }
+                            Text(model.busy ? "Working…" : "Sync Now")
+                        }
+                    }
+                    .disabled(model.busy || model.vaultID.isEmpty || model.passphrase.isEmpty)
+                }
+
+                Section("Vault") {
+                    LabeledField("Worker URL", text: $model.workerURL)
+                    LabeledField("API key", text: $model.apiKey)
+                    LabeledField("Vault ID", text: $model.vaultID)
+                    SecureField("Passphrase", text: $model.passphrase)
+                }
+
+                if !model.conflicts.isEmpty {
+                    Section("Conflicts") {
+                        ForEach(model.conflicts, id: \.path) { conflict in
+                            ConflictRow(conflict: conflict, choice: Binding(
+                                get: { model.choices[conflict.path] ?? .keepLocal },
+                                set: { model.choices[conflict.path] = $0 }
+                            ))
+                        }
+                        Button("Apply Resolutions", action: model.resolve)
+                            .disabled(model.busy)
+                    }
+                }
+            }
+            .navigationTitle("ObSink")
+        }
+    }
+}
+
+private struct LabeledField: View {
+    let label: String
+    @Binding var text: String
+
+    init(_ label: String, text: Binding<String>) {
+        self.label = label
+        self._text = text
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label).font(.caption).foregroundStyle(.secondary)
+            TextField(label, text: $text)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+        }
+    }
+}
+
+private struct ConflictRow: View {
+    let conflict: MobileConflict
+    @Binding var choice: MobileChoice
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(conflict.path).font(.subheadline.weight(.semibold))
+            Text("local \(conflict.localSize)B · remote \(conflict.remoteSize)B")
+                .font(.caption).foregroundStyle(.secondary)
+            Picker("Resolution", selection: $choice) {
+                Text("Keep local").tag(MobileChoice.keepLocal)
+                Text("Keep remote").tag(MobileChoice.keepRemote)
+                Text("Keep both").tag(MobileChoice.keepBoth)
+            }
+            .pickerStyle(.segmented)
+        }
+        .padding(.vertical, 4)
+    }
+}
+
+#Preview {
+    ContentView()
+}

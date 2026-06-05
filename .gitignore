@@ -13,3 +13,11 @@
 
 # macOS
 .DS_Store
+
+# iOS build artifacts (regenerate with scripts/build-ios.sh)
+/ios/Generated/
+/ios/Frameworks/
+/ios/ObSink.xcodeproj/
+/ios/build/
+/ios/DerivedData/
+/ios/headers/
