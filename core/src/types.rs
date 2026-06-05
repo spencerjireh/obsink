@@ -2,13 +2,19 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileEntry {
+    /// HMAC-SHA256 of the plaintext contents (hex).
     pub hash: String,
     pub modified: u64,
     pub size: u64,
     #[serde(default)]
     pub deleted: bool,
+    /// AES-GCM-encrypted real path (base64). Set by the server from the upload's
+    /// `X-Enc-Path` header so a fresh device can recover filenames from the
+    /// token-keyed manifest. Empty on locally-constructed entries.
+    #[serde(default, rename = "encPath")]
+    pub enc_path: String,
 }
 
 pub type Manifest = BTreeMap<String, FileEntry>;
@@ -93,6 +99,8 @@ pub enum BatchOperation {
         #[serde(rename = "contentHash")]
         content_hash: String,
         content: String,
+        #[serde(default, rename = "encPath")]
+        enc_path: String,
     },
     Delete {
         path: String,

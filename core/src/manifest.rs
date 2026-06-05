@@ -135,6 +135,7 @@ mod tests {
             modified,
             size: 10,
             deleted,
+            enc_path: String::new(),
         }
     }
 

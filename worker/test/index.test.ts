@@ -285,6 +285,49 @@ describe('worker', () => {
     })
   })
 
+  it('stores the encrypted path on upload and preserves it through a delete', async () => {
+    const env = createEnv()
+    const vault = await internal.createVault(
+      createRequest('https://example.com/vaults', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'main' }),
+      }),
+      env,
+    )
+
+    // The client addresses files by an opaque token and supplies the encrypted
+    // real path so a fresh device can recover filenames.
+    const token = 'a1b2c3'
+    await internal.putFile(
+      createRequest('https://example.com', {
+        method: 'PUT',
+        headers: { 'X-Content-Hash': 'hash-1', 'X-Enc-Path': 'ENC-PATH-BLOB' },
+        body: new TextEncoder().encode('hello'),
+      }),
+      env,
+      vault.vault.id,
+      token,
+    )
+
+    let manifest = await internal.getManifest(env, vault.vault.id)
+    expect(manifest[token].encPath).toBe('ENC-PATH-BLOB')
+
+    // A delete keeps the encrypted path so the tombstone is still resolvable.
+    await internal.deleteFile(
+      createRequest('https://example.com', {
+        method: 'DELETE',
+        headers: { 'X-Parent-Hash': 'hash-1' },
+      }),
+      env,
+      vault.vault.id,
+      token,
+    )
+
+    manifest = await internal.getManifest(env, vault.vault.id)
+    expect(manifest[token]).toMatchObject({ deleted: true, encPath: 'ENC-PATH-BLOB' })
+  })
+
   it('rejects uploads larger than the configured max file size', async () => {
     const env = createEnv()
     const ctx = createContext()
