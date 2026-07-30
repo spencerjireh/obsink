@@ -1,6 +1,6 @@
 # Platform Setup
 
-ObSink shares one Rust core across every client. This page covers per-platform setup and current status. See [progress.md](../progress.md) for the live checklist.
+ObSink shares one Rust core across every client. This page covers per-platform setup and current status. The live task/phase checklist lives in the Plane project `OBS` — see [AGENTS.md](../AGENTS.md) for the conventions.
 
 | Platform | Status | Notes |
 |---|---|---|
@@ -86,4 +86,4 @@ Remaining: iOS Keychain key storage, a full replicated File Provider (UUID ident
 
 ## Android & Windows (planned)
 
-Not started. Android targets Tauri mobile (with a React Native + Rust fallback); Windows needs a DPAPI/Credential Manager key store. Tracked in [progress.md](../progress.md).
+Not started. Android targets Tauri mobile (with a React Native + Rust fallback); Windows needs a DPAPI/Credential Manager key store. Tracked in the Plane project `OBS` (phases P5/P6).

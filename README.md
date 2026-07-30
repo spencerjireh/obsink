@@ -76,7 +76,7 @@ Set `RUST_LOG=obsink_core=debug` to see request- and sync-level logging from the
 
 ## Status
 
-Phases 1–2 (Rust core + CLI, Cloudflare Worker) are complete and deployed. Phase 3 (desktop) is feature-complete in code. iOS, Android, and Windows/Linux packaging are in progress — see [progress.md](progress.md).
+Phases 1–2 (Rust core + CLI, Cloudflare Worker) are complete and deployed. Phase 3 (desktop) is feature-complete in code. iOS, Android, and Windows/Linux packaging are in progress. Task and phase tracking lives in the **Plane project `OBS`** ("ObSink"); see [AGENTS.md](AGENTS.md) for the conventions.
 
 ## License
 
