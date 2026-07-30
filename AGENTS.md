@@ -93,6 +93,27 @@ RUST_LOG=obsink_core=debug cargo run -p obsink -- sync
 (cd worker && npm run deploy)
 ```
 
+## Local credentials (gitignored)
+
+The deployed test Worker and its client bearer live in a **gitignored** `.env`
+at the repo root (never commit it; `.gitignore` covers `.env`/`.env.*`/`worker/.dev.vars`).
+Source it for the CLI and the `scripts/verify-*` harnesses:
+
+```bash
+set -a; . ./.env; set +a
+RUST_LOG=obsink_core=debug cargo run -p obsink -- sync
+```
+
+- `WORKER_URL` — `https://obsink-worker.spencer-080.workers.dev` (account
+  `Spencer` / `080eb52a3c7398cf1e99d39f2c664bc8`).
+- `WORKER_API_KEY` — the Worker's `API_KEY` secret (client bearer; rotated
+  2026-07-30). Cloudflare secrets are write-only, so this is the only copy.
+
+The Cloudflare **account API token** used for `wrangler`/deploys is **not**
+stored here — create one in the dashboard on demand and revoke it after. A
+`#[ignore]`d live desktop test reads `OBSINK_TEST_WORKER_URL` /
+`OBSINK_TEST_API_KEY` (see `docs/platforms.md`).
+
 ## Workflow expectations
 
 - Rules questions: check `spec.md` first; if the spec is ambiguous, say so and
@@ -109,7 +130,7 @@ Status, tasks, decisions, and session logs live in the Plane project **OBS**
 ("ObSink"), reachable via the plane MCP tools. Conventions:
 
 - `spec.md` phases **P1–P7** are Plane *modules*; module status tracks phase
-  progression (P1/P2 completed; P3/P4/P7 in-progress; P5/P6 backlog).
+  progression (P1/P2/P3 completed; P4/P7 in-progress; P5/P6 backlog).
 - Work items are session-sized; move to **In Progress** when starting, comment
   outcomes (e.g. test output or a deploy URL), then mark **Done**. Reference the
   item in commits: `P4: file-provider enumerateChanges (OBS-12)`.

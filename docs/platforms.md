@@ -5,7 +5,7 @@ ObSink shares one Rust core across every client. This page covers per-platform s
 | Platform | Status | Notes |
 |---|---|---|
 | CLI (`obsink`) | ✅ Complete | Reference client; macOS Keychain for key storage |
-| macOS desktop | ✅ Feature-complete in code | Tauri v2 menu-bar app |
+| macOS desktop | ✅ Verified end-to-end | Tauri v2 menu-bar app; flows covered by `live_tests::desktop_flows_live` (`#[ignore]`) |
 | Linux desktop | 🟡 Builds in CI | `.deb` bundled in CI; keychain backend (libsecret) not yet wired |
 | Windows desktop | ⬜ Planned | Needs DPAPI/Credential Manager keychain |
 | iOS | 🟡 App builds + runs on simulator | SwiftUI app syncs via Rust core (verified); File Provider is a scaffold; TestFlight needs signing |
@@ -45,6 +45,18 @@ Behavior:
 - Configure a vault in the UI (Worker URL, API key, create/connect, passphrase, local folder), then Sync. Conflicts open a side-by-side preview before you choose a winner.
 
 Point Obsidian at the vault's local folder — it opens as a normal vault with no plugin.
+
+### End-to-end verification
+
+The desktop command layer (the exact Tauri commands the UI invokes) is covered by an ignored live integration test that runs against a deployed Worker:
+
+```bash
+OBSINK_TEST_WORKER_URL=https://obsink-worker.<subdomain>.workers.dev \
+OBSINK_TEST_API_KEY=... OBSINK_TEST_PASSPHRASE=... \
+cargo test -p obsink-desktop live_tests -- --ignored --nocapture
+```
+
+It verifies vault create/connect + passphrase validation, the full sync cycle with cross-device propagation, all three conflict resolutions (KeepLocal / KeepRemote / KeepBoth) via an equal-mtime conflict, stale-vault detection (the banner's data source), and multi-vault switching. It uses a sandboxed `HOME` and the file-backed keyring (`OBSINK_KEYRING_DIR`) so it never prompts the macOS keychain or pollutes `~/.obsink/app.json`.
 
 ## Linux desktop
 

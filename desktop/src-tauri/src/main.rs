@@ -247,10 +247,9 @@ async fn get_manifest_diff(vault_id: Option<String>) -> Result<SyncResult, Strin
     Ok(diff_local_and_remote(&local_manifest, &remote_manifest))
 }
 
-#[tauri::command]
-async fn sync_vault(
+async fn sync_vault_inner(
     vault_id: Option<String>,
-    state: tauri::State<'_, AppState>,
+    state: &AppState,
 ) -> Result<SyncCommandResponse, String> {
     let vault = selected_vault(vault_id).map_err(err_string)?;
     let key = load_key_from_keychain(&vault.id).map_err(err_string)?;
@@ -282,10 +281,17 @@ async fn sync_vault(
 }
 
 #[tauri::command]
-async fn resolve_conflict(
+async fn sync_vault(
+    vault_id: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<SyncCommandResponse, String> {
+    sync_vault_inner(vault_id, &state).await
+}
+
+async fn resolve_conflict_inner(
     vault_id: String,
     resolutions: Vec<ConflictResolution>,
-    state: tauri::State<'_, AppState>,
+    state: &AppState,
 ) -> Result<SyncResult, String> {
     let vault = selected_vault(Some(vault_id.clone())).map_err(err_string)?;
     let plan = state
@@ -302,10 +308,18 @@ async fn resolve_conflict(
 }
 
 #[tauri::command]
-async fn get_conflict_preview(
+async fn resolve_conflict(
+    vault_id: String,
+    resolutions: Vec<ConflictResolution>,
+    state: tauri::State<'_, AppState>,
+) -> Result<SyncResult, String> {
+    resolve_conflict_inner(vault_id, resolutions, &state).await
+}
+
+async fn get_conflict_preview_inner(
     vault_id: String,
     path: String,
-    state: tauri::State<'_, AppState>,
+    state: &AppState,
 ) -> Result<ConflictPreview, String> {
     let vault = selected_vault(Some(vault_id.clone())).map_err(err_string)?;
     let conflict = {
@@ -352,6 +366,15 @@ async fn get_conflict_preview(
         local_deleted: conflict.local.deleted,
         remote_deleted: conflict.remote.deleted,
     })
+}
+
+#[tauri::command]
+async fn get_conflict_preview(
+    vault_id: String,
+    path: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<ConflictPreview, String> {
+    get_conflict_preview_inner(vault_id, path, &state).await
 }
 
 fn validate_request(request: &AddVaultRequest) -> Result<(), String> {
@@ -461,6 +484,14 @@ fn upsert_vault(vault: StoredVault) -> Result<(), io::Error> {
 
 fn save_key_to_keychain(vault_id: &str, key: &KeyBytes) -> Result<(), io::Error> {
     let key_hex = hex::encode(key);
+
+    // Test/dev escape hatch: store the key as a file instead of the macOS
+    // keychain so live integration tests can run non-interactively. Production
+    // builds leave this unset and use the real keychain below.
+    if let Ok(dir) = std::env::var("OBSINK_KEYRING_DIR") {
+        return fs::write(PathBuf::from(dir).join(vault_id), key_hex);
+    }
+
     let _ = Command::new("security")
         .args([
             "delete-generic-password",
@@ -495,6 +526,24 @@ fn save_key_to_keychain(vault_id: &str, key: &KeyBytes) -> Result<(), io::Error>
 }
 
 fn load_key_from_keychain(vault_id: &str) -> Result<KeyBytes, io::Error> {
+    // Test/dev escape hatch (see save_key_to_keychain).
+    if let Ok(dir) = std::env::var("OBSINK_KEYRING_DIR") {
+        let hex_value = fs::read_to_string(PathBuf::from(dir).join(vault_id))?
+            .trim()
+            .to_string();
+        let bytes = hex::decode(hex_value)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if bytes.len() != 32 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stored key has invalid length",
+            ));
+        }
+        let mut key = [0_u8; 32];
+        key.copy_from_slice(&bytes);
+        return Ok(key);
+    }
+
     let output = Command::new("security")
         .args([
             "find-generic-password",
@@ -629,4 +678,279 @@ fn main() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+    use obsink_core::{derive_keys, load_manifest_from_disk, sync_manifest_path, ApiClient, ConflictResolutionChoice, VaultConfig};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        time::{Duration, SystemTime},
+    };
+
+    /// `#[ignore]`d live integration test: drives the real desktop command
+    /// functions (add_vault / set_active_vault / get_status / sync_vault_inner /
+    /// get_conflict_preview_inner / resolve_conflict_inner) end-to-end against a
+    /// deployed Worker. Run with:
+    ///   OBSINK_TEST_WORKER_URL=... OBSINK_TEST_API_KEY=... \
+    ///   cargo test -p obsink-desktop live_tests -- --ignored --nocapture
+    #[ignore]
+    #[tokio::test]
+    async fn desktop_flows_live() {
+        let worker_url = env_or_panic("OBSINK_TEST_WORKER_URL");
+        let api_key = env_or_panic("OBSINK_TEST_API_KEY");
+        let passphrase =
+            std::env::var("OBSINK_TEST_PASSPHRASE").unwrap_or_else(|_| {
+                "obsink-test-passphrase-2026".to_string()
+            });
+
+        // Sandbox HOME so the desktop's ~/.obsink/app.json is isolated from the
+        // user's real config. (Keychain is real and keyed per vault id.)
+        let sandbox = PathBuf::from(format!("/tmp/obsink-desktop-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&sandbox);
+        let dir_a = sandbox.join("deviceA");
+        let dir_b = sandbox.join("deviceB");
+        let dir_c = sandbox.join("deviceC");
+        fs::create_dir_all(dir_a.join("notes")).unwrap();
+        fs::create_dir_all(dir_b.join("notes")).unwrap();
+        fs::create_dir_all(&dir_c).unwrap();
+        std::env::set_var("HOME", &sandbox);
+        // Use the file-backed keyring so the live test never prompts the macOS keychain.
+        let keyring_dir = sandbox.join("keyring");
+        fs::create_dir_all(&keyring_dir).unwrap();
+        std::env::set_var("OBSINK_KEYRING_DIR", &keyring_dir);
+
+        let state = AppState::default();
+        let file_rel = "notes/a.md";
+
+        // ===== OBS-3: add (Create) + upload + cross-device download =====
+        let summary = add_vault(AddVaultRequest {
+            mode: AddVaultMode::Create,
+            worker_url: worker_url.clone(),
+            api_key: api_key.clone(),
+            local_path: dir_a.to_string_lossy().into_owned(),
+            vault_name: "obsink-desktop-verify".to_string(),
+            vault_id: String::new(),
+            passphrase: passphrase.clone(),
+        })
+        .await
+        .unwrap();
+        let vault_id = summary.id.clone();
+        println!("OBS-3: created vault {vault_id}");
+        load_key_from_keychain(&vault_id).expect("OBS-3: keychain entry present after add");
+        assert!(get_vaults().unwrap().iter().any(|v| v.id == vault_id && v.active));
+
+        fs::write(dir_a.join(file_rel), "content-A").unwrap();
+        let resp = sync_vault_inner(Some(vault_id.clone()), &state).await.unwrap();
+        assert!(resp.pending_conflicts.is_empty());
+        assert_eq!(
+            resp.completed_result.unwrap().upload.len(),
+            1,
+            "OBS-3: a.md should upload"
+        );
+
+        // Connect device B (same passphrase -> same key) and pull.
+        add_vault(AddVaultRequest {
+            mode: AddVaultMode::Connect,
+            worker_url: worker_url.clone(),
+            api_key: api_key.clone(),
+            local_path: dir_b.to_string_lossy().into_owned(),
+            vault_name: String::new(),
+            vault_id: vault_id.clone(),
+            passphrase: passphrase.clone(),
+        })
+        .await
+        .unwrap(); // validate_passphrase decrypts a.md -> proves the key works
+        let resp_b = sync_vault_inner(Some(vault_id.clone()), &state).await.unwrap();
+        assert_eq!(
+            resp_b.completed_result.unwrap().download.len(),
+            1,
+            "OBS-3: a.md should download on B"
+        );
+        assert_eq!(
+            fs::read_to_string(dir_b.join(file_rel)).unwrap(),
+            "content-A",
+            "OBS-3: content propagated Mac -> server -> iOS-equivalent"
+        );
+
+        // ===== OBS-5: stale-vault detection (server ahead of client) =====
+        // B uploads a new file the A-side view doesn't have.
+        fs::write(dir_b.join("notes/b.md"), "B-only").unwrap();
+        sync_vault_inner(Some(vault_id.clone()), &state).await.unwrap();
+        // Repoint the active local folder at A (which is now behind the server).
+        connect_local(&worker_url, &api_key, &vault_id, &passphrase, &dir_a).await;
+        let status = get_status().await.unwrap();
+        assert_eq!(status.active_vault_id.as_deref(), Some(vault_id.as_str()));
+        assert!(
+            status.pending_downloads >= 1,
+            "OBS-5: expected remote changes pending (b.md) -> banner source"
+        );
+
+        // ===== OBS-4: conflict resolution — all three choices =====
+        let choices = [
+            ConflictResolutionChoice::KeepLocal,
+            ConflictResolutionChoice::KeepRemote,
+            ConflictResolutionChoice::KeepBoth,
+        ];
+        for choice in choices {
+            // Rebaseline: A's a.md == "REMOTE", then sync so server == local.
+            fs::write(dir_a.join(file_rel), "REMOTE").unwrap();
+            let _ = sync_vault_inner(Some(vault_id.clone()), &state).await.unwrap();
+            let ts = server_modified_for(&dir_a, file_rel);
+
+            // Engineer a conflict: different content, same (pinned) mtime.
+            let local_text = format!("LOCAL-{choice:?}");
+            fs::write(dir_a.join(file_rel), &local_text).unwrap();
+            set_mtime(&dir_a.join(file_rel), ts);
+
+            let resp = sync_vault_inner(Some(vault_id.clone()), &state).await.unwrap();
+            assert_eq!(
+                resp.pending_conflicts.len(),
+                1,
+                "OBS-4 ({choice:?}): expected 1 conflict"
+            );
+            assert!(resp.completed_result.is_none());
+
+            // Side-by-side preview decrypts the remote blob via the desktop path.
+            let preview = get_conflict_preview_inner(
+                vault_id.clone(),
+                file_rel.to_string(),
+                &state,
+            )
+            .await
+            .unwrap();
+            assert_eq!(preview.local_text, local_text, "OBS-4 ({choice:?}): local preview");
+            assert_eq!(preview.remote_text, "REMOTE", "OBS-4 ({choice:?}): remote preview");
+
+            let result = resolve_conflict_inner(
+                vault_id.clone(),
+                vec![ConflictResolution {
+                    path: file_rel.to_string(),
+                    choice: choice.clone(),
+                }],
+                &state,
+            )
+            .await
+            .unwrap();
+            assert!(
+                result.conflicts.is_empty(),
+                "OBS-4 ({choice:?}): no late 409 expected"
+            );
+
+            match choice {
+                ConflictResolutionChoice::KeepLocal => {
+                    let remote = remote_text(&worker_url, &api_key, &vault_id, file_rel).await;
+                    assert_eq!(
+                        remote, local_text,
+                        "OBS-4 (KeepLocal): server should hold the local version"
+                    );
+                }
+                ConflictResolutionChoice::KeepRemote => {
+                    assert_eq!(
+                        fs::read_to_string(dir_a.join(file_rel)).unwrap(),
+                        "REMOTE",
+                        "OBS-4 (KeepRemote): local should hold the remote version"
+                    );
+                }
+                ConflictResolutionChoice::KeepBoth => {
+                    assert_eq!(
+                        fs::read_to_string(dir_a.join("notes/a.conflict.md")).unwrap(),
+                        "REMOTE",
+                        "OBS-4 (KeepBoth): a.conflict.md should hold the remote version"
+                    );
+                    assert_eq!(
+                        remote_text(&worker_url, &api_key, &vault_id, file_rel).await,
+                        local_text,
+                        "OBS-4 (KeepBoth): server should hold the local version"
+                    );
+                    let _ = fs::remove_file(dir_a.join("notes/a.conflict.md"));
+                }
+            }
+            println!("OBS-4 ({choice:?}): resolution verified");
+        }
+
+        // ===== OBS-6: multiple-vault switching =====
+        let s2 = add_vault(AddVaultRequest {
+            mode: AddVaultMode::Create,
+            worker_url: worker_url.clone(),
+            api_key: api_key.clone(),
+            local_path: dir_c.to_string_lossy().into_owned(),
+            vault_name: "obsink-desktop-verify-2".to_string(),
+            vault_id: String::new(),
+            passphrase: passphrase.clone(),
+        })
+        .await
+        .unwrap();
+        let vault_id_2 = s2.id.clone();
+        // Both vaults' keys live in the keyring simultaneously.
+        load_key_from_keychain(&vault_id).expect("OBS-6: vault 1 key resolves");
+        load_key_from_keychain(&vault_id_2).expect("OBS-6: vault 2 key resolves");
+        assert_eq!(get_vaults().unwrap().len(), 2, "OBS-6: two vaults configured");
+
+        // Switch active back to vault 1; keychain lookup must follow the active id.
+        let active = set_active_vault(vault_id.clone()).unwrap();
+        assert!(active.active);
+        assert_eq!(active.id, vault_id);
+        let st = get_status().await.unwrap();
+        assert_eq!(
+            st.active_vault_id.as_deref(),
+            Some(vault_id.as_str()),
+            "OBS-6: active vault switched"
+        );
+        println!("OBS-6: multi-vault switching verified");
+
+        println!("ALL DESKTOP FLOWS VERIFIED: vaults={vault_id}, {vault_id_2}");
+        let _ = fs::remove_dir_all(&sandbox);
+    }
+
+    fn env_or_panic(key: &str) -> String {
+        std::env::var(key).unwrap_or_else(|_| panic!("set {key}"))
+    }
+
+    async fn connect_local(
+        worker_url: &str,
+        api_key: &str,
+        vault_id: &str,
+        passphrase: &str,
+        local_path: &Path,
+    ) {
+        add_vault(AddVaultRequest {
+            mode: AddVaultMode::Connect,
+            worker_url: worker_url.to_string(),
+            api_key: api_key.to_string(),
+            local_path: local_path.to_string_lossy().into_owned(),
+            vault_name: String::new(),
+            vault_id: vault_id.to_string(),
+            passphrase: passphrase.to_string(),
+        })
+        .await
+        .unwrap();
+    }
+
+    fn server_modified_for(dir: &Path, rel: &str) -> u64 {
+        let manifest = load_manifest_from_disk(&sync_manifest_path(dir)).unwrap();
+        manifest.get(rel).unwrap().modified
+    }
+
+    fn set_mtime(path: &Path, secs: u64) {
+        let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    async fn remote_text(worker_url: &str, api_key: &str, vault_id: &str, path: &str) -> String {
+        let key = load_key_from_keychain(vault_id).unwrap();
+        let keys = derive_keys(&key);
+        let config = VaultConfig {
+            worker_url: worker_url.to_string(),
+            api_key: api_key.to_string(),
+            vault_id: vault_id.to_string(),
+            local_path: String::new(),
+        };
+        let blob = ApiClient::new(config).get_file(path, &keys).await.unwrap();
+        let bytes = obsink_core::decrypt(&keys.content_enc, &blob).unwrap();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
 }
