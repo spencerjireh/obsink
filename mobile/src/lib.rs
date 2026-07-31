@@ -6,11 +6,11 @@
 //! `VaultClient` object holds the derived key and the pending sync plan between
 //! the `prepare` and `complete` phases, mirroring the desktop flow.
 
-use std::sync::Mutex;
+use std::{fs, path::Path, sync::Mutex};
 
 use obsink_core::{
-    complete_sync, derive_key, prepare_sync, ConflictResolution, ConflictResolutionChoice,
-    KeyBytes, SyncPlan, VaultConfig,
+    complete_sync, decrypt, derive_key, derive_keys, prepare_sync, ApiClient, ConflictResolution,
+    ConflictResolutionChoice, CreateVaultRequest, KeyBytes, SyncPlan, VaultConfig, VaultSummary,
 };
 
 uniffi::setup_scaffolding!();
@@ -98,12 +98,77 @@ pub struct SyncOutcome {
     pub completed: bool,
 }
 
+/// A vault the host can list/create/connect to (OBS-28).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MobileVaultSummary {
+    pub id: String,
+    pub name: String,
+    pub created: u64,
+    pub max_file_size: u64,
+}
+
+impl From<VaultSummary> for MobileVaultSummary {
+    fn from(v: VaultSummary) -> Self {
+        Self {
+            id: v.id,
+            name: v.name,
+            created: v.created,
+            max_file_size: v.max_file_size,
+        }
+    }
+}
+
+/// Read-only content preview of both sides of a conflict (OBS-25).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MobileConflictPreview {
+    pub path: String,
+    pub local_text: String,
+    pub remote_text: String,
+    pub local_deleted: bool,
+    pub remote_deleted: bool,
+}
+
+/// A Worker-only config (no vault id / local path) for list/create calls.
+fn worker_only(worker_url: String, api_key: String) -> VaultConfig {
+    VaultConfig {
+        worker_url,
+        api_key,
+        vault_id: String::new(),
+        local_path: String::new(),
+    }
+}
+
 /// Derive the 32-byte master key from a passphrase and vault ID (the salt).
 #[uniffi::export]
 pub fn derive_master_key(passphrase: String, vault_id: String) -> Result<Vec<u8>, MobileError> {
     derive_key(&passphrase, vault_id.as_bytes())
         .map(|key| key.to_vec())
         .map_err(sync_err)
+}
+
+/// List vaults reachable at a Worker (OBS-28).
+#[uniffi::export]
+pub fn list_vaults(worker_url: String, api_key: String) -> Result<Vec<MobileVaultSummary>, MobileError> {
+    let vaults =
+        block_on(ApiClient::new(worker_only(worker_url, api_key)).list_vaults()).map_err(sync_err)?;
+    Ok(vaults.into_iter().map(MobileVaultSummary::from).collect())
+}
+
+/// Create a new vault at a Worker; returns its id + metadata (OBS-28).
+#[uniffi::export]
+pub fn create_vault(
+    worker_url: String,
+    api_key: String,
+    name: String,
+) -> Result<MobileVaultSummary, MobileError> {
+    let request = CreateVaultRequest {
+        name,
+        max_file_size: 50 * 1024 * 1024,
+    };
+    let response =
+        block_on(ApiClient::new(worker_only(worker_url, api_key)).create_vault(&request))
+            .map_err(sync_err)?;
+    Ok(response.vault.into())
 }
 
 /// Stateful sync client for one vault. Holds the derived key and the pending
@@ -185,6 +250,46 @@ impl VaultClient {
             return self.complete(Vec::new());
         }
         Ok(outcome)
+    }
+
+    /// Decrypt/read both sides of a pending conflict for the UI preview (OBS-25).
+    /// Requires a pending plan from `prepare`/`sync`.
+    pub fn conflict_preview(&self, path: String) -> Result<MobileConflictPreview, MobileError> {
+        let conflict = {
+            let guard = self.pending.lock().expect("pending lock");
+            let plan = guard.as_ref().ok_or(MobileError::NoPendingSync)?;
+            plan.conflicts
+                .iter()
+                .find(|conflict| conflict.path == path)
+                .cloned()
+                .ok_or_else(|| MobileError::Sync {
+                    message: format!("no pending conflict for {path}"),
+                })?
+        };
+        let keys = derive_keys(&self.key);
+
+        let local_text = if conflict.local.deleted {
+            String::new()
+        } else {
+            fs::read_to_string(Path::new(&self.config.local_path).join(&path)).unwrap_or_default()
+        };
+
+        let (remote_text, remote_deleted) = if conflict.remote.deleted {
+            (String::new(), true)
+        } else {
+            let blob =
+                block_on(ApiClient::new(self.config.clone()).get_file(&path, &keys)).map_err(sync_err)?;
+            let bytes = decrypt(&keys.content_enc, &blob).map_err(sync_err)?;
+            (String::from_utf8_lossy(&bytes).into_owned(), false)
+        };
+
+        Ok(MobileConflictPreview {
+            path,
+            local_text,
+            remote_text,
+            local_deleted: conflict.local.deleted,
+            remote_deleted,
+        })
     }
 }
 

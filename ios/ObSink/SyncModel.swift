@@ -22,6 +22,7 @@ final class SyncModel: ObservableObject {
     @Published var hasStoredKey: Bool = false
     @Published var conflicts: [MobileConflict] = []
     @Published var choices: [String: MobileChoice] = [:]
+    @Published var previews: [String: MobileConflictPreview] = [:]
 
     private var client: VaultClient?
     private let defaults: UserDefaults
@@ -127,6 +128,7 @@ final class SyncModel: ObservableObject {
         self.client = client
         conflicts = outcome.conflicts
         choices = Dictionary(uniqueKeysWithValues: outcome.conflicts.map { ($0.path, .keepLocal) })
+        previews = [:]
         busy = false
         if outcome.completed {
             status = "Synced · ↑\(outcome.uploaded) ↓\(outcome.downloaded)"
@@ -140,8 +142,25 @@ final class SyncModel: ObservableObject {
             refreshPending()
         } else if !outcome.conflicts.isEmpty {
             status = "\(outcome.conflicts.count) conflict(s) need attention"
+            loadPreviews()
         } else {
             status = "Prepared · ↑\(outcome.uploaded) ↓\(outcome.downloaded)"
+        }
+    }
+
+    /// Fetch read-only local/remote content previews for each pending conflict
+    /// (OBS-25) so the detail screen can show both versions.
+    private func loadPreviews() {
+        guard let client else { return }
+        let paths = conflicts.map(\.path)
+        Task.detached {
+            var loaded: [String: MobileConflictPreview] = [:]
+            for path in paths {
+                if let preview = try? client.conflictPreview(path: path) {
+                    loaded[path] = preview
+                }
+            }
+            await MainActor.run { self.previews = loaded }
         }
     }
 

@@ -39,10 +39,21 @@ struct ContentView: View {
                 if !model.conflicts.isEmpty {
                     Section("Conflicts") {
                         ForEach(model.conflicts, id: \.path) { conflict in
-                            ConflictRow(conflict: conflict, choice: Binding(
-                                get: { model.choices[conflict.path] ?? .keepLocal },
-                                set: { model.choices[conflict.path] = $0 }
-                            ))
+                            NavigationLink {
+                                ConflictDetailView(
+                                    path: conflict.path,
+                                    model: model,
+                                    choice: Binding(
+                                        get: { model.choices[conflict.path] ?? .keepLocal },
+                                        set: { model.choices[conflict.path] = $0 }
+                                    )
+                                )
+                            } label: {
+                                ConflictRow(conflict: conflict, choice: Binding(
+                                    get: { model.choices[conflict.path] ?? .keepLocal },
+                                    set: { model.choices[conflict.path] = $0 }
+                                ))
+                            }
                         }
                         Button("Apply Resolutions", action: model.resolve)
                             .disabled(model.busy)
@@ -103,6 +114,47 @@ private struct ConflictRow: View {
             .pickerStyle(.segmented)
         }
         .padding(.vertical, 4)
+    }
+}
+
+/// Per-conflict detail screen (OBS-24/25): segmented winner + read-only preview
+/// of both versions' decrypted content.
+private struct ConflictDetailView: View {
+    let path: String
+    @ObservedObject var model: SyncModel
+    @Binding var choice: MobileChoice
+
+    var body: some View {
+        Form {
+            Section("Resolution") {
+                Picker("Winner", selection: $choice) {
+                    Text("Keep local").tag(MobileChoice.keepLocal)
+                    Text("Keep remote").tag(MobileChoice.keepRemote)
+                    Text("Keep both").tag(MobileChoice.keepBoth)
+                }
+                .pickerStyle(.segmented)
+            }
+            Section("This device") {
+                previewText(model.previews[path]?.localText, deleted: model.previews[path]?.localDeleted ?? false)
+            }
+            Section("Other device") {
+                previewText(model.previews[path]?.remoteText, deleted: model.previews[path]?.remoteDeleted ?? false)
+            }
+        }
+        .navigationTitle(path)
+    }
+
+    @ViewBuilder
+    private func previewText(_ text: String?, deleted: Bool) -> some View {
+        if deleted {
+            Text("(deleted on this side)").font(.caption).foregroundStyle(.secondary)
+        } else if let text {
+            Text(text.isEmpty ? "(empty)" : text)
+                .font(.system(.body, design: .monospaced))
+                .textSelection(.enabled)
+        } else {
+            Text("Loading…").foregroundStyle(.secondary)
+        }
     }
 }
 
