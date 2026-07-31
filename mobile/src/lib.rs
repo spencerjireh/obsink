@@ -204,7 +204,8 @@ impl VaultClient {
     /// Pull the remote manifest, apply downloads, and report pending uploads and
     /// conflicts. Stores the plan so `complete` can finish the cycle.
     pub fn prepare(&self) -> Result<SyncOutcome, MobileError> {
-        let plan = block_on(prepare_sync(&self.config, &self.key)).map_err(sync_err)?;
+        let plan = block_on(prepare_sync(&self.config, &self.key, &obsink_core::NoProgress))
+            .map_err(sync_err)?;
         let outcome = SyncOutcome {
             uploaded: plan.upload.len() as u32,
             downloaded: plan.download.len() as u32,
@@ -231,8 +232,14 @@ impl VaultClient {
                 choice: resolution.choice.into(),
             })
             .collect();
-        let result = block_on(complete_sync(&self.config, &self.key, &plan, &resolutions))
-            .map_err(sync_err)?;
+        let result = block_on(complete_sync(
+            &self.config,
+            &self.key,
+            &plan,
+            &resolutions,
+            &obsink_core::NoProgress,
+        ))
+        .map_err(sync_err)?;
         Ok(SyncOutcome {
             uploaded: result.upload.len() as u32,
             downloaded: result.download.len() as u32,

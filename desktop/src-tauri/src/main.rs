@@ -253,14 +253,20 @@ async fn sync_vault_inner(
 ) -> Result<SyncCommandResponse, String> {
     let vault = selected_vault(vault_id).map_err(err_string)?;
     let key = load_key_from_keychain(&vault.id).map_err(err_string)?;
-    let plan = prepare_sync(&to_vault_config(&vault), &key)
+    let plan = prepare_sync(&to_vault_config(&vault), &key, &obsink_core::NoProgress)
         .await
         .map_err(err_string)?;
 
     if plan.conflicts.is_empty() {
-        let result = complete_sync(&to_vault_config(&vault), &key, &plan, &[])
-            .await
-            .map_err(err_string)?;
+        let result = complete_sync(
+            &to_vault_config(&vault),
+            &key,
+            &plan,
+            &[],
+            &obsink_core::NoProgress,
+        )
+        .await
+        .map_err(err_string)?;
         return Ok(SyncCommandResponse {
             completed_result: Some(result),
             pending_conflicts: Vec::new(),
@@ -302,9 +308,15 @@ async fn resolve_conflict_inner(
         .ok_or_else(|| format!("no pending conflict set for {}", vault_id))?;
     let key = load_key_from_keychain(&vault.id).map_err(err_string)?;
 
-    complete_sync(&to_vault_config(&vault), &key, &plan, &resolutions)
-        .await
-        .map_err(err_string)
+    complete_sync(
+        &to_vault_config(&vault),
+        &key,
+        &plan,
+        &resolutions,
+        &obsink_core::NoProgress,
+    )
+    .await
+    .map_err(err_string)
 }
 
 #[tauri::command]

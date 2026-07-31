@@ -11,9 +11,10 @@ use crate::{
     crypto::{decrypt, derive_keys, encrypt, CryptoError, CryptoKeys, KeyBytes},
     hasher::{build_manifest_from_dir, hash_file, HasherError},
     manifest::{diff_manifests, ManifestDiff},
+    progress::{ProgressEvent, ProgressSink, SyncPhase},
     types::{
         Conflict, ConflictResolution, ConflictResolutionChoice, FileEntry, Manifest, SyncAction,
-        SyncActionKind, SyncPlan, SyncResult, VaultConfig,
+        SyncActionKind, SyncFailure, SyncPlan, SyncResult, VaultConfig,
     },
 };
 
@@ -73,6 +74,7 @@ pub fn build_working_manifest_for_path(
 pub async fn prepare_sync(
     config: &VaultConfig,
     key: &KeyBytes,
+    progress: &dyn ProgressSink,
 ) -> Result<SyncPlan, SyncEngineError> {
     let keys = derive_keys(key);
     let client = ApiClient::new(config.clone());
@@ -81,19 +83,22 @@ pub async fn prepare_sync(
     let remote_manifest = client.get_manifest(&keys).await?;
     let diff = diff_manifests(&working_manifest, &remote_manifest);
 
-    apply_downloads(local_root, &keys, &client, &diff.download).await?;
+    progress.report(ProgressEvent::Phase(SyncPhase::Downloading));
+    let download_failures = apply_downloads(local_root, &keys, &client, &diff.download, progress).await;
 
     tracing::info!(
         vault = %config.vault_id,
         uploads = diff.upload.len(),
         downloads = diff.download.len(),
         conflicts = diff.conflicts.len(),
+        download_failures = download_failures.len(),
         "prepared sync plan"
     );
     Ok(SyncPlan {
         upload: diff.upload,
         download: diff.download,
         conflicts: diff.conflicts,
+        failures: download_failures,
     })
 }
 
@@ -102,6 +107,7 @@ pub async fn complete_sync(
     key: &KeyBytes,
     plan: &SyncPlan,
     resolutions: &[ConflictResolution],
+    progress: &dyn ProgressSink,
 ) -> Result<SyncResult, SyncEngineError> {
     let keys = derive_keys(key);
     let client = ApiClient::new(config.clone());
@@ -114,6 +120,10 @@ pub async fn complete_sync(
 
     let mut pending_uploads = plan.upload.clone();
 
+    if !plan.conflicts.is_empty() {
+        progress.report(ProgressEvent::Phase(SyncPhase::ResolvingConflicts));
+    }
+
     for conflict in &plan.conflicts {
         let choice = resolution_map
             .get(&conflict.path)
@@ -124,11 +134,31 @@ pub async fn complete_sync(
                 pending_uploads.push(conflict_to_upload(conflict));
             }
             ConflictResolutionChoice::KeepRemote => {
-                apply_keep_remote(local_root, &keys, &client, conflict).await?;
+                progress.report(ProgressEvent::FileStarted {
+                    path: conflict.path.clone(),
+                    kind: SyncActionKind::Download,
+                    index: 0,
+                    total: 1,
+                });
+                let bytes = apply_keep_remote(local_root, &keys, &client, conflict).await?;
+                progress.report(ProgressEvent::FileCompleted {
+                    path: conflict.path.clone(),
+                    bytes,
+                });
             }
             ConflictResolutionChoice::KeepBoth => {
-                let duplicate_path =
+                progress.report(ProgressEvent::FileStarted {
+                    path: conflict.path.clone(),
+                    kind: SyncActionKind::Download,
+                    index: 0,
+                    total: 1,
+                });
+                let (duplicate_path, bytes) =
                     write_conflict_copy(local_root, &keys, &client, conflict).await?;
+                progress.report(ProgressEvent::FileCompleted {
+                    path: conflict.path.clone(),
+                    bytes,
+                });
                 pending_uploads.push(conflict_to_upload(conflict));
                 pending_uploads.push(build_upload_action_for_path(
                     local_root,
@@ -139,46 +169,115 @@ pub async fn complete_sync(
         }
     }
 
+    progress.report(ProgressEvent::Phase(SyncPhase::Uploading));
+    let total = pending_uploads.len();
     let mut late_conflicts = Vec::new();
-    for action in &pending_uploads {
-        if let Err(error) = apply_upload(local_root, &keys, &client, action).await {
-            match error {
-                SyncEngineError::Api(ApiError::Conflict { path, conflict }) => {
-                    if let Some(remote) = conflict.current {
-                        let local = action.local.clone().unwrap_or_else(|| FileEntry {
-                            hash: String::new(),
-                            modified: 0,
-                            size: 0,
-                            deleted: false,
-                            enc_path: String::new(),
-                        });
-                        late_conflicts.push(Conflict {
-                            path,
-                            local,
-                            remote,
-                        });
-                    }
+    let mut upload_failures = Vec::new();
+    let mut successful_uploads = 0usize;
+    for (index, action) in pending_uploads.iter().enumerate() {
+        progress.report(ProgressEvent::FileStarted {
+            path: action.path.clone(),
+            kind: action.kind.clone(),
+            index,
+            total,
+        });
+        match apply_upload(local_root, &keys, &client, action).await {
+            Ok(()) => {
+                successful_uploads += 1;
+                let bytes = action.local.as_ref().map(|entry| entry.size).unwrap_or(0);
+                progress.report(ProgressEvent::FileCompleted {
+                    path: action.path.clone(),
+                    bytes,
+                });
+            }
+            Err(SyncEngineError::Api(ApiError::Conflict { path, conflict })) => {
+                if let Some(remote) = conflict.current {
+                    let local = action.local.clone().unwrap_or_else(|| FileEntry {
+                        hash: String::new(),
+                        modified: 0,
+                        size: 0,
+                        deleted: false,
+                        enc_path: String::new(),
+                    });
+                    late_conflicts.push(Conflict { path, local, remote });
                 }
-                other => return Err(other),
+            }
+            Err(error) => {
+                let fatal = is_fatal_sync_error(&error);
+                let message = error.to_string();
+                progress.report(ProgressEvent::FileFailed {
+                    path: action.path.clone(),
+                    error: message.clone(),
+                });
+                upload_failures.push(SyncFailure {
+                    path: action.path.clone(),
+                    kind: action.kind.clone(),
+                    error: message,
+                    fatal,
+                });
+                if fatal {
+                    break;
+                }
             }
         }
     }
 
+    // Carry download-side failures from prepare into the final result.
+    let mut failures = plan.failures.clone();
+    failures.extend(upload_failures);
+
+    let downloaded = plan
+        .download
+        .iter()
+        .filter(|action| matches!(action.kind, SyncActionKind::Download))
+        .count()
+        .saturating_sub(
+            failures
+                .iter()
+                .filter(|failure| matches!(failure.kind, SyncActionKind::Download))
+                .count(),
+        );
+
+    progress.report(ProgressEvent::Done {
+        uploaded: successful_uploads,
+        downloaded,
+        failed: failures.len(),
+    });
+
     if !late_conflicts.is_empty() {
+        // Conflicts need the user's input before the manifest can advance.
         return Ok(SyncResult {
             upload: pending_uploads,
             download: plan.download.clone(),
             conflicts: late_conflicts,
+            failures,
         });
     }
 
-    let remote_manifest = client.get_manifest(&keys).await?;
-    save_manifest_to_disk(&sync_manifest_path(local_root), &remote_manifest)?;
+    // No late conflicts: checkpoint the server manifest so local state advances
+    // past every file that did transfer (the resume point). Skip the re-fetch
+    // when a fatal error already proved the network is gone.
+    if !failures.iter().any(|failure| failure.fatal) {
+        match client.get_manifest(&keys).await {
+            Ok(remote_manifest) => {
+                save_manifest_to_disk(&sync_manifest_path(local_root), &remote_manifest)?;
+            }
+            Err(error) => {
+                failures.push(SyncFailure {
+                    path: String::new(),
+                    kind: SyncActionKind::Upload,
+                    error: error.to_string(),
+                    fatal: true,
+                });
+            }
+        }
+    }
 
     Ok(SyncResult {
         upload: pending_uploads,
         download: plan.download.clone(),
         conflicts: Vec::new(),
+        failures,
     })
 }
 
@@ -215,22 +314,84 @@ async fn apply_downloads(
     keys: &CryptoKeys,
     client: &ApiClient,
     downloads: &[SyncAction],
-) -> Result<(), SyncEngineError> {
-    for action in downloads {
+    progress: &dyn ProgressSink,
+) -> Vec<SyncFailure> {
+    let mut failures = Vec::new();
+    let total = downloads.len();
+    for (index, action) in downloads.iter().enumerate() {
         match action.kind {
             SyncActionKind::Download => {
-                let blob = client.get_file(&action.path, keys).await?;
-                let plaintext = decrypt(&keys.content_enc, &blob)?;
-                write_local_file(local_root, &action.path, &plaintext)?;
+                progress.report(ProgressEvent::FileStarted {
+                    path: action.path.clone(),
+                    kind: SyncActionKind::Download,
+                    index,
+                    total,
+                });
+                let outcome = async {
+                    let blob = client.get_file(&action.path, keys).await?;
+                    let plaintext = decrypt(&keys.content_enc, &blob)?;
+                    write_local_file(local_root, &action.path, &plaintext)?;
+                    Ok::<usize, SyncEngineError>(plaintext.len())
+                }
+                .await;
+                match outcome {
+                    Ok(len) => progress.report(ProgressEvent::FileCompleted {
+                        path: action.path.clone(),
+                        bytes: len as u64,
+                    }),
+                    Err(error) => {
+                        let fatal = is_fatal_sync_error(&error);
+                        let message = error.to_string();
+                        progress.report(ProgressEvent::FileFailed {
+                            path: action.path.clone(),
+                            error: message.clone(),
+                        });
+                        failures.push(SyncFailure {
+                            path: action.path.clone(),
+                            kind: SyncActionKind::Download,
+                            error: message,
+                            fatal,
+                        });
+                        if fatal {
+                            break;
+                        }
+                    }
+                }
             }
             SyncActionKind::DeleteLocal => {
-                delete_local_file(local_root, &action.path)?;
+                if let Err(error) = delete_local_file(local_root, &action.path) {
+                    failures.push(SyncFailure {
+                        path: action.path.clone(),
+                        kind: SyncActionKind::DeleteLocal,
+                        error: error.to_string(),
+                        fatal: false,
+                    });
+                }
             }
             _ => {}
         }
     }
 
-    Ok(())
+    failures
+}
+
+/// A fatal error is systemic (network down, auth failure, server error): it
+/// will likely strike every remaining file too, so the batch stops. Per-file
+/// errors (a too-large 413, a missing 404, a local crypto/path failure) leave
+/// the rest of the batch viable, so the sync continues.
+fn is_fatal_sync_error(error: &SyncEngineError) -> bool {
+    match error {
+        SyncEngineError::Api(api_error) => is_fatal_api_error(api_error),
+        _ => false,
+    }
+}
+
+fn is_fatal_api_error(error: &ApiError) -> bool {
+    match error {
+        ApiError::Http(_) => true,
+        ApiError::UnexpectedStatus { status, .. } => matches!(status.as_u16(), 401 | 403 | 500..=599),
+        ApiError::Crypto(_) | ApiError::Conflict { .. } => false,
+    }
 }
 
 async fn apply_keep_remote(
@@ -238,16 +399,16 @@ async fn apply_keep_remote(
     keys: &CryptoKeys,
     client: &ApiClient,
     conflict: &Conflict,
-) -> Result<(), SyncEngineError> {
+) -> Result<u64, SyncEngineError> {
     if conflict.remote.deleted {
         delete_local_file(local_root, &conflict.path)?;
+        Ok(0)
     } else {
         let blob = client.get_file(&conflict.path, keys).await?;
         let plaintext = decrypt(&keys.content_enc, &blob)?;
         write_local_file(local_root, &conflict.path, &plaintext)?;
+        Ok(plaintext.len() as u64)
     }
-
-    Ok(())
 }
 
 async fn write_conflict_copy(
@@ -255,16 +416,16 @@ async fn write_conflict_copy(
     keys: &CryptoKeys,
     client: &ApiClient,
     conflict: &Conflict,
-) -> Result<String, SyncEngineError> {
+) -> Result<(String, u64), SyncEngineError> {
     if conflict.remote.deleted {
-        return Ok(conflict_copy_path(&conflict.path));
+        return Ok((conflict_copy_path(&conflict.path), 0));
     }
 
     let duplicate_path = conflict_copy_path(&conflict.path);
     let blob = client.get_file(&conflict.path, keys).await?;
     let plaintext = decrypt(&keys.content_enc, &blob)?;
     write_local_file(local_root, &duplicate_path, &plaintext)?;
-    Ok(duplicate_path)
+    Ok((duplicate_path, plaintext.len() as u64))
 }
 
 async fn apply_upload(
@@ -422,6 +583,7 @@ mod tests {
     };
     use crate::{
         crypto::{content_hmac, derive_keys, encrypt, encrypt_path, path_token, CryptoKeys},
+        progress::NoProgress,
         types::{ConflictResolution, ConflictResolutionChoice, FileEntry, Manifest, VaultConfig},
     };
 
@@ -549,10 +711,12 @@ mod tests {
             .await;
 
         let cfg = config(server.base_url(), dir.path().display().to_string());
-        let plan = prepare_sync(&cfg, &key).await.unwrap();
+        let plan = prepare_sync(&cfg, &key, &NoProgress).await.unwrap();
         assert_eq!(plan.download.len(), 1);
 
-        let result = complete_sync(&cfg, &key, &plan, &[]).await.unwrap();
+        let result = complete_sync(&cfg, &key, &plan, &[], &NoProgress)
+            .await
+            .unwrap();
         assert!(result.conflicts.is_empty());
         assert_eq!(
             fs::read_to_string(dir.path().join("note.md")).unwrap(),
@@ -595,10 +759,12 @@ mod tests {
             .await;
 
         let cfg = config(server.base_url(), dir.path().display().to_string());
-        let plan = prepare_sync(&cfg, &key).await.unwrap();
+        let plan = prepare_sync(&cfg, &key, &NoProgress).await.unwrap();
         assert_eq!(plan.upload.len(), 1);
 
-        let result = complete_sync(&cfg, &key, &plan, &[]).await.unwrap();
+        let result = complete_sync(&cfg, &key, &plan, &[], &NoProgress)
+            .await
+            .unwrap();
         put_mock.assert_async().await;
         assert!(result.conflicts.is_empty());
     }
@@ -647,7 +813,7 @@ mod tests {
             .await;
 
         let cfg = config(server.base_url(), dir.path().display().to_string());
-        let plan = prepare_sync(&cfg, &key).await.unwrap();
+        let plan = prepare_sync(&cfg, &key, &NoProgress).await.unwrap();
         assert_eq!(plan.conflicts.len(), 1);
 
         let result = complete_sync(
@@ -658,6 +824,7 @@ mod tests {
                 path: "note.md".to_string(),
                 choice: ConflictResolutionChoice::KeepRemote,
             }],
+            &NoProgress,
         )
         .await
         .unwrap();
@@ -667,5 +834,174 @@ mod tests {
             fs::read_to_string(dir.path().join("note.md")).unwrap(),
             "remote version"
         );
+    }
+
+    #[tokio::test]
+    async fn upload_loop_continues_past_per_file_failure() {
+        // a.md, b.md, c.md upload in BTreeSet (alphabetical) order. b returns
+        // 413 (per-file, non-fatal): the loop records the failure and continues
+        // to c. The manifest still checkpoints because no fatal occurred.
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.md"), "aaa").unwrap();
+        fs::write(dir.path().join("b.md"), "bbb").unwrap();
+        fs::write(dir.path().join("c.md"), "ccc").unwrap();
+        let server = MockServer::start_async().await;
+        let key = [11_u8; 32];
+        let keys = derive_keys(&key);
+        let token_a = path_token(&keys.path_token, "a.md");
+        let token_b = path_token(&keys.path_token, "b.md");
+        let token_c = path_token(&keys.path_token, "c.md");
+
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path("/vaults/vault_123/manifest");
+                then.status(200).json_body_obj(&serde_json::json!({}));
+            })
+            .await;
+        let put_a = server
+            .mock_async(move |when, then| {
+                when.method(PUT).path(format!("/vaults/vault_123/files/{token_a}"));
+                then.status(200);
+            })
+            .await;
+        let _put_b = server
+            .mock_async(move |when, then| {
+                when.method(PUT).path(format!("/vaults/vault_123/files/{token_b}"));
+                then.status(413).body("file too large");
+            })
+            .await;
+        let put_c = server
+            .mock_async(move |when, then| {
+                when.method(PUT).path(format!("/vaults/vault_123/files/{token_c}"));
+                then.status(200);
+            })
+            .await;
+
+        let cfg = config(server.base_url(), dir.path().display().to_string());
+        let plan = prepare_sync(&cfg, &key, &NoProgress).await.unwrap();
+        assert_eq!(plan.upload.len(), 3);
+
+        let result = complete_sync(&cfg, &key, &plan, &[], &NoProgress)
+            .await
+            .unwrap();
+
+        // a and c were both attempted (loop did not stop at b).
+        put_a.assert_hits_async(1).await;
+        put_c.assert_hits_async(1).await;
+        // Exactly one non-fatal failure, for b.md.
+        assert_eq!(result.failures.len(), 1);
+        assert_eq!(result.failures[0].path, "b.md");
+        assert!(!result.failures[0].fatal);
+        assert!(result.conflicts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn upload_loop_stops_on_fatal_server_error() {
+        // a (200), b (500 fatal) breaks the loop; c is never attempted, and the
+        // manifest checkpoint is skipped because a fatal error occurred.
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.md"), "aaa").unwrap();
+        fs::write(dir.path().join("b.md"), "bbb").unwrap();
+        fs::write(dir.path().join("c.md"), "ccc").unwrap();
+        let server = MockServer::start_async().await;
+        let key = [12_u8; 32];
+        let keys = derive_keys(&key);
+        let token_a = path_token(&keys.path_token, "a.md");
+        let token_b = path_token(&keys.path_token, "b.md");
+        let token_c = path_token(&keys.path_token, "c.md");
+
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path("/vaults/vault_123/manifest");
+                then.status(200).json_body_obj(&serde_json::json!({}));
+            })
+            .await;
+        let put_a = server
+            .mock_async(move |when, then| {
+                when.method(PUT).path(format!("/vaults/vault_123/files/{token_a}"));
+                then.status(200);
+            })
+            .await;
+        let _put_b = server
+            .mock_async(move |when, then| {
+                when.method(PUT).path(format!("/vaults/vault_123/files/{token_b}"));
+                then.status(500).body("server error");
+            })
+            .await;
+        let put_c = server
+            .mock_async(move |when, then| {
+                when.method(PUT).path(format!("/vaults/vault_123/files/{token_c}"));
+                then.status(200);
+            })
+            .await;
+
+        let cfg = config(server.base_url(), dir.path().display().to_string());
+        let plan = prepare_sync(&cfg, &key, &NoProgress).await.unwrap();
+        let result = complete_sync(&cfg, &key, &plan, &[], &NoProgress)
+            .await
+            .unwrap();
+
+        put_a.assert_hits_async(1).await;
+        put_c.assert_hits_async(0).await; // loop stopped at b
+        assert_eq!(result.failures.len(), 1);
+        assert_eq!(result.failures[0].path, "b.md");
+        assert!(result.failures[0].fatal);
+    }
+
+    #[tokio::test]
+    async fn download_loop_continues_past_per_file_failure() {
+        // Remote has a.md and b.md; b's GET returns 404 (per-file, non-fatal).
+        // a downloads fine, b is recorded as a failure, sync keeps going.
+        let dir = tempdir().unwrap();
+        let server = MockServer::start_async().await;
+        let key = [13_u8; 32];
+        let keys = derive_keys(&key);
+        let encrypted_a = encrypt(&keys.content_enc, b"file a").unwrap();
+        let token_a = path_token(&keys.path_token, "a.md");
+        let token_b = path_token(&keys.path_token, "b.md");
+
+        // Build a two-entry manifest by merging per-file server_manifest objects.
+        let mut manifest = server_manifest(&keys, "a.md", b"file a", 1, false);
+        let manifest_b = server_manifest(&keys, "b.md", b"file b", 1, false);
+        if let (Some(a), Some(b)) = (manifest.as_object_mut(), manifest_b.as_object()) {
+            for (k, v) in b {
+                a.insert(k.clone(), v.clone());
+            }
+        }
+
+        server
+            .mock_async(move |when, then| {
+                when.method(GET).path("/vaults/vault_123/manifest");
+                then.status(200).json_body_obj(&manifest);
+            })
+            .await;
+        server
+            .mock_async(move |when, then| {
+                when.method(GET)
+                    .path(format!("/vaults/vault_123/files/{token_a}"));
+                then.status(200).body(encrypted_a.clone());
+            })
+            .await;
+        server
+            .mock_async(move |when, then| {
+                when.method(GET)
+                    .path(format!("/vaults/vault_123/files/{token_b}"));
+                then.status(404).body("not found");
+            })
+            .await;
+
+        let cfg = config(server.base_url(), dir.path().display().to_string());
+        let plan = prepare_sync(&cfg, &key, &NoProgress).await.unwrap();
+        assert_eq!(plan.download.len(), 2);
+        assert_eq!(plan.failures.len(), 1);
+        assert_eq!(plan.failures[0].path, "b.md");
+        assert!(!plan.failures[0].fatal);
+
+        // a.md was written; b.md was not.
+        assert_eq!(
+            fs::read_to_string(dir.path().join("a.md")).unwrap(),
+            "file a"
+        );
+        assert!(!dir.path().join("b.md").exists());
     }
 }

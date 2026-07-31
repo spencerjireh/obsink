@@ -42,11 +42,26 @@ pub struct Conflict {
     pub remote: FileEntry,
 }
 
+/// A single file that could not be transferred during a sync. When `fatal` is
+/// true the error was systemic (network down, auth failure) and aborted the
+/// rest of the batch; otherwise it was file-specific (e.g. a too-large file)
+/// and the sync continued past it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncFailure {
+    pub path: String,
+    pub kind: SyncActionKind,
+    pub error: String,
+    pub fatal: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct SyncResult {
     pub upload: Vec<SyncAction>,
     pub download: Vec<SyncAction>,
     pub conflicts: Vec<Conflict>,
+    /// Per-file transfers that failed this cycle. Empty on a clean sync.
+    #[serde(default)]
+    pub failures: Vec<SyncFailure>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,6 +154,9 @@ pub struct SyncPlan {
     pub upload: Vec<SyncAction>,
     pub download: Vec<SyncAction>,
     pub conflicts: Vec<Conflict>,
+    /// Download-side failures captured during `prepare_sync` (best-effort).
+    #[serde(default)]
+    pub failures: Vec<SyncFailure>,
 }
 
 const fn default_max_file_size() -> u64 {

@@ -10,7 +10,8 @@ use dirs::home_dir;
 use obsink_core::{
     build_manifest_from_dir, complete_sync, derive_key, derive_keys, diff_local_and_remote,
     prepare_sync, sync_manifest_path, ApiClient, Conflict, ConflictResolution,
-    ConflictResolutionChoice, CreateVaultRequest, KeyBytes, VaultConfig,
+    ConflictResolutionChoice, CreateVaultRequest, KeyBytes, ProgressEvent, ProgressSink,
+    SyncActionKind, SyncPhase, VaultConfig,
 };
 use rpassword::prompt_password;
 use serde::{Deserialize, Serialize};
@@ -201,6 +202,47 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Prints sync progress to stderr so it doesn't interleave with the stdout
+/// result summary (which scripts may parse).
+struct CliProgress;
+
+impl ProgressSink for CliProgress {
+    fn report(&self, event: ProgressEvent) {
+        match event {
+            ProgressEvent::Phase(phase) => match phase {
+                SyncPhase::Downloading => eprintln!("downloading…"),
+                SyncPhase::ResolvingConflicts => eprintln!("resolving conflicts…"),
+                SyncPhase::Uploading => eprintln!("uploading…"),
+            },
+            ProgressEvent::FileStarted {
+                path, kind, index, total,
+            } => {
+                let verb = match kind {
+                    SyncActionKind::Download => "downloading",
+                    SyncActionKind::Upload => "uploading",
+                    _ => "syncing",
+                };
+                eprintln!("[{}/{}] {verb}: {path}", index + 1, total);
+            }
+            ProgressEvent::FileCompleted { path, bytes } => {
+                eprintln!("  done ({bytes} B): {path}");
+            }
+            ProgressEvent::FileFailed { path, error } => {
+                eprintln!("  FAILED: {path}: {error}");
+            }
+            ProgressEvent::Done {
+                uploaded,
+                downloaded,
+                failed,
+            } => {
+                eprintln!(
+                    "sync summary: {uploaded} uploaded, {downloaded} downloaded, {failed} failed"
+                );
+            }
+        }
+    }
+}
+
 async fn run_sync_for_config(
     config: &CliConfig,
     key: &KeyBytes,
@@ -208,15 +250,34 @@ async fn run_sync_for_config(
     let vault_config = to_vault_config(config);
 
     loop {
-        let plan = prepare_sync(&vault_config, key).await?;
+        let plan = prepare_sync(&vault_config, key, &CliProgress).await?;
         let resolutions = prompt_conflict_resolutions(&plan.conflicts)?;
-        let result = complete_sync(&vault_config, key, &plan, &resolutions).await?;
+        let result = complete_sync(&vault_config, key, &plan, &resolutions, &CliProgress).await?;
 
         println!("downloaded: {}", result.download.len());
         println!("uploaded: {}", result.upload.len());
 
+        if !result.failures.is_empty() {
+            let fatal = result.failures.iter().any(|failure| failure.fatal);
+            eprintln!(
+                "{} file(s) failed this sync:",
+                result.failures.len()
+            );
+            for failure in &result.failures {
+                let tag = if failure.fatal { "FATAL" } else { "skipped" };
+                eprintln!("  [{tag}] {}: {}", failure.path, failure.error);
+            }
+            if fatal {
+                eprintln!("a fatal error stopped the sync early; re-run `obsink sync` to resume");
+            }
+        }
+
         if result.conflicts.is_empty() {
-            println!("sync complete");
+            if result.failures.is_empty() {
+                println!("sync complete");
+            } else {
+                println!("sync complete with failures (see above)");
+            }
             println!(
                 "manifest: {}",
                 sync_manifest_path(&PathBuf::from(&config.local_path)).display()
