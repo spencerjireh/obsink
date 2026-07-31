@@ -74,8 +74,10 @@ cd desktop && npm ci && npm run tauri build -- --bundles deb
 The `mobile/` crate exposes the core to Swift via UniFFI. Build everything (staticlibs, bindings, XCFramework, Xcode project) with:
 
 ```bash
-brew install xcodegen          # one-time
-./scripts/build-ios.sh
+# One-time prereqs: Xcode, rustup + iOS targets, and xcodegen
+rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+brew install xcodegen
+./scripts/build-ios.sh        # self-resolves rustup's cargo if a non-rustup one is on PATH
 ```
 
 Then build/run on a simulator:

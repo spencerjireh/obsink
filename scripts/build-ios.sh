@@ -7,7 +7,7 @@
 #   4. Generate the Xcode project with XcodeGen.
 #
 # These outputs are build artifacts (git-ignored); run this after cloning or
-# whenever the FFI surface changes. Requires: rustup iOS targets, xcodegen.
+# whenever the FFI surface changes. Requires: rustup + the iOS targets, Xcode, xcodegen.
 
 set -euo pipefail
 
@@ -15,6 +15,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 IOS_DIR="$REPO_ROOT/ios"
 TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
+
+# Prefer a rustup-managed toolchain when present: the iOS targets (added below)
+# are only shipped via rustup, and a non-rustup cargo first on PATH (e.g. Homebrew)
+# would fail the cross-compile. Checks the standard install location so it works
+# even when rustup isn't on PATH (e.g. installed with --no-modify-path).
+if [ -x "$HOME/.cargo/bin/rustup" ]; then
+    export PATH="$HOME/.cargo/bin:$PATH"
+fi
 
 cd "$REPO_ROOT"
 
