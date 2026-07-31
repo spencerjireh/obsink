@@ -104,6 +104,16 @@ final class ItemStoreTests: XCTestCase {
         XCTAssertEqual(kids.map(\.filename), ["c1.md", "c2.md"])
     }
 
+    // OBS-20: reconcile is gated on a completed sync (no rewrite on conflict-pause).
+    func testReconcileAfterSyncGatedOnCompleted() throws {
+        let (store, root, _) = try makeStore()
+        try Data("hi".utf8).write(to: root.appendingPathComponent("a.md"))
+        try store.reconcileAfterSync(completed: false, vaultRoot: root)
+        XCTAssertEqual(try store.children(of: "").count, 0)
+        try store.reconcileAfterSync(completed: true, vaultRoot: root)
+        XCTAssertEqual(try store.children(of: "").count, 1)
+    }
+
     func testPendingFlags() throws {
         let (store, _, _) = try makeStore()
         try store.upsert(ItemRecord(identifier: "P", parentIdentifier: "", filename: "p.md",

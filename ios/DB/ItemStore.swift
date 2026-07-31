@@ -180,6 +180,14 @@ final class ItemStore {
 
     // MARK: Reconcile (mirror the on-disk vault into the DB)
 
+    /// Reconcile only when a sync just completed (OBS-20). Gated so an aborted or
+    /// conflict-paused sync doesn't rewrite the DB. The host app calls this right
+    /// after a successful sync, then signals the File Provider (OBS-21).
+    func reconcileAfterSync(completed: Bool, vaultRoot: URL) throws {
+        guard completed else { return }
+        try reconcile(vaultRoot: vaultRoot)
+    }
+
     /// Scan `vaultRoot` and upsert item rows, assigning stable UUIDs on first
     /// encounter and bumping `rowVersion` only for genuinely changed/new items.
     /// Rows for paths no longer on disk are dropped (the sync engine's

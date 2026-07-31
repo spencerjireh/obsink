@@ -1,3 +1,4 @@
+import FileProvider
 import Foundation
 
 /// Drives sync from the SwiftUI layer by calling the Rust core through the
@@ -99,11 +100,22 @@ final class SyncModel: ObservableObject {
         busy = false
         if outcome.completed {
             status = "Synced · ↑\(outcome.uploaded) ↓\(outcome.downloaded)"
+            // OBS-20/21: mirror the freshly synced vault into the item DB, then
+            // tell the File Provider to re-enumerate so Obsidian/Files see it.
+            try? ItemStore.shared.reconcileAfterSync(completed: true, vaultRoot: vaultDirectory)
+            signalFileProvider()
         } else if !outcome.conflicts.isEmpty {
             status = "\(outcome.conflicts.count) conflict(s) need attention"
         } else {
             status = "Prepared · ↑\(outcome.uploaded) ↓\(outcome.downloaded)"
         }
+    }
+
+    /// Ask the system to re-enumerate the working set so the File Provider picks
+    /// up the DB changes from `reconcileAfterSync`. Errors are ignored: on a fresh
+    /// install or in the simulator the default domain may not be registered yet.
+    private func signalFileProvider() {
+        NSFileProviderManager.default.signalEnumerator(for: .workingSet) { _ in }
     }
 
     private func fail(_ error: Error) {

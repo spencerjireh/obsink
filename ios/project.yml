@@ -35,6 +35,7 @@ targets:
         embed: false
       - sdk: SystemConfiguration.framework
       - sdk: CFNetwork.framework
+      - sdk: FileProvider.framework
       - target: FileProviderExt
         embed: true
       - package: GRDB
