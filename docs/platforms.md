@@ -87,7 +87,7 @@ xcodebuild -project ios/ObSink.xcodeproj -scheme ObSink -sdk iphonesimulator \
 
 The SwiftUI app (sync button, status, vault setup, conflict resolution) talks to the Rust core through the generated `VaultClient`. Files sync into the App Group container (`group.com.obsink.shared`), which the File Provider extension exposes to Obsidian/Files.
 
-Run the on-simulator integration tests (the live-sync test reads `TEST_RUNNER_OBSINK_TEST_*` env for a worker URL, API key, vault ID, and passphrase):
+Run the on-simulator integration tests (the live-sync test reads `OBSINK_TEST_*` env vars — worker URL, API key, vault ID, and passphrase):
 
 ```bash
 xcodebuild test -project ios/ObSink.xcodeproj -scheme ObSink -sdk iphonesimulator \
