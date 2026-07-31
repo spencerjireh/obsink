@@ -1,6 +1,16 @@
 import FileProvider
 import Foundation
 
+/// One configured vault (spec §10 — multi-vault). The derived key lives in the
+/// Keychain under `account = vaultID`, so each vault's key is stored separately.
+struct VaultEntry: Codable, Identifiable, Equatable {
+    var workerURL: String
+    var apiKey: String
+    var vaultID: String
+    var name: String
+    var id: String { vaultID }
+}
+
 /// Drives sync from the SwiftUI layer by calling the Rust core through the
 /// generated UniFFI bindings (`VaultClient`, `deriveMasterKey`, ...).
 ///
@@ -11,9 +21,12 @@ import Foundation
 final class SyncModel: ObservableObject {
     static let appGroup = "group.com.obsink.shared"
 
-    @Published var workerURL: String
-    @Published var apiKey: String
-    @Published var vaultID: String
+    @Published var entries: [VaultEntry] = []
+    @Published var activeVaultID: String = ""
+
+    @Published var workerURL: String = "https://"
+    @Published var apiKey: String = ""
+    @Published var vaultID: String = ""
     @Published var passphrase: String = ""
 
     @Published var status: String = "Not synced"
@@ -30,12 +43,102 @@ final class SyncModel: ObservableObject {
     init() {
         let defaults = UserDefaults(suiteName: Self.appGroup) ?? .standard
         self.defaults = defaults
-        self.workerURL = defaults.string(forKey: "workerURL") ?? "https://"
-        self.apiKey = defaults.string(forKey: "apiKey") ?? ""
-        self.vaultID = defaults.string(forKey: "vaultID") ?? ""
+        self.entries = Self.loadEntries(from: defaults)
+
+        if let active = defaults.string(forKey: "activeVaultID"), entries.contains(where: { $0.vaultID == active }) {
+            self.activeVaultID = active
+        } else if let first = entries.first {
+            self.activeVaultID = first.vaultID
+        } else if let oldID = defaults.string(forKey: "vaultID"), !oldID.isEmpty {
+            // Migrate a legacy single-vault config into the multi-vault list.
+            let entry = VaultEntry(
+                workerURL: defaults.string(forKey: "workerURL") ?? "https://",
+                apiKey: defaults.string(forKey: "apiKey") ?? "",
+                vaultID: oldID,
+                name: oldID
+            )
+            self.entries = [entry]
+            self.activeVaultID = oldID
+            Self.saveEntries(self.entries, active: self.activeVaultID, to: defaults)
+        }
+
+        loadActiveIntoFields()
         refreshPending()
         refreshStoredKey()
     }
+
+    var activeEntry: VaultEntry? {
+        entries.first { $0.vaultID == activeVaultID }
+    }
+
+    /// Load the active vault's connection details into the editable fields.
+    private func loadActiveIntoFields() {
+        if let entry = activeEntry {
+            workerURL = entry.workerURL
+            apiKey = entry.apiKey
+            vaultID = entry.vaultID
+        } else {
+            workerURL = "https://"
+            apiKey = ""
+            vaultID = ""
+        }
+        passphrase = ""
+    }
+
+    /// Switch the active vault (spec §10.3 vault picker).
+    func selectVault(_ id: String) {
+        guard entries.contains(where: { $0.vaultID == id }), id != activeVaultID else { return }
+        persistConfig()
+        activeVaultID = id
+        Self.saveEntries(entries, active: activeVaultID, to: defaults)
+        loadActiveIntoFields()
+        conflicts = []
+        choices = [:]
+        previews = [:]
+        refreshStoredKey()
+        status = "Switched to \(activeEntry?.name ?? id)"
+    }
+
+    /// Add (or replace) a vault and make it active.
+    func addVault(_ entry: VaultEntry) {
+        if let idx = entries.firstIndex(where: { $0.vaultID == entry.vaultID }) {
+            entries[idx] = entry
+        } else {
+            entries.append(entry)
+        }
+        activeVaultID = entry.vaultID
+        Self.saveEntries(entries, active: activeVaultID, to: defaults)
+        loadActiveIntoFields()
+        refreshStoredKey()
+        status = "Added vault \(entry.name)"
+    }
+
+    // MARK: Persistence
+
+    private static func loadEntries(from defaults: UserDefaults) -> [VaultEntry] {
+        guard let data = defaults.data(forKey: "vaultEntries"),
+              let entries = try? JSONDecoder().decode([VaultEntry].self, from: data) else {
+            return []
+        }
+        return entries
+    }
+
+    private static func saveEntries(_ entries: [VaultEntry], active: String, to defaults: UserDefaults) {
+        if let data = try? JSONEncoder().encode(entries) {
+            defaults.set(data, forKey: "vaultEntries")
+        }
+        defaults.set(active, forKey: "activeVaultID")
+    }
+
+    /// Persist the active vault's current fields back into the entry list.
+    func persistConfig() {
+        guard let idx = entries.firstIndex(where: { $0.vaultID == activeVaultID }) else { return }
+        entries[idx].workerURL = workerURL
+        entries[idx].apiKey = apiKey
+        Self.saveEntries(entries, active: activeVaultID, to: defaults)
+    }
+
+    // MARK: Sync state helpers
 
     /// Count of File-Provider-queued local changes (pendingUpload/pendingDeletion),
     /// read from the shared item DB. Surfaces a "Sync to push" hint in the UI.
@@ -57,12 +160,6 @@ final class SyncModel: ObservableObject {
         let dir = base.appendingPathComponent("Vault", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
-    }
-
-    func persistConfig() {
-        defaults.set(workerURL, forKey: "workerURL")
-        defaults.set(apiKey, forKey: "apiKey")
-        defaults.set(vaultID, forKey: "vaultID")
     }
 
     func sync() {
