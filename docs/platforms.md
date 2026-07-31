@@ -9,7 +9,6 @@ ObSink shares one Rust core across every client. This page covers per-platform s
 | Linux desktop | 🟡 Builds in CI | `.deb` bundled in CI; keychain backend (libsecret) not yet wired |
 | Windows desktop | ⬜ Planned | Needs DPAPI/Credential Manager keychain |
 | iOS | 🟡 App + File Provider code-complete | DB-backed replicated FP (UUID IDs, change deltas), Keychain, multi-vault, conflict preview; needs E2E + TestFlight |
-| Android | ⬜ Planned | Tauri mobile (React Native + Rust fallback) |
 
 ## CLI
 
@@ -100,6 +99,6 @@ xcodebuild test -project ios/ObSink.xcodeproj -scheme ObSink -sdk iphonesimulato
 
 Remaining (Slice F — manual validation + signing): a visual check that synced files appear in the iOS Files app / Obsidian (OBS-19), Mac↔iOS end-to-end scenarios (OBS-29–34), and code-signing + TestFlight — set `DEVELOPMENT_TEAM` in `ios/project.yml` and upload via Xcode (the project uses automatic signing). See `docs/p4-plan.md` and spec.md §11 for the File Provider design.
 
-## Android & Windows (planned)
+## Windows (planned)
 
-Not started. Android targets Tauri mobile (with a React Native + Rust fallback); Windows needs a DPAPI/Credential Manager key store. Tracked in the Plane project `OBS` (phases P5/P6).
+Not started. Windows needs a DPAPI/Credential Manager key store. Tracked in the Plane project `OBS` (phase P5).

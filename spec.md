@@ -2,7 +2,7 @@
 
 > *Because things will go wrong.*
 
-ObSink is a free, self-hosted, end-to-end encrypted sync engine for Obsidian vaults across macOS, iOS, Windows, Linux, and Android. It replaces paid sync services with a manual "Sync" button backed by Cloudflare infrastructure and a shared Rust core.
+ObSink is a free, self-hosted, end-to-end encrypted sync engine for Obsidian vaults across macOS, iOS, Windows, and Linux. It replaces paid sync services with a manual "Sync" button backed by Cloudflare infrastructure and a shared Rust core.
 
 ---
 
@@ -13,7 +13,7 @@ ObSink is a free, self-hosted, end-to-end encrypted sync engine for Obsidian vau
 │  Desktop clients │        │     Cloudflare            │        │   Mobile clients │
 │  (Tauri + Rust)  │        │                           │        │                  │
 │                  │ HTTPS  │  Worker  (API logic, TS)  │ HTTPS  │  iOS (Swift)     │
-│  macOS           │◄──────►│  R2      (file storage)   │◄──────►│  Android (Tauri) │
+│  macOS           │◄──────►│  R2      (file storage)   │◄──────►│                  │
 │  Windows         │        │  KV      (manifest/meta)  │        │                  │
 │  Linux           │        │  Cron    (version pruning)│        │                  │
 └──────────────────┘        └──────────────────────────┘        └──────────────────┘
@@ -27,7 +27,6 @@ ObSink is a free, self-hosted, end-to-end encrypted sync engine for Obsidian vau
 | `worker/` | TypeScript | Cloudflare Worker API: file storage, manifest management, conflict gating, version retention |
 | `desktop/` | Rust + Web (Tauri) | macOS, Windows, Linux desktop apps. Thin UI shell calling into Rust core |
 | `ios/` | Swift + Rust (via UniFFI) | iOS app + File Provider extension. SwiftUI interface, Rust core via generated bindings |
-| `android/` | Tauri (or React Native + Rust) | Android app. Tauri mobile if viable, React Native as fallback |
 
 ---
 
@@ -36,7 +35,6 @@ ObSink is a free, self-hosted, end-to-end encrypted sync engine for Obsidian vau
 - **Rust** — core sync library (encryption, hashing, manifest diffing, conflict detection, Cloudflare API client)
 - **TypeScript** — Cloudflare Worker backend
 - **Tauri v2 + React** — desktop apps (macOS, Windows, Linux); UI in HTML/CSS/TS
-- **Tauri v2 + web frontend** — Android remains a candidate path, with React Native + Rust as fallback
 - **Swift + SwiftUI** — iOS main app + File Provider extension, calling Rust core via UniFFI bindings
 - **Cloudflare** — Worker (compute), R2 (object storage), KV (manifest metadata), Cron Triggers (pruning)
 
@@ -233,7 +231,6 @@ On first setup, user enters passphrase. The app derives the key via Argon2id and
 |---|---|
 | macOS | macOS Keychain |
 | iOS | iOS Keychain |
-| Android | Android Keystore |
 | Windows | DPAPI / Credential Manager |
 | Linux | libsecret / kwallet |
 
@@ -425,7 +422,7 @@ obsink/
         └── deploy-worker.yml
 ```
 
-The iOS and Android sections above remain target architecture. Those platform directories are not in the repo yet.
+The iOS section above remains target architecture. Those platform directories are not in the repo yet.
 
 ---
 

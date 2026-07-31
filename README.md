@@ -132,7 +132,7 @@ clean for scripted parsing).
 ## Status
 
 Phases 1–2 (Rust core, CLI, Worker) are complete and deployed. Phase 3 (desktop) is
-feature-complete in code. iOS, Android, and Windows/Linux packaging are in progress. Task tracking
+feature-complete in code. iOS is in progress; Windows/Linux packaging is planned. Task tracking
 lives in the Plane project `OBS`; conventions are in [AGENTS.md](AGENTS.md).
 
 ## License

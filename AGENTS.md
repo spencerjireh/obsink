@@ -6,7 +6,7 @@ this file. When this file conflicts with `spec.md`, ask.
 
 ObSink is a free, self-hosted, end-to-end encrypted sync engine for
 [Obsidian](https://obsidian.md) vaults. A shared Rust core drives a CLI, a
-Tauri desktop app (macOS), and (in progress) iOS + Android clients; a
+Tauri desktop app (macOS), and (in progress) an iOS client; a
 Cloudflare Worker (TS) + R2 + KV is the backend. **`spec.md` is the spec source
 of truth** — read it before your first task. Architecture/wire-format details
 live in `docs/architecture.md`; per-platform status in `docs/platforms.md`.
@@ -129,8 +129,8 @@ stored here — create one in the dashboard on demand and revoke it after. A
 Status, tasks, decisions, and session logs live in the Plane project **OBS**
 ("ObSink"), reachable via the plane MCP tools. Conventions:
 
-- `spec.md` phases **P1–P7** are Plane *modules*; module status tracks phase
-  progression (P1/P2/P3 completed; P4/P7 in-progress; P5/P6 backlog).
+- `spec.md` phases **P1–P6** are Plane *modules*; module status tracks phase
+  progression (P1/P2/P3 completed; P4/P6 in-progress; P5 backlog).
 - Work items are session-sized; move to **In Progress** when starting, comment
   outcomes (e.g. test output or a deploy URL), then mark **Done**. Reference the
   item in commits: `P4: file-provider enumerateChanges (OBS-12)`.
@@ -138,4 +138,4 @@ Status, tasks, decisions, and session logs live in the Plane project **OBS**
   `[Log] Decision log` (OBS-74) and `[Log] Session log` (OBS-73); one comment
   per entry, newest last. The specs themselves stay in this repo (`spec.md`);
   the logs record the choices around them.
-- The backlog is fully detailed for all phases P1–P7.
+- The backlog is fully detailed for all phases P1–P6.
