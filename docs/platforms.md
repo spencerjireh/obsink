@@ -8,7 +8,7 @@ ObSink shares one Rust core across every client. This page covers per-platform s
 | macOS desktop | ✅ Verified end-to-end | Tauri v2 menu-bar app; flows covered by `live_tests::desktop_flows_live` (`#[ignore]`) |
 | Linux desktop | 🟡 Builds in CI | `.deb` bundled in CI; keychain backend (libsecret) not yet wired |
 | Windows desktop | ⬜ Planned | Needs DPAPI/Credential Manager keychain |
-| iOS | 🟡 App builds + runs on simulator | SwiftUI app syncs via Rust core (verified); File Provider is a scaffold; TestFlight needs signing |
+| iOS | 🟡 App + File Provider code-complete | DB-backed replicated FP (UUID IDs, change deltas), Keychain, multi-vault, conflict preview; needs E2E + TestFlight |
 | Android | ⬜ Planned | Tauri mobile (React Native + Rust fallback) |
 
 ## CLI
@@ -85,7 +85,9 @@ xcodebuild -project ios/ObSink.xcodeproj -scheme ObSink -sdk iphonesimulator \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' CODE_SIGNING_ALLOWED=NO build
 ```
 
-The SwiftUI app (sync button, status, vault setup, conflict resolution) talks to the Rust core through the generated `VaultClient`. Files sync into the App Group container (`group.com.obsink.shared`), which the File Provider extension exposes to Obsidian/Files.
+The SwiftUI app (sync button, status, vault setup, multi-vault picker, conflict resolution with side-by-side preview) talks to the Rust core through the generated `VaultClient`. Files sync into the App Group container (`group.com.obsink.shared`), which the File Provider extension exposes to Obsidian/Files. The extension is **DB-backed** (`group.com.obsink.shared/obsink.sqlite` via GRDB): stable UUID identifiers, real `enumerateChanges` deltas (monotonic `rowVersion` + `isDeleted` tombstones), and the host app reconciles the DB + signals the enumerator after each sync. The derived key is stored in the iOS Keychain (per vault), so the passphrase isn't re-entered each launch.
+
+> Slices A–E of the P4 plan are complete (21/28 items; see `docs/p4-plan.md`). The app + embedded FileProviderExt build, unit-test green (17 tests on the simulator), and install/launch cleanly.
 
 Run the on-simulator integration tests (the live-sync test reads `OBSINK_TEST_*` env vars — worker URL, API key, vault ID, and passphrase):
 
@@ -94,7 +96,7 @@ xcodebuild test -project ios/ObSink.xcodeproj -scheme ObSink -sdk iphonesimulato
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' CODE_SIGNING_ALLOWED=NO
 ```
 
-Remaining: iOS Keychain key storage, a full replicated File Provider (UUID identifiers, change tracking, `signalEnumerator`), and code-signing + TestFlight (select your team in Xcode — the project uses automatic signing). See spec.md §11 for the File Provider design.
+Remaining (Slice F — manual validation + signing): a visual check that synced files appear in the iOS Files app / Obsidian (OBS-19), Mac↔iOS end-to-end scenarios (OBS-29–34), and code-signing + TestFlight — set `DEVELOPMENT_TEAM` in `ios/project.yml` and upload via Xcode (the project uses automatic signing). See `docs/p4-plan.md` and spec.md §11 for the File Provider design.
 
 ## Android & Windows (planned)
 

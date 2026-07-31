@@ -3,6 +3,8 @@
 > Status source of truth is the Plane project **OBS** (module P4). This doc is the
 > engineering breakdown; `spec.md` §11 is the File Provider design spec.
 
+> **Progress:** slices **A–E are complete** (OBS-7,8,9,10,11,12,13,14,15,16,17,18,20,21,22,23,24,25,26,27,28 — 21/28). Remaining: **Slice F** (OBS-19 visual checkpoint + OBS-29–34 cross-device E2E + TestFlight), which is manual validation + Apple signing. Gate: `xcodebuild test` (iPhone 17 Pro sim) → 17 tests, 0 failures; `cargo test --workspace` green.
+
 P4 delivers real cross-device Obsidian sync on iOS. It's broken into **six
 dependency-ordered slices** (one session-ish each, with a verification gate before
 the next). The File Provider extension **never touches the network** (spec §11.4) —
