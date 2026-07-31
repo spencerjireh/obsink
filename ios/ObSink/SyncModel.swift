@@ -19,6 +19,7 @@ final class SyncModel: ObservableObject {
     @Published var status: String = "Not synced"
     @Published var busy: Bool = false
     @Published var pendingLocalChanges: Int = 0
+    @Published var hasStoredKey: Bool = false
     @Published var conflicts: [MobileConflict] = []
     @Published var choices: [String: MobileChoice] = [:]
 
@@ -32,12 +33,19 @@ final class SyncModel: ObservableObject {
         self.apiKey = defaults.string(forKey: "apiKey") ?? ""
         self.vaultID = defaults.string(forKey: "vaultID") ?? ""
         refreshPending()
+        refreshStoredKey()
     }
 
     /// Count of File-Provider-queued local changes (pendingUpload/pendingDeletion),
     /// read from the shared item DB. Surfaces a "Sync to push" hint in the UI.
     func refreshPending() {
         pendingLocalChanges = (try? ItemStore.shared.pendingCount()) ?? 0
+    }
+
+    /// Whether a derived key is already in the Keychain for this vault (so sync
+    /// can run without re-entering the passphrase).
+    func refreshStoredKey() {
+        hasStoredKey = !vaultID.isEmpty && KeychainStore.load(account: vaultID) != nil
     }
 
     /// Directory the Rust core reads/writes; Obsidian (via File Provider) sees the same files.
@@ -74,10 +82,24 @@ final class SyncModel: ObservableObject {
 
         Task.detached {
             do {
-                let key = try deriveMasterKey(passphrase: passphrase, vaultId: vaultID)
+                // Prefer the stored key; only derive (and store) on first setup.
+                let key: Data
+                if let stored = KeychainStore.load(account: vaultID) {
+                    key = stored
+                } else {
+                    guard !passphrase.isEmpty else {
+                        await self.fail(NSError(domain: "obsink", code: 1, userInfo: [
+                            NSLocalizedDescriptionKey: "Enter a passphrase to set up this vault."
+                        ]))
+                        return
+                    }
+                    key = try deriveMasterKey(passphrase: passphrase, vaultId: vaultID)
+                    KeychainStore.save(key, account: vaultID)
+                }
                 let client = try VaultClient(config: config, key: key)
                 let outcome = try client.sync()
                 await self.apply(outcome: outcome, client: client)
+                await MainActor.run { self.refreshStoredKey() }
             } catch {
                 await self.fail(error)
             }

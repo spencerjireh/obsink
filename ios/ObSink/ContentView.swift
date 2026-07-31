@@ -22,14 +22,18 @@ struct ContentView: View {
                             Text(model.busy ? "Working…" : "Sync Now")
                         }
                     }
-                    .disabled(model.busy || model.vaultID.isEmpty || model.passphrase.isEmpty)
+                    .disabled(model.busy || model.vaultID.isEmpty || (model.passphrase.isEmpty && !model.hasStoredKey))
                 }
 
                 Section("Vault") {
                     LabeledField("Worker URL", text: $model.workerURL)
                     LabeledField("API key", text: $model.apiKey)
                     LabeledField("Vault ID", text: $model.vaultID)
-                    SecureField("Passphrase", text: $model.passphrase)
+                    SecureField(model.hasStoredKey ? "Passphrase (saved — not needed)" : "Passphrase", text: $model.passphrase)
+                    if model.hasStoredKey {
+                        Text("Key saved in Keychain for this vault.")
+                            .font(.caption).foregroundStyle(.green)
+                    }
                 }
 
                 if !model.conflicts.isEmpty {
@@ -76,11 +80,21 @@ private struct ConflictRow: View {
     let conflict: MobileConflict
     @Binding var choice: MobileChoice
 
+    private static let formatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .short
+        f.timeStyle = .short
+        return f
+    }()
+
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(conflict.path).font(.subheadline.weight(.semibold))
-            Text("local \(conflict.localSize)B · remote \(conflict.remoteSize)B")
-                .font(.caption).foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("This device · \(conflict.localSize)B · \(Self.formatter.string(from: Date(timeIntervalSince1970: TimeInterval(conflict.localModified))))")
+                Text("Other device · \(conflict.remoteSize)B · \(Self.formatter.string(from: Date(timeIntervalSince1970: TimeInterval(conflict.remoteModified))))")
+            }
+            .font(.caption).foregroundStyle(.secondary)
             Picker("Resolution", selection: $choice) {
                 Text("Keep local").tag(MobileChoice.keepLocal)
                 Text("Keep remote").tag(MobileChoice.keepRemote)

@@ -67,6 +67,7 @@ targets:
       - path: Tests
       - path: DB
       - path: FileProvider
+      - path: ObSink/KeychainStore.swift
     dependencies:
       - target: ObSink
       - package: GRDB
