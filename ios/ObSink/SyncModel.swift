@@ -18,6 +18,7 @@ final class SyncModel: ObservableObject {
 
     @Published var status: String = "Not synced"
     @Published var busy: Bool = false
+    @Published var pendingLocalChanges: Int = 0
     @Published var conflicts: [MobileConflict] = []
     @Published var choices: [String: MobileChoice] = [:]
 
@@ -30,6 +31,13 @@ final class SyncModel: ObservableObject {
         self.workerURL = defaults.string(forKey: "workerURL") ?? "https://"
         self.apiKey = defaults.string(forKey: "apiKey") ?? ""
         self.vaultID = defaults.string(forKey: "vaultID") ?? ""
+        refreshPending()
+    }
+
+    /// Count of File-Provider-queued local changes (pendingUpload/pendingDeletion),
+    /// read from the shared item DB. Surfaces a "Sync to push" hint in the UI.
+    func refreshPending() {
+        pendingLocalChanges = (try? ItemStore.shared.pendingCount()) ?? 0
     }
 
     /// Directory the Rust core reads/writes; Obsidian (via File Provider) sees the same files.
@@ -103,7 +111,11 @@ final class SyncModel: ObservableObject {
             // OBS-20/21: mirror the freshly synced vault into the item DB, then
             // tell the File Provider to re-enumerate so Obsidian/Files see it.
             try? ItemStore.shared.reconcileAfterSync(completed: true, vaultRoot: vaultDirectory)
+            // OBS-22/23: the core sync already pushed uploads/deletes by scanning
+            // the vault dir; clear the FP's pending flags now.
+            try? ItemStore.shared.drainPendingAfterSync(completed: true)
             signalFileProvider()
+            refreshPending()
         } else if !outcome.conflicts.isEmpty {
             status = "\(outcome.conflicts.count) conflict(s) need attention"
         } else {

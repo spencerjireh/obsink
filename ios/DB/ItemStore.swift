@@ -156,7 +156,9 @@ final class ItemStore {
         try dbQueue.write { db in
             guard var rec = try ItemRecord.filter(Column("identifier") == identifier).fetchOne(db) else { return }
             if upload { rec.pendingUpload = true }
-            if deletion { rec.pendingDeletion = true }
+            // A queued deletion also tombstones the row so it drops out of
+            // enumeration immediately; the host app removes it after syncing.
+            if deletion { rec.pendingDeletion = true; rec.isDeleted = true }
             rec.rowVersion = try Self.maxRowVersion(db) + 1
             try rec.update(db)
         }
@@ -168,6 +170,18 @@ final class ItemStore {
             rec.pendingUpload = false
             rec.pendingDeletion = false
             try rec.update(db)
+        }
+    }
+
+    /// Drain the pending flags after a completed sync (OBS-22/23). The core sync
+    /// already pushed the uploads/deletes by scanning the vault dir; here we just
+    /// clear `pendingUpload` (content is now on the server) and remove rows marked
+    /// `pendingDeletion` (the deletion has propagated). No-op unless `completed`.
+    func drainPendingAfterSync(completed: Bool) throws {
+        guard completed else { return }
+        try dbQueue.write { db in
+            try db.execute(sql: "UPDATE items SET pendingUpload = 0 WHERE pendingUpload = 1")
+            try db.execute(sql: "DELETE FROM items WHERE pendingDeletion = 1")
         }
     }
 

@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var model = SyncModel()
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         NavigationStack {
@@ -10,6 +11,11 @@ struct ContentView: View {
                     Text(model.status)
                         .font(.callout)
                         .foregroundStyle(model.status.hasPrefix("Error") ? .red : .primary)
+                    if model.pendingLocalChanges > 0 {
+                        Label("\(model.pendingLocalChanges) local change\(model.pendingLocalChanges == 1 ? "" : "s") — Sync to push", systemImage: "arrow.up.circle")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
                     Button(action: model.sync) {
                         HStack {
                             if model.busy { ProgressView() }
@@ -40,6 +46,9 @@ struct ContentView: View {
                 }
             }
             .navigationTitle("ObSink")
+            .onChange(of: scenePhase) { _, phase in
+                if phase == .active { model.refreshPending() }
+            }
         }
     }
 }

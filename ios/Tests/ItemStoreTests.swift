@@ -163,4 +163,35 @@ final class ItemStoreTests: XCTestCase {
         XCTAssertEqual(rec?.identifier, id)     // UUID preserved
         XCTAssertTrue(rec?.isDeleted == false)
     }
+
+    // OBS-16: a queued deletion tombstones immediately (drops out of enumeration).
+    func testPendingDeletionTombstonesImmediately() throws {
+        let (store, _, _) = try makeStore()
+        try store.upsert(ItemRecord(identifier: "D", parentIdentifier: "", filename: "d.md",
+                                    contentHash: nil, localPath: "d.md", isDirectory: false, size: 1, modified: 1))
+        XCTAssertEqual(try store.children(of: "").count, 1)
+        try store.setPending(identifier: "D", deletion: true)
+        XCTAssertEqual(try store.children(of: "").count, 0) // excluded from enumeration
+        XCTAssertNil(try store.item(for: "D"))
+    }
+
+    // OBS-22/23: a completed sync drains both pending kinds; a paused sync doesn't.
+    func testDrainPendingAfterSync() throws {
+        let (store, _, _) = try makeStore()
+        try store.upsert(ItemRecord(identifier: "U", parentIdentifier: "", filename: "u.md",
+                                    contentHash: nil, localPath: "u.md", isDirectory: false, size: 1, modified: 1,
+                                    pendingUpload: true))
+        try store.upsert(ItemRecord(identifier: "D", parentIdentifier: "", filename: "d.md",
+                                    contentHash: nil, localPath: "d.md", isDirectory: false, size: 1, modified: 1,
+                                    pendingDeletion: true, isDeleted: true))
+        XCTAssertEqual(try store.pendingCount(), 2)
+
+        try store.drainPendingAfterSync(completed: false) // conflict-paused: no-op
+        XCTAssertEqual(try store.pendingCount(), 2)
+
+        try store.drainPendingAfterSync(completed: true)
+        XCTAssertEqual(try store.pendingCount(), 0)
+        XCTAssertFalse(try store.item(for: "U")?.pendingUpload ?? true) // upload flag cleared
+        XCTAssertNil(try store.item(for: "D"))                          // deletion row removed
+    }
 }
