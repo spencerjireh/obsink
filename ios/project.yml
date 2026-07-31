@@ -65,9 +65,11 @@ targets:
     sources:
       - path: Tests
       - path: DB
+      - path: FileProvider
     dependencies:
       - target: ObSink
       - package: GRDB
+      - sdk: FileProvider.framework
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.obsink.ios.Tests

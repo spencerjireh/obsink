@@ -1,46 +1,73 @@
 import FileProvider
 import UniformTypeIdentifiers
 
-/// An item in the replicated File Provider. Identifiers are vault-relative paths
-/// (the root container maps to the vault directory in the shared App Group).
+/// An item in the replicated File Provider, backed by an `ItemRecord`. The
+/// identifier is the record's stable UUID (spec §11.6) — never the file path.
 final class FileProviderItem: NSObject, NSFileProviderItem {
-    let id: NSFileProviderItemIdentifier
-    let name: String
-    let isFolder: Bool
-    let byteSize: NSNumber?
-    let contentVersion: Data
+    private let record: ItemRecord?
+    private let isRoot: Bool
 
-    init(identifier: NSFileProviderItemIdentifier, name: String, isFolder: Bool, size: NSNumber?, contentVersion: Data) {
-        self.id = identifier
-        self.name = name
-        self.isFolder = isFolder
-        self.byteSize = size
-        self.contentVersion = contentVersion
+    private init(record: ItemRecord?, isRoot: Bool) {
+        self.record = record
+        self.isRoot = isRoot
+        super.init()
     }
 
-    var itemIdentifier: NSFileProviderItemIdentifier { id }
+    init(record: ItemRecord) {
+        self.record = record
+        self.isRoot = false
+        super.init()
+    }
+
+    /// Synthesized root container item.
+    static func root() -> FileProviderItem {
+        FileProviderItem(record: nil, isRoot: true)
+    }
+
+    var itemIdentifier: NSFileProviderItemIdentifier {
+        isRoot ? .rootContainer : NSFileProviderItemIdentifier(record!.identifier)
+    }
 
     var parentItemIdentifier: NSFileProviderItemIdentifier {
-        guard id != .rootContainer else { return .rootContainer }
-        let path = id.rawValue
-        guard let slash = path.lastIndex(of: "/") else { return .rootContainer }
-        return NSFileProviderItemIdentifier(String(path[..<slash]))
+        guard !isRoot, let parent = record?.parentIdentifier, !parent.isEmpty else {
+            return .rootContainer
+        }
+        return NSFileProviderItemIdentifier(parent)
     }
 
-    var filename: String { name }
+    var filename: String { isRoot ? "ObSink" : (record?.filename ?? "") }
 
-    var contentType: UTType { isFolder ? .folder : (UTType(filenameExtension: (name as NSString).pathExtension) ?? .data) }
+    var contentType: UTType {
+        guard !isRoot, let rec = record else { return .folder }
+        return rec.isDirectory
+            ? .folder
+            : (UTType(filenameExtension: (rec.filename as NSString).pathExtension) ?? .data)
+    }
 
     var capabilities: NSFileProviderItemCapabilities {
-        isFolder
+        guard !isRoot, let rec = record else {
+            return [.allowsAddingSubItems, .allowsContentEnumerating, .allowsReading]
+        }
+        return rec.isDirectory
             ? [.allowsAddingSubItems, .allowsContentEnumerating, .allowsReading]
             : [.allowsReading, .allowsWriting, .allowsDeleting, .allowsReparenting, .allowsRenaming]
     }
 
-    var documentSize: NSNumber? { byteSize }
+    var documentSize: NSNumber? {
+        guard !isRoot, let rec = record, let size = rec.size else { return nil }
+        return NSNumber(value: size)
+    }
 
-    // Replicated extensions require an item version (content + metadata).
+    var contentModificationDate: Date? {
+        guard !isRoot, let rec = record else { return nil }
+        return Date(timeIntervalSince1970: TimeInterval(rec.modified))
+    }
+
+    // Replicated extensions require an item version. rowVersion changes on every
+    // real mutation, so it doubles as both content and metadata version.
     var itemVersion: NSFileProviderItemVersion {
-        NSFileProviderItemVersion(contentVersion: contentVersion, metadataVersion: contentVersion)
+        var be = (record?.rowVersion ?? 0).bigEndian
+        let data = withUnsafeBytes(of: &be) { Data($0) }
+        return NSFileProviderItemVersion(contentVersion: data, metadataVersion: data)
     }
 }

@@ -114,4 +114,43 @@ final class ItemStoreTests: XCTestCase {
         try store.clearPending(identifier: "P")
         XCTAssertEqual(try store.pendingCount(), 0)
     }
+
+    // OBS-12: a file that vanished from disk is tombstoned (not hard-deleted) and
+    // surfaces in changes() for the enumerator to report as a delete.
+    func testReconcileTombstonesVanishedFiles() throws {
+        let (store, root, _) = try makeStore()
+        let f = root.appendingPathComponent("gone.md")
+        try Data("x".utf8).write(to: f)
+        try store.reconcile(vaultRoot: root)
+        let anchor = try store.currentAnchor()
+
+        try FileManager.default.removeItem(at: f)
+        try store.reconcile(vaultRoot: root)
+
+        // Hidden from normal reads (so the FP doesn't list it)...
+        XCTAssertNil(try store.item(path: "gone.md"))
+        // ...but present in changes() as a tombstone.
+        let deltas = try store.changes(from: anchor)
+        XCTAssertEqual(deltas.count, 1)
+        XCTAssertEqual(deltas.first?.localPath, "gone.md")
+        XCTAssertTrue(deltas.first?.isDeleted == true)
+    }
+
+    // OBS-18: a path that reappears after tombstoning resurrects (reuses its UUID).
+    func testReconcileResurrectsReappearingPath() throws {
+        let (store, root, _) = try makeStore()
+        let f = root.appendingPathComponent("ghost.md")
+        try Data("first".utf8).write(to: f)
+        try store.reconcile(vaultRoot: root)
+        let id = try store.item(path: "ghost.md")?.identifier
+
+        try FileManager.default.removeItem(at: f)
+        try store.reconcile(vaultRoot: root) // tombstone
+        try Data("back".utf8).write(to: f)
+        try store.reconcile(vaultRoot: root) // resurrect
+
+        let rec = try store.item(path: "ghost.md")
+        XCTAssertEqual(rec?.identifier, id)     // UUID preserved
+        XCTAssertTrue(rec?.isDeleted == false)
+    }
 }

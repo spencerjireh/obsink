@@ -47,12 +47,15 @@ Plus a `meta(key, value)` KV holding `syncAnchor` = max(rowVersion) after reconc
 **Gate:** `xcodebuild test -scheme ObSink -sdk iphonesimulator` green (new
 `ItemStoreTests`).
 
-## Slice B — File Provider goes DB-backed + real deltas (OBS-11, 12, 13, 17)
+## Slice B — File Provider goes DB-backed + real deltas (OBS-11, 12, 13, 14, 15, 16, 17)
 
-Rewrite `FileProviderItem`/`FileProviderExtension` to read from `ItemStore`
-(UUID identifiers); `item(for:)`/`fetchContents` serve from DB + cache (OBS-13);
-monotonic `rowVersion` anchor (OBS-17); real `enumerateChanges` reporting
-insert/modify/delete since an anchor (OBS-12).
+Migrates the FP fully to UUID identifiers backed by `ItemStore` (read **and** write
+paths — you can't half-migrate): `item(for:)`/`fetchContents` serve from DB + cache
+(OBS-13); `createItem`/`modifyItem`/`deleteItem` resolve UUID↔path via the DB and set
+`pendingUpload`/`pendingDeletion` (OBS-14/15/16); a monotonic `rowVersion` anchor
+(OBS-17) plus an `isDeleted` tombstone let `enumerateChanges` report real
+insert/modify/delete deltas (OBS-12). App-side draining of the pending flags stays
+in Slice D (OBS-22/23).
 
 **Gate:** seeded items appear via `enumerateChanges`; mutation yields exactly that delta.
 
@@ -63,12 +66,11 @@ changed files (OBS-20), then `NSFileProviderManager.signalEnumerator(for: .worki
 (OBS-21). Static validation checkpoint: seeded files appear in iOS Files + Obsidian
 (sim) opens the folder as a vault (OBS-19).
 
-## Slice D — FP write-back / pending flags (OBS-14, 15, 16, 22, 23)
+## Slice D — FP write-back draining (OBS-22, 23)
 
-`createItem`/`modifyItem`/`deleteItem` set `pendingUpload`/`pendingDeletion` in the
-DB (UUID-aware). The app's next sync drains them (core already scans the vault dir;
-deletions propagate via the working-manifest delete-detection). Pending count drives
-a "Local changes — Sync" UI affordance.
+The app's next sync drains the `pendingUpload`/`pendingDeletion` flags the FP set in
+Slice B: uploads/deletes flow through the core (which already scans the vault dir),
+then the app clears the flags. Pending count drives a "Local changes — Sync" UI affordance.
 
 ## Slice E — Keychain, multi-vault, conflict-UI polish (OBS-24, 25, 26, 27, 28)
 

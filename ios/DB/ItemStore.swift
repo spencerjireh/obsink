@@ -50,6 +50,14 @@ final class ItemStore {
                 t.column("value", .text).notNull()
             }
         }
+        m.registerMigration("v2_tombstones") { db in
+            // Tombstones let enumerateChanges report deletes: reconcile marks a
+            // vanished file isDeleted (bumping rowVersion) instead of hard-deleting.
+            try db.alter(table: "items") { t in
+                t.add(column: "isDeleted", .boolean).notNull().defaults(to: false)
+            }
+            try db.create(index: "items_isDeleted", on: "items", columns: ["isDeleted"])
+        }
         return m
     }
 
@@ -64,13 +72,19 @@ final class ItemStore {
 
     func item(for identifier: String) throws -> ItemRecord? {
         try dbQueue.read { db in
-            try ItemRecord.filter(Column("identifier") == identifier).fetchOne(db)
+            try ItemRecord
+                .filter(Column("identifier") == identifier)
+                .filter(Column("isDeleted") == false)
+                .fetchOne(db)
         }
     }
 
     func item(path: String) throws -> ItemRecord? {
         try dbQueue.read { db in
-            try ItemRecord.filter(Column("localPath") == path).fetchOne(db)
+            try ItemRecord
+                .filter(Column("localPath") == path)
+                .filter(Column("isDeleted") == false)
+                .fetchOne(db)
         }
     }
 
@@ -78,13 +92,14 @@ final class ItemStore {
         try dbQueue.read { db in
             try ItemRecord
                 .filter(Column("parentIdentifier") == parentIdentifier)
+                .filter(Column("isDeleted") == false)
                 .order(Column("filename"))
                 .fetchAll(db)
         }
     }
 
-    /// Items changed since `anchor` (rowVersion strictly greater). Slice B feeds
-    /// this to `enumerateChanges`.
+    /// Items changed since `anchor` (rowVersion strictly greater), INCLUDING
+    /// tombstones (`isDeleted`). Slice B's enumerator maps tombstones to deletes.
     func changes(from anchor: Int64) throws -> [ItemRecord] {
         try dbQueue.read { db in
             try ItemRecord
@@ -197,8 +212,13 @@ final class ItemStore {
                 seen.insert(entry.path)
             }
 
-            for (path, rec) in existing where !seen.contains(path) && !rec.pendingUpload {
-                _ = try ItemRecord.filter(Column("identifier") == rec.identifier).deleteAll(db)
+            for (path, rec) in existing where !seen.contains(path) && !rec.pendingUpload && !rec.pendingDeletion {
+                if rec.isDeleted { continue }
+                var r = rec
+                r.isDeleted = true
+                r.rowVersion = nextVersion
+                nextVersion += 1
+                try r.insert(db, onConflict: .replace)
             }
         }
     }
@@ -245,6 +265,22 @@ final class ItemStore {
         nextVersion: inout Int64
     ) throws -> String {
         if let rec = existing[entry.path] {
+            // Resurrection: the path reappeared after being tombstoned. Reuse the
+            // existing UUID and clear the tombstone (the FP sees an update, not a
+            // delete + insert).
+            if rec.isDeleted {
+                var r = rec
+                r.isDeleted = false
+                r.filename = entry.filename
+                r.isDirectory = entry.isDirectory
+                r.size = entry.size
+                r.modified = entry.modified
+                r.parentIdentifier = parentIdentifier
+                r.rowVersion = nextVersion
+                nextVersion += 1
+                try r.insert(db, onConflict: .replace)
+                return r.identifier
+            }
             let changed = rec.size != entry.size
                 || rec.modified != entry.modified
                 || rec.isDirectory != entry.isDirectory

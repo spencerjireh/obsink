@@ -19,6 +19,7 @@ struct ItemRecord: Codable, FetchableRecord, MutablePersistableRecord {
     var modified: Int64            // seconds since epoch
     var pendingUpload: Bool
     var pendingDeletion: Bool
+    var isDeleted: Bool          // tombstone: set when the file vanished from disk so enumerateChanges can report a delete
     var rowVersion: Int64          // monotonic; bumped on every real change for enumerateChanges
 
     init(identifier: String,
@@ -31,6 +32,7 @@ struct ItemRecord: Codable, FetchableRecord, MutablePersistableRecord {
          modified: Int64,
          pendingUpload: Bool = false,
          pendingDeletion: Bool = false,
+         isDeleted: Bool = false,
          rowVersion: Int64 = 0) {
         self.identifier = identifier
         self.parentIdentifier = parentIdentifier
@@ -42,6 +44,7 @@ struct ItemRecord: Codable, FetchableRecord, MutablePersistableRecord {
         self.modified = modified
         self.pendingUpload = pendingUpload
         self.pendingDeletion = pendingDeletion
+        self.isDeleted = isDeleted
         self.rowVersion = rowVersion
     }
 }
