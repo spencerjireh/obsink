@@ -32,7 +32,7 @@ The **Rust core** (`core/`) holds all the logic worth sharing across platforms. 
    - **conflict** — both changed since the last common state (decided by mtime; equal mtime + different hash ⇒ conflict)
 4. **Apply downloads** immediately; return uploads + conflicts as a `SyncPlan`.
 5. The UI/CLI resolves conflicts (keep local / keep remote / keep both).
-6. `complete_sync` applies resolutions, uploads pending changes (each PUT is conflict-gated by the server via `X-Parent-Hash`), handles any late 409s, and saves the new remote manifest to disk.
+6. `complete_sync` applies resolutions, uploads pending changes (each PUT is conflict-gated by the server via `X-Parent-Hash`), handles any late 409s, and saves the new remote manifest to disk. Transfers are best-effort: a per-file failure (e.g. a 413) is recorded and skipped while the batch continues; a fatal failure (network down, auth) stops the batch. When there are no late conflicts and no fatal failure, the server manifest is re-fetched and saved even on partial success — the resume point for the next sync. Per-file failures come back as `SyncFailure { path, kind, error, fatal }` on the `SyncResult`.
 
 The engine **never auto-resolves** a conflict — that's a UI decision.
 
@@ -78,6 +78,14 @@ On `PUT`/`DELETE` the client sends `X-Parent-Hash` (the hash it believes is curr
 ## Network resilience
 
 `ApiClient` applies a 30s per-request timeout and retries transient failures (timeouts, connection errors) up to 3 times with exponential backoff. HTTP status errors and non-transient errors surface immediately as typed `ApiError`s. Logging is via `tracing` (`debug` per request, `info` per sync plan, `warn` on retry).
+
+### Partial-sync recovery
+
+Above the per-request retry, the sync engine is partial-sync aware. Each non-conflict transfer error is classified **fatal** (`ApiError::Http`, or `UnexpectedStatus` 401/403/5xx → stop the batch) or **per-file** (413/404/other 4xx, local crypto/IO → record and continue). Recorded failures land on `SyncResult.failures` as `SyncFailure { path, kind, error, fatal }`. Because the manifest checkpoints on partial success (sync-cycle step 6), a dropped sync resumes on the next run — hash-based diffing means already-pushed files are skipped automatically.
+
+### Progress reporting
+
+Sync is observable through a `ProgressSink` trait (`Phase` / `FileStarted` / `FileCompleted` / `FileFailed` / `Done` events) that each facade adapts to its native channel: the CLI prints to stderr, the desktop emits a `sync://progress` Tauri event, and iOS receives a UniFFI `ProgressListener` callback. Callers with no UI pass `NoProgress`.
 
 ## Worker storage keys
 

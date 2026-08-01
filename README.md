@@ -40,7 +40,10 @@ in [docs/architecture.md](docs/architecture.md).
    differing hash is a conflict).
 4. Downloads apply immediately; uploads and conflicts return as a `SyncPlan`.
 5. The client resolves conflicts, then `complete_sync` uploads with parent-hash gating, handles late
-   409s, and persists the new manifest.
+   409s, and persists the new manifest. Transfers are best-effort — per-file failures are skipped
+   while the batch continues, fatal failures stop early, and the manifest checkpoints on partial
+   success so a dropped sync resumes next time. Per-file progress streams to each client (CLI stderr,
+   a desktop Tauri event, an iOS callback).
 
 ## Worker API
 
