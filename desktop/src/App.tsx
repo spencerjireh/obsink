@@ -17,6 +17,31 @@ type SyncResult = {
   upload: SyncAction[]
   download: SyncAction[]
   conflicts: Conflict[]
+  failures: SyncFailure[]
+}
+
+type SyncFailure = {
+  path: string
+  kind: SyncAction['kind']
+  error: string
+  fatal: boolean
+}
+
+// Core `ProgressEvent` serializes (serde, externally-tagged) to this shape.
+type SyncPhase = 'Downloading' | 'ResolvingConflicts' | 'Uploading'
+
+type ProgressEvent =
+  | { Phase: SyncPhase }
+  | { FileStarted: { path: string; kind: SyncAction['kind']; index: number; total: number } }
+  | { FileCompleted: { path: string; bytes: number } }
+  | { FileFailed: { path: string; error: string } }
+  | { Done: { uploaded: number; downloaded: number; failed: number } }
+
+type Progress = {
+  phase: SyncPhase
+  current: number
+  total: number
+  path: string | null
 }
 
 type SyncStatus = {
@@ -78,6 +103,17 @@ function countRemoteChanges(diff: SyncResult): number {
   return diff.download.length + diff.conflicts.length
 }
 
+function phaseLabel(phase: SyncPhase): string {
+  switch (phase) {
+    case 'Downloading':
+      return 'Downloading'
+    case 'ResolvingConflicts':
+      return 'Resolving conflicts'
+    case 'Uploading':
+      return 'Uploading'
+  }
+}
+
 function App() {
   const [vaults, setVaults] = useState<LocalVault[]>([])
   const [status, setStatus] = useState<SyncStatus | null>(null)
@@ -85,6 +121,7 @@ function App() {
   const [message, setMessage] = useState<string>('')
   const [busy, setBusy] = useState(false)
   const [syncResult, setSyncResult] = useState<SyncResult | null>(null)
+  const [progress, setProgress] = useState<Progress | null>(null)
   const [conflicts, setConflicts] = useState<Conflict[]>([])
   const [choices, setChoices] = useState<Record<string, ResolutionChoice>>({})
   const [staleRemoteChanges, setStaleRemoteChanges] = useState(0)
@@ -186,6 +223,7 @@ function App() {
   async function handleSync() {
     setBusy(true)
     setMessage('')
+    setProgress(null)
 
     try {
       const response = await call<SyncResponse>('sync_vault', {
@@ -218,6 +256,27 @@ function App() {
   handleSyncRef.current = handleSync
 
   useEffect(() => {
+    const unlisten = listen<ProgressEvent>('sync://progress', (event) => {
+      const ev = event.payload
+      if ('Phase' in ev) {
+        setProgress({ phase: ev.Phase, current: 0, total: 0, path: null })
+      } else if ('FileStarted' in ev) {
+        setProgress((prev) => ({
+          phase: prev?.phase ?? 'Uploading',
+          current: ev.FileStarted.index + 1,
+          total: ev.FileStarted.total,
+          path: ev.FileStarted.path,
+        }))
+      } else if ('Done' in ev) {
+        setProgress(null)
+      }
+    })
+    return () => {
+      void unlisten.then((dispose) => dispose())
+    }
+  }, [])
+
+  useEffect(() => {
     const unlisten = listen('tray://sync-now', () => {
       void handleSyncRef.current()
     })
@@ -233,6 +292,7 @@ function App() {
 
     setBusy(true)
     setMessage('')
+    setProgress(null)
 
     try {
       const result = await call<SyncResult>('resolve_conflict', {
@@ -333,7 +393,32 @@ function App() {
             </article>
           </div>
 
+          {busy && progress ? (
+            <div className="notice">
+              {phaseLabel(progress.phase)}
+              {progress.path ? ` · ${progress.path}` : ''}
+              {progress.total > 0 ? ` (${progress.current}/${progress.total})` : ''}
+            </div>
+          ) : null}
+
           {message ? <div className="notice">{message}</div> : null}
+
+          {syncResult?.failures?.length ? (
+            <div className="notice notice--warning">
+              {syncResult.failures.length} file{syncResult.failures.length === 1 ? '' : 's'} failed
+              this sync:
+              <ul className="failure-list">
+                {syncResult.failures.map((failure) => (
+                  <li key={failure.path}>
+                    <span className={`tag tag--${failure.fatal ? 'fatal' : 'skipped'}`}>
+                      {failure.fatal ? 'FATAL' : 'skipped'}
+                    </span>{' '}
+                    {failure.path}: {failure.error}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
 
           <div className="vault-list">
             {vaults.length === 0 ? <p>No vaults configured yet.</p> : null}

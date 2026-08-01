@@ -17,7 +17,7 @@ use tauri::{
 use obsink_core::{
     build_working_manifest_for_path, complete_sync, derive_key, derive_keys, diff_local_and_remote,
     prepare_sync, sync_manifest_path, ApiClient, Conflict, ConflictResolution, CreateVaultRequest,
-    KeyBytes, SyncPlan, SyncResult, VaultConfig,
+    KeyBytes, ProgressEvent, ProgressSink, SyncPlan, SyncResult, VaultConfig,
 };
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +27,21 @@ const KEYCHAIN_SERVICE: &str = "obsink";
 #[derive(Default)]
 struct AppState {
     pending_plans: Mutex<HashMap<String, SyncPlan>>,
+}
+
+/// Bridges core sync progress events to the frontend via the Tauri event bus.
+/// Events flow as `sync://progress` (payload = the core `ProgressEvent`),
+/// consumed by the React UI's live progress line.
+#[derive(Clone)]
+struct TauriProgressSink {
+    app: AppHandle,
+}
+
+impl ProgressSink for TauriProgressSink {
+    fn report(&self, event: ProgressEvent) {
+        // Best-effort: a listener that has unmounted shouldn't fail the sync.
+        let _ = self.app.emit("sync://progress", event);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -250,23 +265,18 @@ async fn get_manifest_diff(vault_id: Option<String>) -> Result<SyncResult, Strin
 async fn sync_vault_inner(
     vault_id: Option<String>,
     state: &AppState,
+    progress: &dyn ProgressSink,
 ) -> Result<SyncCommandResponse, String> {
     let vault = selected_vault(vault_id).map_err(err_string)?;
     let key = load_key_from_keychain(&vault.id).map_err(err_string)?;
-    let plan = prepare_sync(&to_vault_config(&vault), &key, &obsink_core::NoProgress)
+    let plan = prepare_sync(&to_vault_config(&vault), &key, progress)
         .await
         .map_err(err_string)?;
 
     if plan.conflicts.is_empty() {
-        let result = complete_sync(
-            &to_vault_config(&vault),
-            &key,
-            &plan,
-            &[],
-            &obsink_core::NoProgress,
-        )
-        .await
-        .map_err(err_string)?;
+        let result = complete_sync(&to_vault_config(&vault), &key, &plan, &[], progress)
+            .await
+            .map_err(err_string)?;
         return Ok(SyncCommandResponse {
             completed_result: Some(result),
             pending_conflicts: Vec::new(),
@@ -290,14 +300,17 @@ async fn sync_vault_inner(
 async fn sync_vault(
     vault_id: Option<String>,
     state: tauri::State<'_, AppState>,
+    app: AppHandle,
 ) -> Result<SyncCommandResponse, String> {
-    sync_vault_inner(vault_id, &state).await
+    let sink = TauriProgressSink { app };
+    sync_vault_inner(vault_id, &state, &sink).await
 }
 
 async fn resolve_conflict_inner(
     vault_id: String,
     resolutions: Vec<ConflictResolution>,
     state: &AppState,
+    progress: &dyn ProgressSink,
 ) -> Result<SyncResult, String> {
     let vault = selected_vault(Some(vault_id.clone())).map_err(err_string)?;
     let plan = state
@@ -308,15 +321,9 @@ async fn resolve_conflict_inner(
         .ok_or_else(|| format!("no pending conflict set for {}", vault_id))?;
     let key = load_key_from_keychain(&vault.id).map_err(err_string)?;
 
-    complete_sync(
-        &to_vault_config(&vault),
-        &key,
-        &plan,
-        &resolutions,
-        &obsink_core::NoProgress,
-    )
-    .await
-    .map_err(err_string)
+    complete_sync(&to_vault_config(&vault), &key, &plan, &resolutions, progress)
+        .await
+        .map_err(err_string)
 }
 
 #[tauri::command]
@@ -324,8 +331,10 @@ async fn resolve_conflict(
     vault_id: String,
     resolutions: Vec<ConflictResolution>,
     state: tauri::State<'_, AppState>,
+    app: AppHandle,
 ) -> Result<SyncResult, String> {
-    resolve_conflict_inner(vault_id, resolutions, &state).await
+    let sink = TauriProgressSink { app };
+    resolve_conflict_inner(vault_id, resolutions, &state, &sink).await
 }
 
 async fn get_conflict_preview_inner(
@@ -755,7 +764,7 @@ mod live_tests {
         assert!(get_vaults().unwrap().iter().any(|v| v.id == vault_id && v.active));
 
         fs::write(dir_a.join(file_rel), "content-A").unwrap();
-        let resp = sync_vault_inner(Some(vault_id.clone()), &state).await.unwrap();
+        let resp = sync_vault_inner(Some(vault_id.clone()), &state, &obsink_core::NoProgress).await.unwrap();
         assert!(resp.pending_conflicts.is_empty());
         assert_eq!(
             resp.completed_result.unwrap().upload.len(),
@@ -775,7 +784,7 @@ mod live_tests {
         })
         .await
         .unwrap(); // validate_passphrase decrypts a.md -> proves the key works
-        let resp_b = sync_vault_inner(Some(vault_id.clone()), &state).await.unwrap();
+        let resp_b = sync_vault_inner(Some(vault_id.clone()), &state, &obsink_core::NoProgress).await.unwrap();
         assert_eq!(
             resp_b.completed_result.unwrap().download.len(),
             1,
@@ -790,7 +799,7 @@ mod live_tests {
         // ===== OBS-5: stale-vault detection (server ahead of client) =====
         // B uploads a new file the A-side view doesn't have.
         fs::write(dir_b.join("notes/b.md"), "B-only").unwrap();
-        sync_vault_inner(Some(vault_id.clone()), &state).await.unwrap();
+        sync_vault_inner(Some(vault_id.clone()), &state, &obsink_core::NoProgress).await.unwrap();
         // Repoint the active local folder at A (which is now behind the server).
         connect_local(&worker_url, &api_key, &vault_id, &passphrase, &dir_a).await;
         let status = get_status().await.unwrap();
@@ -809,7 +818,7 @@ mod live_tests {
         for choice in choices {
             // Rebaseline: A's a.md == "REMOTE", then sync so server == local.
             fs::write(dir_a.join(file_rel), "REMOTE").unwrap();
-            let _ = sync_vault_inner(Some(vault_id.clone()), &state).await.unwrap();
+            let _ = sync_vault_inner(Some(vault_id.clone()), &state, &obsink_core::NoProgress).await.unwrap();
             let ts = server_modified_for(&dir_a, file_rel);
 
             // Engineer a conflict: different content, same (pinned) mtime.
@@ -817,7 +826,7 @@ mod live_tests {
             fs::write(dir_a.join(file_rel), &local_text).unwrap();
             set_mtime(&dir_a.join(file_rel), ts);
 
-            let resp = sync_vault_inner(Some(vault_id.clone()), &state).await.unwrap();
+            let resp = sync_vault_inner(Some(vault_id.clone()), &state, &obsink_core::NoProgress).await.unwrap();
             assert_eq!(
                 resp.pending_conflicts.len(),
                 1,
@@ -843,6 +852,7 @@ mod live_tests {
                     choice: choice.clone(),
                 }],
                 &state,
+                &obsink_core::NoProgress,
             )
             .await
             .unwrap();

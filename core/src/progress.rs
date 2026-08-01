@@ -4,10 +4,12 @@
 //! the run without the core knowing about Tauri events, UniFFI callbacks, or
 //! stderr. Pass a [`NoProgress`] when observation isn't needed (e.g. tests).
 
+use serde::{Deserialize, Serialize};
+
 use crate::types::SyncActionKind;
 
 /// Broad phase of the sync cycle, reported before the per-file events for it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SyncPhase {
     Downloading,
     ResolvingConflicts,
@@ -15,7 +17,7 @@ pub enum SyncPhase {
 }
 
 /// A single observable event emitted during `prepare_sync` / `complete_sync`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProgressEvent {
     /// A new phase is starting (download / resolve / upload).
     Phase(SyncPhase),
