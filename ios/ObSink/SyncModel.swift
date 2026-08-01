@@ -11,6 +11,48 @@ struct VaultEntry: Codable, Identifiable, Equatable {
     var id: String { vaultID }
 }
 
+/// UI snapshot of sync progress, derived from `MobileProgressEvent`.
+struct SyncProgressInfo: Equatable {
+    var phase: String
+    var current: Int
+    var total: Int
+    var path: String?
+
+    static func label(for phase: MobileSyncPhase) -> String {
+        switch phase {
+        case .downloading: return "Downloading"
+        case .resolvingConflicts: return "Resolving conflicts"
+        case .uploading: return "Uploading"
+        }
+    }
+}
+
+/// Bridges Rust sync progress events into `SyncModel.progress`. `onProgress`
+/// fires on the sync's background thread (during the blocking Rust call), so it
+/// hops to the main actor to update SwiftUI. Lives for one sync cycle.
+final class SyncProgressListener: ProgressListener {
+    private weak var model: SyncModel?
+    private var phase: String = "Working"
+
+    init(model: SyncModel) { self.model = model }
+
+    func onProgress(event: MobileProgressEvent) {
+        let info: SyncProgressInfo?
+        switch event {
+        case .phase(let p):
+            phase = SyncProgressInfo.label(for: p)
+            info = SyncProgressInfo(phase: phase, current: 0, total: 0, path: nil)
+        case .fileStarted(let path, _, let index, let total):
+            info = SyncProgressInfo(phase: phase, current: Int(index), total: Int(total), path: path)
+        case .done:
+            info = nil
+        case .fileCompleted, .fileFailed:
+            return
+        }
+        Task { @MainActor [weak model] in model?.progress = info }
+    }
+}
+
 /// Drives sync from the SwiftUI layer by calling the Rust core through the
 /// generated UniFFI bindings (`VaultClient`, `deriveMasterKey`, ...).
 ///
@@ -36,6 +78,8 @@ final class SyncModel: ObservableObject {
     @Published var conflicts: [MobileConflict] = []
     @Published var choices: [String: MobileChoice] = [:]
     @Published var previews: [String: MobileConflictPreview] = [:]
+    @Published var progress: SyncProgressInfo?
+    @Published var failures: [MobileSyncFailure] = []
 
     private var client: VaultClient?
     private let defaults: UserDefaults
@@ -168,6 +212,8 @@ final class SyncModel: ObservableObject {
         busy = true
         status = "Syncing…"
         conflicts = []
+        progress = nil
+        failures = []
 
         let config = MobileVaultConfig(
             workerUrl: workerURL,
@@ -177,6 +223,7 @@ final class SyncModel: ObservableObject {
         )
         let passphrase = self.passphrase
         let vaultID = self.vaultID
+        let listener = SyncProgressListener(model: self)
 
         Task.detached {
             do {
@@ -195,7 +242,7 @@ final class SyncModel: ObservableObject {
                     KeychainStore.save(key, account: vaultID)
                 }
                 let client = try VaultClient(config: config, key: key)
-                let outcome = try client.sync()
+                let outcome = try client.sync(listener: listener)
                 await self.apply(outcome: outcome, client: client)
                 await MainActor.run { self.refreshStoredKey() }
             } catch {
@@ -208,12 +255,15 @@ final class SyncModel: ObservableObject {
         guard let client, !busy else { return }
         busy = true
         status = "Resolving…"
+        progress = nil
+        failures = []
         let resolutions = conflicts.map { conflict in
             MobileResolution(path: conflict.path, choice: choices[conflict.path] ?? .keepLocal)
         }
+        let listener = SyncProgressListener(model: self)
         Task.detached {
             do {
-                let outcome = try client.complete(resolutions: resolutions)
+                let outcome = try client.complete(resolutions: resolutions, listener: listener)
                 await self.apply(outcome: outcome, client: client)
             } catch {
                 await self.fail(error)
@@ -226,9 +276,14 @@ final class SyncModel: ObservableObject {
         conflicts = outcome.conflicts
         choices = Dictionary(uniqueKeysWithValues: outcome.conflicts.map { ($0.path, .keepLocal) })
         previews = [:]
+        failures = outcome.failures
+        progress = nil
         busy = false
+        let failedSuffix = outcome.failures.isEmpty
+            ? ""
+            : " · \(outcome.failures.count) failed"
         if outcome.completed {
-            status = "Synced · ↑\(outcome.uploaded) ↓\(outcome.downloaded)"
+            status = "Synced · ↑\(outcome.uploaded) ↓\(outcome.downloaded)\(failedSuffix)"
             // OBS-20/21: mirror the freshly synced vault into the item DB, then
             // tell the File Provider to re-enumerate so Obsidian/Files see it.
             try? ItemStore.shared.reconcileAfterSync(completed: true, vaultRoot: vaultDirectory)
@@ -241,7 +296,7 @@ final class SyncModel: ObservableObject {
             status = "\(outcome.conflicts.count) conflict(s) need attention"
             loadPreviews()
         } else {
-            status = "Prepared · ↑\(outcome.uploaded) ↓\(outcome.downloaded)"
+            status = "Prepared · ↑\(outcome.uploaded) ↓\(outcome.downloaded)\(failedSuffix)"
         }
     }
 
@@ -270,6 +325,7 @@ final class SyncModel: ObservableObject {
 
     private func fail(_ error: Error) {
         busy = false
+        progress = nil
         status = "Error: \(error.localizedDescription)"
     }
 }

@@ -41,6 +41,17 @@ struct ContentView: View {
                         }
                     }
                     .disabled(model.busy || model.vaultID.isEmpty || (model.passphrase.isEmpty && !model.hasStoredKey))
+
+                    if model.busy, let p = model.progress {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("\(p.phase)\(p.path.map { " · \($0)" } ?? "")")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            if p.total > 0 {
+                                ProgressView(value: Double(p.current), total: Double(p.total))
+                            }
+                        }
+                    }
                 }
 
                 Section("Vault") {
@@ -75,6 +86,24 @@ struct ContentView: View {
                         }
                         Button("Apply Resolutions", action: model.resolve)
                             .disabled(model.busy)
+                    }
+                }
+
+                if !model.failures.isEmpty {
+                    Section("Failed this sync") {
+                        ForEach(model.failures, id: \.self) { failure in
+                            VStack(alignment: .leading, spacing: 2) {
+                                HStack(spacing: 6) {
+                                    Text(failure.fatal ? "FATAL" : "skipped")
+                                        .font(.caption2.weight(.bold))
+                                        .foregroundStyle(failure.fatal ? .red : .orange)
+                                    Text(failure.path).font(.caption)
+                                }
+                                Text(failure.error)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
                     }
                 }
             }

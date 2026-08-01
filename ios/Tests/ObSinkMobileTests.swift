@@ -5,6 +5,11 @@ import XCTest
 /// simulator. Proves the FFI bridge, Argon2 key derivation, and (when live env
 /// is provided) the full encrypted sync over the network all work on iOS.
 final class ObSinkMobileTests: XCTestCase {
+    /// Minimal `ProgressListener` that discards events for tests.
+    final class NoopListener: ProgressListener {
+        func onProgress(event: MobileProgressEvent) {}
+    }
+
     func testDeriveKeyIsDeterministic32Bytes() throws {
         let a = try deriveMasterKey(passphrase: "hunter2", vaultId: "vault_test")
         let b = try deriveMasterKey(passphrase: "hunter2", vaultId: "vault_test")
@@ -31,9 +36,10 @@ final class ObSinkMobileTests: XCTestCase {
         let key = try deriveMasterKey(passphrase: passphrase, vaultId: vaultID)
         let client = try VaultClient(config: config, key: key)
 
-        let outcome = try client.sync()
+        let outcome = try client.sync(listener: NoopListener())
         XCTAssertTrue(outcome.completed, "sync should complete without conflicts")
         XCTAssertGreaterThanOrEqual(outcome.downloaded, 1)
+        XCTAssertTrue(outcome.failures.isEmpty, "seeded-file sync should have no failures")
 
         let downloaded = try String(contentsOf: dir.appendingPathComponent("ios-test.md"), encoding: .utf8)
         XCTAssertTrue(downloaded.contains("hello from CLI"), "decrypted content should match the seeded file")
