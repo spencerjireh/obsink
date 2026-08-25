@@ -40,7 +40,23 @@ step() { printf '\n==> %s\n' "$*"; }
 pass() { printf 'PASS: %s\n' "$*"; PASS_COUNT=$((PASS_COUNT+1)); }
 fail() { printf 'FAIL: %s\n' "$*"; FAIL_COUNT=$((FAIL_COUNT+1)); }
 
-cli() { OBSINK_HOME="$A_HOME" cargo run -q -p obsink -- "$@"; }
+# Cloudflare KV caches reads at the edge for up to 60 s, so a manifest the
+# app read moments ago can shadow a CLI write for that long. After any CLI
+# write, the next XCUITest phase waits KV_SETTLE seconds (OBSINK_KV_SETTLE=0
+# to disable, e.g. against wrangler dev).
+KV_SETTLE="${OBSINK_KV_SETTLE:-65}"
+NEED_SETTLE=0
+cli() {
+    OBSINK_HOME="$A_HOME" cargo run -q -p obsink -- "$@"
+    case "$1" in sync|init|connect) NEED_SETTLE=1 ;; esac
+}
+settle() {
+    if [ "$NEED_SETTLE" = 1 ] && [ "$KV_SETTLE" -gt 0 ]; then
+        echo "    (waiting ${KV_SETTLE}s for KV edge caches to expire)"
+        sleep "$KV_SETTLE"
+    fi
+    NEED_SETTLE=0
+}
 
 # Run one XCUITest phase; extra env for the app goes via TEST_RUNNER_*.
 RUN_N=0
@@ -48,6 +64,7 @@ run_test() {
     local test_name="$1"; shift
     RUN_N=$((RUN_N+1))
     local log="$WORK/xcuitest-$(printf '%02d' "$RUN_N")-$test_name.log"
+    settle
     if env "$@" \
         TEST_RUNNER_OBSINK_TEST_WORKER_URL="$WORKER_URL" \
         TEST_RUNNER_OBSINK_TEST_API_KEY="$WORKER_API_KEY" \

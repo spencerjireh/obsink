@@ -114,6 +114,8 @@ xcodebuild test -project ios/ObSink.xcodeproj -scheme ObSink -sdk iphonesimulato
 
 The Mac↔iOS scenarios are automated end to end on a simulator:
 
+Cloudflare KV caches reads at the edge for up to 60 s, so the harness waits `OBSINK_KV_SETTLE` seconds (default 65) between a CLI write and the next XCUITest phase; set it to `0` against `wrangler dev`. Without it the stale banner, Connect listing, and conflict rounds fail intermittently depending on which key the app read last.
+
 ```bash
 # Uses .env (WORKER_URL, WORKER_API_KEY, DEVELOPMENT_TEAM) and a throwaway vault.
 OBSINK_SIM_NAME=obsink-e2e ./scripts/verify-ios-sim-e2e.sh
