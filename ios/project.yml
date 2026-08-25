@@ -14,6 +14,8 @@ settings:
     # Rust staticlib needs these system libs (reqwest proxy detection + resolver).
     OTHER_LDFLAGS:
       - -lresolv
+    # The Rust xcframework ships an arm64-only simulator slice.
+    "EXCLUDED_ARCHS[sdk=iphonesimulator*]": x86_64
     # Resolved by XcodeGen from the environment at generate time (see
     # scripts/build-ios.sh, which loads it from the gitignored .env). Empty is
     # fine for simulator builds (CODE_SIGNING_ALLOWED=NO); device/TestFlight
