@@ -10,9 +10,10 @@ use std::{fs, path::Path, sync::{Arc, Mutex}};
 
 use obsink_core::{
     build_working_manifest_for_path, complete_sync, decrypt, derive_key, derive_keys,
-    diff_local_and_remote, prepare_sync, ApiClient, ConflictResolution,
-    ConflictResolutionChoice, CreateVaultRequest, KeyBytes, ProgressEvent, ProgressSink,
-    SyncActionKind, SyncFailure, SyncPlan, SyncPhase, VaultConfig, VaultSummary,
+    diff_local_and_remote, hosted_worker_url as core_hosted_worker_url, normalize_worker_url,
+    prepare_sync, ApiClient, AuthClient, ConflictResolution, ConflictResolutionChoice,
+    CreateVaultRequest, KeyBytes, ProgressEvent, ProgressSink, SyncActionKind, SyncFailure,
+    SyncPlan, SyncPhase, VaultConfig, VaultSummary,
 };
 
 uniffi::setup_scaffolding!();
@@ -218,6 +219,155 @@ pub fn create_vault(
         block_on(ApiClient::new(worker_only(worker_url, api_key)).create_vault(&request))
             .map_err(sync_err)?;
     Ok(response.vault.into())
+}
+
+// --- Accounts (hosted mode) ------------------------------------------------
+
+/// The Worker every client offers as "ObSink Cloud".
+#[uniffi::export]
+pub fn hosted_worker_url() -> String {
+    core_hosted_worker_url()
+}
+
+/// Canonical form of a Worker URL (the keychain account for its bearer).
+#[uniffi::export]
+pub fn canonical_worker_url(url: String) -> String {
+    normalize_worker_url(&url)
+}
+
+/// Which sign-in methods a Worker offers (`GET /`).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MobileCapabilities {
+    pub email: bool,
+    pub apple: bool,
+    pub api_key: bool,
+}
+
+/// A signed-in session: `token` is the bearer to store in the Keychain.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MobileSession {
+    pub token: String,
+    pub session_id: String,
+    pub user_id: String,
+    pub email: Option<String>,
+}
+
+/// `GET /auth/me` for the signed-in account.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MobileAccount {
+    pub user_id: String,
+    pub email: Option<String>,
+    pub devices: Vec<MobileDevice>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MobileDevice {
+    pub session_id: String,
+    pub device_name: String,
+    pub created: u64,
+    pub current: bool,
+}
+
+#[uniffi::export]
+pub fn auth_capabilities(worker_url: String) -> Result<MobileCapabilities, MobileError> {
+    let caps = block_on(AuthClient::new(&worker_url).capabilities()).map_err(sync_err)?;
+    Ok(MobileCapabilities {
+        email: caps.auth.email,
+        apple: caps.auth.apple,
+        api_key: caps.auth.api_key,
+    })
+}
+
+/// Send a one-time code to `email`. Returns the code only against a dev
+/// server (`AUTH_DEV_RETURN_CODE=1`), otherwise `None`.
+#[uniffi::export]
+pub fn auth_email_start(worker_url: String, email: String) -> Result<Option<String>, MobileError> {
+    let result = block_on(AuthClient::new(&worker_url).email_start(&email)).map_err(sync_err)?;
+    Ok(result.code)
+}
+
+#[uniffi::export]
+pub fn auth_email_verify(
+    worker_url: String,
+    email: String,
+    code: String,
+    device_name: String,
+) -> Result<MobileSession, MobileError> {
+    let session = block_on(AuthClient::new(&worker_url).email_verify(&email, &code, &device_name))
+        .map_err(sync_err)?;
+    Ok(to_mobile_session(session))
+}
+
+/// Exchange an Apple identity token (from `ASAuthorizationAppleIDCredential`)
+/// for a session. Pass the credential's email when Apple supplies it (first
+/// authorization only).
+#[uniffi::export]
+pub fn auth_apple(
+    worker_url: String,
+    identity_token: String,
+    device_name: String,
+    email: Option<String>,
+) -> Result<MobileSession, MobileError> {
+    let session = block_on(AuthClient::new(&worker_url).apple_sign_in(
+        &identity_token,
+        &device_name,
+        email.as_deref(),
+    ))
+    .map_err(sync_err)?;
+    Ok(to_mobile_session(session))
+}
+
+#[uniffi::export]
+pub fn auth_me(worker_url: String, token: String) -> Result<MobileAccount, MobileError> {
+    let me = block_on(AuthClient::new(&worker_url).me(&token)).map_err(sync_err)?;
+    let user = me.user.ok_or_else(|| sync_err("this credential is a self-hosted API key, not an account"))?;
+    Ok(MobileAccount {
+        user_id: user.id,
+        email: user.email,
+        devices: me
+            .sessions
+            .into_iter()
+            .map(|session| MobileDevice {
+                session_id: session.id,
+                device_name: session.device_name,
+                created: session.created,
+                current: session.current,
+            })
+            .collect(),
+    })
+}
+
+/// Revoke the current session (sign out this device).
+#[uniffi::export]
+pub fn auth_logout(worker_url: String, token: String) -> Result<(), MobileError> {
+    block_on(AuthClient::new(&worker_url).logout(&token)).map_err(sync_err)
+}
+
+/// Delete the account and every vault it owns. Irreversible.
+#[uniffi::export]
+pub fn auth_delete_account(worker_url: String, token: String) -> Result<(), MobileError> {
+    block_on(AuthClient::new(&worker_url).delete_account(&token)).map_err(sync_err)
+}
+
+/// Delete a vault (and its server-side blobs) the bearer owns.
+#[uniffi::export]
+pub fn delete_vault(worker_url: String, api_key: String, vault_id: String) -> Result<(), MobileError> {
+    let config = VaultConfig {
+        worker_url,
+        api_key,
+        vault_id,
+        local_path: String::new(),
+    };
+    block_on(ApiClient::new(config).delete_vault()).map_err(sync_err)
+}
+
+fn to_mobile_session(session: obsink_core::Session) -> MobileSession {
+    MobileSession {
+        token: session.token,
+        session_id: session.session.id,
+        user_id: session.user.id,
+        email: session.user.email,
+    }
 }
 
 /// Foreign-implemented receiver of sync progress events. Swift passes an
