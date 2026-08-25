@@ -389,6 +389,7 @@ fn is_fatal_sync_error(error: &SyncEngineError) -> bool {
 fn is_fatal_api_error(error: &ApiError) -> bool {
     match error {
         ApiError::Http(_) => true,
+        ApiError::Unauthorized => true,
         ApiError::UnexpectedStatus { status, .. } => matches!(status.as_u16(), 401 | 403 | 500..=599),
         ApiError::Crypto(_) | ApiError::Conflict { .. } => false,
     }

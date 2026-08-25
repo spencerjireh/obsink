@@ -1,4 +1,5 @@
 pub mod api_client;
+pub mod auth;
 pub mod crypto;
 pub mod hasher;
 pub mod manifest;
@@ -7,6 +8,10 @@ pub mod sync_engine;
 pub mod types;
 
 pub use api_client::{ApiClient, ApiError};
+pub use auth::{
+    hosted_worker_url, normalize_worker_url, AuthClient, AuthError, AuthMethods, Capabilities,
+    EmailStartResult, Me, MeSession, MeUser, Session, SessionInfo, UserInfo, HOSTED_WORKER_URL,
+};
 pub use crypto::{
     content_hmac, decrypt, decrypt_path, derive_key, derive_keys, encrypt, encrypt_path,
     path_token, CryptoError, CryptoKeys, KeyBytes, PROTOCOL_VERSION,

@@ -33,6 +33,10 @@ pub enum ApiError {
     },
     #[error("crypto error: {0}")]
     Crypto(#[from] CryptoError),
+    /// 401: the bearer (self-hosted `API_KEY` or a hosted session token) was
+    /// rejected — the session may have been revoked or expired.
+    #[error("unauthorized: sign in again or check the API key")]
+    Unauthorized,
     #[error("unexpected status {status}: {body}")]
     UnexpectedStatus { status: StatusCode, body: String },
 }
@@ -76,11 +80,11 @@ impl ApiClient {
 
     pub fn vault_url(&self, suffix: &str) -> String {
         let base = self.config.worker_url.trim_end_matches('/');
-        format!(
-            "{base}/vaults/{}/{}",
-            self.config.vault_id,
-            suffix.trim_start_matches('/')
-        )
+        let suffix = suffix.trim_start_matches('/');
+        if suffix.is_empty() {
+            return format!("{base}/vaults/{}", self.config.vault_id);
+        }
+        format!("{base}/vaults/{}/{suffix}", self.config.vault_id)
     }
 
     fn root_url(&self, suffix: &str) -> String {
@@ -110,6 +114,16 @@ impl ApiClient {
             .json(request);
 
         parse_json(self.send_with_retry(http_request).await?).await
+    }
+
+    /// Delete the configured vault and every blob it owns on the server.
+    pub async fn delete_vault(&self) -> Result<(), ApiError> {
+        debug!(vault = %self.config.vault_id, "deleting vault");
+        let request = self
+            .client
+            .delete(self.vault_url(""))
+            .bearer_auth(&self.config.api_key);
+        parse_empty("", self.send_with_retry(request).await?).await
     }
 
     /// Fetch the server manifest (keyed by opaque path tokens) and re-key it by
@@ -210,6 +224,9 @@ async fn parse_json<T: DeserializeOwned>(response: Response) -> Result<T, ApiErr
         return Ok(response.json().await?);
     }
 
+    if status == StatusCode::UNAUTHORIZED {
+        return Err(ApiError::Unauthorized);
+    }
     let body = response.text().await.unwrap_or_default();
     Err(ApiError::UnexpectedStatus { status, body })
 }
@@ -221,6 +238,9 @@ async fn parse_bytes(response: Response) -> Result<Vec<u8>, ApiError> {
         return Ok(response.bytes().await?.to_vec());
     }
 
+    if status == StatusCode::UNAUTHORIZED {
+        return Err(ApiError::Unauthorized);
+    }
     let body = response.text().await.unwrap_or_default();
     Err(ApiError::UnexpectedStatus { status, body })
 }
@@ -240,6 +260,9 @@ async fn parse_empty(path: &str, response: Response) -> Result<(), ApiError> {
         });
     }
 
+    if status == StatusCode::UNAUTHORIZED {
+        return Err(ApiError::Unauthorized);
+    }
     let body = response.text().await.unwrap_or_default();
     Err(ApiError::UnexpectedStatus { status, body })
 }
