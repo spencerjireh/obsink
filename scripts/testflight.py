@@ -106,6 +106,11 @@ def cmd_distribute(args):
     groups = call("GET", "/betaGroups", params={"filter[app]": app, "filter[name]": args.group})["data"]
     if groups:
         gid = groups[0]["id"]
+        if groups[0]["attributes"].get("hasAccessToAllBuilds"):
+            # Auto-access groups receive every build; assigning explicitly is
+            # rejected (422 "Cannot add internal group to a build").
+            print(f"build {build['attributes']['version']} is available to '{args.group}' (auto-access group)")
+            return
     else:
         gid = call("POST", "/betaGroups", json={"data": {"type": "betaGroups", "attributes": {
             "name": args.group, "isInternalGroup": True, "hasAccessToAllBuilds": False},
