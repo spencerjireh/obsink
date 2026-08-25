@@ -54,6 +54,7 @@ type SyncStatus = {
 }
 
 type LocalVault = {
+  hosted: boolean
   id: string
   name: string
   worker_url: string
@@ -75,7 +76,15 @@ type ConflictPreview = {
 }
 
 type AddVaultMode = 'create' | 'connect'
+type Backend = 'cloud' | 'self'
 type ResolutionChoice = 'KeepLocal' | 'KeepRemote' | 'KeepBoth'
+
+type AccountState =
+  | { kind: 'signed_out' }
+  | { kind: 'api_key' }
+  | { kind: 'account'; user_id: string; email: string | null; devices: { session_id: string; device_name: string; current: boolean }[] }
+
+type RemoteVault = { id: string; name: string; created: number }
 
 const emptyForm = {
   mode: 'connect' as AddVaultMode,
@@ -129,6 +138,121 @@ function App() {
   const [conflictPreview, setConflictPreview] = useState<ConflictPreview | null>(null)
   const [previewBusy, setPreviewBusy] = useState(false)
   const handleSyncRef = useRef<() => Promise<void>>(async () => {})
+
+  // Backend choice for Vault Setup: ObSink Cloud (hosted, account sign-in) or
+  // a self-hosted Worker (URL + API key). The bearer for either lives in the
+  // keychain, keyed by Worker URL, so it is entered once per machine.
+  const [backend, setBackend] = useState<Backend>('cloud')
+  const [hostedUrl, setHostedUrl] = useState('')
+  const [account, setAccount] = useState<AccountState | null>(null)
+  const [authEmail, setAuthEmail] = useState('')
+  const [authCode, setAuthCode] = useState('')
+  const [codeSent, setCodeSent] = useState(false)
+  const [remoteVaults, setRemoteVaults] = useState<RemoteVault[] | null>(null)
+
+  const workerUrl = backend === 'cloud' ? hostedUrl : form.worker_url
+
+  async function refreshAccount(url: string) {
+    if (!url || url === 'https://') {
+      setAccount(null)
+      return
+    }
+    try {
+      setAccount(await call<AccountState>('get_account', { workerUrl: url }))
+    } catch (error) {
+      setMessage(String(error))
+    }
+  }
+
+  useEffect(() => {
+    call<string>('get_hosted_url')
+      .then((url) => {
+        setHostedUrl(url)
+        return refreshAccount(url)
+      })
+      .catch((error) => setMessage(String(error)))
+  }, [])
+
+  useEffect(() => {
+    setRemoteVaults(null)
+    setCodeSent(false)
+    void refreshAccount(workerUrl)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [backend, hostedUrl])
+
+  async function handleSendCode() {
+    setBusy(true)
+    setMessage('')
+    try {
+      const devCode = await call<string | null>('auth_email_start', { workerUrl, email: authEmail })
+      setCodeSent(true)
+      if (devCode) {
+        setAuthCode(devCode)
+        setMessage('Dev server returned the code inline.')
+      } else {
+        setMessage(`Sent a 6-digit code to ${authEmail}.`)
+      }
+    } catch (error) {
+      setMessage(String(error))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function handleVerifyCode() {
+    setBusy(true)
+    setMessage('')
+    try {
+      const next = await call<AccountState>('auth_email_verify', { workerUrl, email: authEmail, code: authCode })
+      setAccount(next)
+      setCodeSent(false)
+      setAuthCode('')
+      setMessage(next.kind === 'account' ? `Signed in as ${next.email ?? next.user_id}.` : 'Signed in.')
+    } catch (error) {
+      setMessage(String(error))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function handleSignOut() {
+    setBusy(true)
+    setMessage('')
+    try {
+      await call('sign_out', { workerUrl })
+      setAccount({ kind: 'signed_out' })
+      setRemoteVaults(null)
+      setMessage(backend === 'cloud' ? 'Signed out of ObSink Cloud.' : 'Forgot the API key for this Worker.')
+    } catch (error) {
+      setMessage(String(error))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function handleLoadRemoteVaults() {
+    setBusy(true)
+    setMessage('')
+    try {
+      const list = await call<RemoteVault[]>('list_remote_vaults', {
+        workerUrl,
+        apiKey: backend === 'self' ? form.api_key : '',
+      })
+      setRemoteVaults(list)
+      if (list.length === 0) {
+        setMessage('No vaults on this server yet — switch to Create.')
+      } else if (!form.vault_id) {
+        setForm((current) => ({ ...current, vault_id: list[0].id }))
+      }
+      if (backend === 'self') {
+        await refreshAccount(workerUrl)
+      }
+    } catch (error) {
+      setMessage(String(error))
+    } finally {
+      setBusy(false)
+    }
+  }
 
   const activeVault = useMemo(
     () => vaults.find((vault) => vault.active) ?? null,
@@ -209,10 +333,17 @@ function App() {
     setMessage('')
 
     try {
-      const saved = await call<LocalVault>('add_vault', { request: form })
+      const request = {
+        ...form,
+        worker_url: workerUrl,
+        api_key: backend === 'self' ? form.api_key : '',
+      }
+      const saved = await call<LocalVault>('add_vault', { request })
       setMessage(`Configured ${saved.name}`)
       setForm(emptyForm)
+      setRemoteVaults(null)
       await refresh()
+      await refreshAccount(workerUrl)
     } catch (error) {
       setMessage(String(error))
     } finally {
@@ -428,7 +559,7 @@ function App() {
                   <h3>{vault.name}</h3>
                   <span>{vault.active ? 'Active' : vault.id}</span>
                 </header>
-                <p>{vault.worker_url}</p>
+                <p>{vault.hosted ? 'ObSink Cloud' : vault.worker_url}</p>
                 <code>{vault.local_path}</code>
                 <div className="vault-card__actions">
                   <button
@@ -451,7 +582,84 @@ function App() {
             <span>{form.mode === 'create' ? 'Create a new remote vault' : 'Connect to an existing vault'}</span>
           </div>
 
-          <div className="mode-toggle">
+          <div className="mode-toggle" aria-label="Backend">
+            <button className={backend === 'cloud' ? 'is-selected' : ''} onClick={() => setBackend('cloud')} type="button">
+              ObSink Cloud
+            </button>
+            <button className={backend === 'self' ? 'is-selected' : ''} onClick={() => setBackend('self')} type="button">
+              Self-hosted
+            </button>
+          </div>
+
+          {backend === 'cloud' ? (
+            account?.kind === 'account' ? (
+              <div className="account-row">
+                <span>
+                  Signed in as <strong>{account.email ?? account.user_id}</strong>
+                  {account.devices.length > 1 ? ` · ${account.devices.length} devices` : ''}
+                </span>
+                <button className="button button--ghost" disabled={busy} onClick={handleSignOut} type="button">
+                  Sign out
+                </button>
+              </div>
+            ) : (
+              <div className="form-grid">
+                <label>
+                  <span>Email</span>
+                  <input
+                    autoComplete="email"
+                    disabled={codeSent}
+                    value={authEmail}
+                    onChange={(event) => setAuthEmail(event.target.value)}
+                  />
+                </label>
+                {codeSent ? (
+                  <label>
+                    <span>6-digit code</span>
+                    <input inputMode="numeric" value={authCode} onChange={(event) => setAuthCode(event.target.value)} />
+                  </label>
+                ) : null}
+                <div className="choice-row">
+                  {codeSent ? (
+                    <>
+                      <button className="button" disabled={busy || authCode.trim().length !== 6} onClick={handleVerifyCode} type="button">
+                        Verify and sign in
+                      </button>
+                      <button className="button button--ghost" disabled={busy} onClick={() => setCodeSent(false)} type="button">
+                        Change email
+                      </button>
+                    </>
+                  ) : (
+                    <button className="button" disabled={busy || !authEmail.includes('@')} onClick={handleSendCode} type="button">
+                      Send sign-in code
+                    </button>
+                  )}
+                </div>
+              </div>
+            )
+          ) : (
+            <div className="form-grid">
+              <label>
+                <span>Worker URL</span>
+                <input
+                  value={form.worker_url}
+                  onBlur={() => void refreshAccount(form.worker_url)}
+                  onChange={(event) => setForm((current) => ({ ...current, worker_url: event.target.value }))}
+                />
+              </label>
+              <label>
+                <span>API key{account?.kind === 'api_key' ? ' (saved — leave blank to keep)' : ''}</span>
+                <input
+                  type="password"
+                  autoComplete="off"
+                  value={form.api_key}
+                  onChange={(event) => setForm((current) => ({ ...current, api_key: event.target.value }))}
+                />
+              </label>
+            </div>
+          )}
+
+          <div className="mode-toggle" aria-label="Mode">
             <button
               className={form.mode === 'connect' ? 'is-selected' : ''}
               onClick={() => setForm((current) => ({ ...current, mode: 'connect' }))}
@@ -470,14 +678,6 @@ function App() {
 
           <div className="form-grid">
             <label>
-              <span>Worker URL</span>
-              <input value={form.worker_url} onChange={(event) => setForm((current) => ({ ...current, worker_url: event.target.value }))} />
-            </label>
-            <label>
-              <span>API key</span>
-              <input value={form.api_key} onChange={(event) => setForm((current) => ({ ...current, api_key: event.target.value }))} />
-            </label>
-            <label>
               <span>Local vault path</span>
               <input value={form.local_path} onChange={(event) => setForm((current) => ({ ...current, local_path: event.target.value }))} />
             </label>
@@ -488,8 +688,20 @@ function App() {
               </label>
             ) : (
               <label>
-                <span>Vault ID</span>
-                <input value={form.vault_id} onChange={(event) => setForm((current) => ({ ...current, vault_id: event.target.value }))} />
+                <span>Vault</span>
+                {remoteVaults ? (
+                  <select value={form.vault_id} onChange={(event) => setForm((current) => ({ ...current, vault_id: event.target.value }))}>
+                    {remoteVaults.map((vault) => (
+                      <option key={vault.id} value={vault.id}>
+                        {vault.name}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <button className="button button--ghost" disabled={busy} onClick={handleLoadRemoteVaults} type="button">
+                    Load vaults
+                  </button>
+                )}
               </label>
             )}
             <label>

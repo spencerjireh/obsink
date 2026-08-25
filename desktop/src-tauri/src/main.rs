@@ -16,8 +16,9 @@ use tauri::{
 
 use obsink_core::{
     build_working_manifest_for_path, complete_sync, derive_key, derive_keys, diff_local_and_remote,
-    prepare_sync, sync_manifest_path, ApiClient, Conflict, ConflictResolution, CreateVaultRequest,
-    KeyBytes, ProgressEvent, ProgressSink, SyncPlan, SyncResult, VaultConfig,
+    hosted_worker_url, normalize_worker_url, prepare_sync, sync_manifest_path, ApiClient,
+    AuthClient, Conflict, ConflictResolution, CreateVaultRequest, KeyBytes, ProgressEvent,
+    ProgressSink, SyncPlan, SyncResult, VaultConfig, VaultSummary,
 };
 use serde::{Deserialize, Serialize};
 
@@ -59,12 +60,17 @@ impl Default for StoredAppConfig {
     }
 }
 
+/// One configured vault. The server bearer (ObSink Cloud session token or a
+/// self-hosted API key) is NOT stored here — it lives in the keychain under
+/// `bearer:<worker_url>`. `api_key` only exists to migrate pre-accounts
+/// configs (`load_app_config` moves it into the keychain and drops it).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredVault {
     id: String,
     name: String,
     worker_url: String,
-    api_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    api_key: Option<String>,
     local_path: String,
 }
 
@@ -75,6 +81,199 @@ struct LocalVaultSummary {
     worker_url: String,
     local_path: String,
     active: bool,
+    /// True when the vault lives on ObSink Cloud (the hosted Worker).
+    hosted: bool,
+}
+
+impl LocalVaultSummary {
+    fn from_stored(vault: &StoredVault, active: bool) -> Self {
+        Self {
+            id: vault.id.clone(),
+            name: vault.name.clone(),
+            worker_url: vault.worker_url.clone(),
+            local_path: vault.local_path.clone(),
+            active,
+            hosted: is_hosted(&vault.worker_url),
+        }
+    }
+}
+
+fn is_hosted(worker_url: &str) -> bool {
+    normalize_worker_url(worker_url) == normalize_worker_url(&hosted_worker_url())
+}
+
+fn bearer_account(worker_url: &str) -> String {
+    format!("bearer:{}", normalize_worker_url(worker_url))
+}
+
+/// The bearer to use for a Worker: a supplied self-hosted API key (which is
+/// then remembered) or the credential already in the keychain.
+fn resolve_bearer(worker_url: &str, api_key: &str) -> Result<String, String> {
+    let account = bearer_account(worker_url);
+    if !api_key.trim().is_empty() {
+        save_secret(&account, api_key.trim()).map_err(err_string)?;
+        return Ok(api_key.trim().to_string());
+    }
+    load_secret(&account).map_err(|_| {
+        if is_hosted(worker_url) {
+            "not signed in to ObSink Cloud — sign in first".to_string()
+        } else {
+            format!("no API key saved for {worker_url} — enter it")
+        }
+    })
+}
+
+fn device_name() -> String {
+    Command::new("scutil")
+        .args(["--get", "ComputerName"])
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .map(|name| format!("{name} (ObSink Desktop)"))
+        .unwrap_or_else(|| "ObSink Desktop".to_string())
+}
+
+// --- Accounts (ObSink Cloud) --------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+struct AuthCapabilities {
+    email: bool,
+    apple: bool,
+    api_key: bool,
+}
+
+/// What the UI shows for a Worker's credential state.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum AccountState {
+    /// No credential stored for this Worker.
+    SignedOut,
+    /// A self-hosted API key is stored (no account behind it).
+    ApiKey,
+    /// An ObSink Cloud session; `devices` lists the account's sessions.
+    Account {
+        user_id: String,
+        email: Option<String>,
+        devices: Vec<DeviceInfo>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DeviceInfo {
+    session_id: String,
+    device_name: String,
+    created: u64,
+    current: bool,
+}
+
+#[tauri::command]
+fn get_hosted_url() -> String {
+    hosted_worker_url()
+}
+
+#[tauri::command]
+async fn get_auth_capabilities(worker_url: String) -> Result<AuthCapabilities, String> {
+    let caps = AuthClient::new(&worker_url)
+        .capabilities()
+        .await
+        .map_err(err_string)?;
+    Ok(AuthCapabilities {
+        email: caps.auth.email,
+        apple: caps.auth.apple,
+        api_key: caps.auth.api_key,
+    })
+}
+
+/// Send a one-time code. Returns the code itself only against a dev Worker
+/// (`AUTH_DEV_RETURN_CODE=1`) so harnesses can complete the flow.
+#[tauri::command]
+async fn auth_email_start(worker_url: String, email: String) -> Result<Option<String>, String> {
+    let result = AuthClient::new(&worker_url)
+        .email_start(email.trim())
+        .await
+        .map_err(err_string)?;
+    Ok(result.code)
+}
+
+#[tauri::command]
+async fn auth_email_verify(
+    worker_url: String,
+    email: String,
+    code: String,
+) -> Result<AccountState, String> {
+    let session = AuthClient::new(&worker_url)
+        .email_verify(email.trim(), code.trim(), &device_name())
+        .await
+        .map_err(err_string)?;
+    save_secret(&bearer_account(&worker_url), &session.token).map_err(err_string)?;
+    get_account(worker_url).await
+}
+
+#[tauri::command]
+async fn get_account(worker_url: String) -> Result<AccountState, String> {
+    let Ok(bearer) = load_secret(&bearer_account(&worker_url)) else {
+        return Ok(AccountState::SignedOut);
+    };
+    if !bearer.starts_with("os_") {
+        return Ok(AccountState::ApiKey);
+    }
+    match AuthClient::new(&worker_url).me(&bearer).await {
+        Ok(me) => match me.user {
+            Some(user) => Ok(AccountState::Account {
+                user_id: user.id,
+                email: user.email,
+                devices: me
+                    .sessions
+                    .into_iter()
+                    .map(|session| DeviceInfo {
+                        session_id: session.id,
+                        device_name: session.device_name,
+                        created: session.created,
+                        current: session.current,
+                    })
+                    .collect(),
+            }),
+            None => Ok(AccountState::ApiKey),
+        },
+        Err(obsink_core::AuthError::Server { status, .. }) if status.as_u16() == 401 => {
+            // Session revoked/expired elsewhere: forget it locally.
+            delete_secret(&bearer_account(&worker_url));
+            Ok(AccountState::SignedOut)
+        }
+        Err(error) => Err(err_string(error)),
+    }
+}
+
+/// Sign out of (or forget the API key for) a Worker. Vault configs stay; sync
+/// will ask for a credential again.
+#[tauri::command]
+async fn sign_out(worker_url: String) -> Result<(), String> {
+    let account = bearer_account(&worker_url);
+    if let Ok(bearer) = load_secret(&account) {
+        if bearer.starts_with("os_") {
+            // Best effort: the local credential goes away regardless.
+            let _ = AuthClient::new(&worker_url).logout(&bearer).await;
+        }
+    }
+    delete_secret(&account);
+    Ok(())
+}
+
+/// Vaults the current credential can see on a Worker (for the Connect picker).
+#[tauri::command]
+async fn list_remote_vaults(worker_url: String, api_key: String) -> Result<Vec<VaultSummary>, String> {
+    let bearer = resolve_bearer(&worker_url, &api_key)?;
+    ApiClient::new(VaultConfig {
+        worker_url: normalize_worker_url(&worker_url),
+        api_key: bearer,
+        vault_id: String::new(),
+        local_path: String::new(),
+    })
+    .list_vaults()
+    .await
+    .map_err(err_string)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -126,12 +325,11 @@ fn get_vaults() -> Result<Vec<LocalVaultSummary>, String> {
     Ok(config
         .vaults
         .iter()
-        .map(|vault| LocalVaultSummary {
-            id: vault.id.clone(),
-            name: vault.name.clone(),
-            worker_url: vault.worker_url.clone(),
-            local_path: vault.local_path.clone(),
-            active: config.active_vault_id.as_deref() == Some(vault.id.as_str()),
+        .map(|vault| {
+            LocalVaultSummary::from_stored(
+                vault,
+                config.active_vault_id.as_deref() == Some(vault.id.as_str()),
+            )
         })
         .collect())
 }
@@ -149,22 +347,18 @@ fn set_active_vault(vault_id: String) -> Result<LocalVaultSummary, String> {
     config.active_vault_id = Some(vault.id.clone());
     save_app_config(&config).map_err(err_string)?;
 
-    Ok(LocalVaultSummary {
-        id: vault.id,
-        name: vault.name,
-        worker_url: vault.worker_url,
-        local_path: vault.local_path,
-        active: true,
-    })
+    Ok(LocalVaultSummary::from_stored(&vault, true))
 }
 
 #[tauri::command]
 async fn add_vault(request: AddVaultRequest) -> Result<LocalVaultSummary, String> {
     validate_request(&request)?;
+    let worker_url = normalize_worker_url(&request.worker_url);
+    let bearer = resolve_bearer(&worker_url, &request.api_key)?;
 
     let client = ApiClient::new(VaultConfig {
-        worker_url: request.worker_url.clone(),
-        api_key: request.api_key.clone(),
+        worker_url: worker_url.clone(),
+        api_key: bearer,
         vault_id: String::new(),
         local_path: request.local_path.clone(),
     });
@@ -194,8 +388,8 @@ async fn add_vault(request: AddVaultRequest) -> Result<LocalVaultSummary, String
     let stored = StoredVault {
         id: vault_id.clone(),
         name: vault_name.clone(),
-        worker_url: request.worker_url.clone(),
-        api_key: request.api_key.clone(),
+        worker_url,
+        api_key: None,
         local_path: request.local_path.clone(),
     };
 
@@ -203,13 +397,7 @@ async fn add_vault(request: AddVaultRequest) -> Result<LocalVaultSummary, String
     save_key_to_keychain(&vault_id, &key).map_err(err_string)?;
     upsert_vault(stored.clone()).map_err(err_string)?;
 
-    Ok(LocalVaultSummary {
-        id: stored.id.clone(),
-        name: stored.name.clone(),
-        worker_url: stored.worker_url,
-        local_path: stored.local_path,
-        active: true,
-    })
+    Ok(LocalVaultSummary::from_stored(&stored, true))
 }
 
 #[tauri::command]
@@ -402,9 +590,6 @@ fn validate_request(request: &AddVaultRequest) -> Result<(), String> {
     if request.worker_url.trim().is_empty() {
         return Err("worker URL is required".into());
     }
-    if request.api_key.trim().is_empty() {
-        return Err("API key is required".into());
-    }
     if request.local_path.trim().is_empty() {
         return Err("local vault path is required".into());
     }
@@ -453,10 +638,13 @@ fn active_vault(config: &StoredAppConfig) -> Option<&StoredVault> {
         .and_then(|vault_id| config.vaults.iter().find(|vault| vault.id == *vault_id))
 }
 
+/// Bearer comes from the keychain; if it is missing the request goes out
+/// without one and the Worker's 401 surfaces as `ApiError::Unauthorized`
+/// ("sign in again"), which is the message the user needs.
 fn to_vault_config(vault: &StoredVault) -> VaultConfig {
     VaultConfig {
         worker_url: vault.worker_url.clone(),
-        api_key: vault.api_key.clone(),
+        api_key: load_secret(&bearer_account(&vault.worker_url)).unwrap_or_default(),
         vault_id: vault.id.clone(),
         local_path: vault.local_path.clone(),
     }
@@ -475,8 +663,23 @@ fn load_app_config() -> Result<StoredAppConfig, io::Error> {
     }
 
     let contents = fs::read_to_string(path)?;
-    Ok(serde_json::from_str(&contents)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?)
+    let mut config: StoredAppConfig = serde_json::from_str(&contents)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+
+    // Pre-accounts configs kept the API key in this file; move it into the
+    // keychain once and rewrite without it.
+    let mut migrated = false;
+    for vault in &mut config.vaults {
+        vault.worker_url = normalize_worker_url(&vault.worker_url);
+        if let Some(api_key) = vault.api_key.take() {
+            save_secret(&bearer_account(&vault.worker_url), &api_key)?;
+            migrated = true;
+        }
+    }
+    if migrated {
+        save_app_config(&config)?;
+    }
+    Ok(config)
 }
 
 fn save_app_config(config: &StoredAppConfig) -> Result<(), io::Error> {
@@ -504,13 +707,42 @@ fn upsert_vault(vault: StoredVault) -> Result<(), io::Error> {
 }
 
 fn save_key_to_keychain(vault_id: &str, key: &KeyBytes) -> Result<(), io::Error> {
-    let key_hex = hex::encode(key);
+    save_secret(vault_id, &hex::encode(key))
+}
 
-    // Test/dev escape hatch: store the key as a file instead of the macOS
-    // keychain so live integration tests can run non-interactively. Production
-    // builds leave this unset and use the real keychain below.
-    if let Ok(dir) = std::env::var("OBSINK_KEYRING_DIR") {
-        return fs::write(PathBuf::from(dir).join(vault_id), key_hex);
+fn load_key_from_keychain(vault_id: &str) -> Result<KeyBytes, io::Error> {
+    let bytes = hex::decode(load_secret(vault_id)?)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if bytes.len() != 32 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stored key has invalid length",
+        ));
+    }
+    let mut key = [0_u8; 32];
+    key.copy_from_slice(&bytes);
+    Ok(key)
+}
+
+// --- Keychain -----------------------------------------------------------------
+//
+// Service `obsink`; account = vault ID for the derived key (hex) or
+// `bearer:<worker_url>` for the server credential. `OBSINK_KEYRING_DIR`
+// swaps the macOS keychain for a directory of files so the live integration
+// test runs non-interactively; production builds leave it unset.
+
+fn keyring_dir() -> Option<PathBuf> {
+    std::env::var_os("OBSINK_KEYRING_DIR").map(PathBuf::from)
+}
+
+fn keyring_file(dir: &Path, account: &str) -> PathBuf {
+    dir.join(account.replace(['/', ':'], "_"))
+}
+
+fn save_secret(account: &str, value: &str) -> Result<(), io::Error> {
+    if let Some(dir) = keyring_dir() {
+        fs::create_dir_all(&dir)?;
+        return fs::write(keyring_file(&dir, account), value);
     }
 
     let _ = Command::new("security")
@@ -519,7 +751,7 @@ fn save_key_to_keychain(vault_id: &str, key: &KeyBytes) -> Result<(), io::Error>
             "-s",
             KEYCHAIN_SERVICE,
             "-a",
-            vault_id,
+            account,
         ])
         .output();
 
@@ -530,9 +762,9 @@ fn save_key_to_keychain(vault_id: &str, key: &KeyBytes) -> Result<(), io::Error>
             "-s",
             KEYCHAIN_SERVICE,
             "-a",
-            vault_id,
+            account,
             "-w",
-            &key_hex,
+            value,
         ])
         .output()?;
 
@@ -546,23 +778,11 @@ fn save_key_to_keychain(vault_id: &str, key: &KeyBytes) -> Result<(), io::Error>
     Ok(())
 }
 
-fn load_key_from_keychain(vault_id: &str) -> Result<KeyBytes, io::Error> {
-    // Test/dev escape hatch (see save_key_to_keychain).
-    if let Ok(dir) = std::env::var("OBSINK_KEYRING_DIR") {
-        let hex_value = fs::read_to_string(PathBuf::from(dir).join(vault_id))?
+fn load_secret(account: &str) -> Result<String, io::Error> {
+    if let Some(dir) = keyring_dir() {
+        return Ok(fs::read_to_string(keyring_file(&dir, account))?
             .trim()
-            .to_string();
-        let bytes = hex::decode(hex_value)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        if bytes.len() != 32 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "stored key has invalid length",
-            ));
-        }
-        let mut key = [0_u8; 32];
-        key.copy_from_slice(&bytes);
-        return Ok(key);
+            .to_string());
     }
 
     let output = Command::new("security")
@@ -572,7 +792,7 @@ fn load_key_from_keychain(vault_id: &str) -> Result<KeyBytes, io::Error> {
             "-s",
             KEYCHAIN_SERVICE,
             "-a",
-            vault_id,
+            account,
         ])
         .output()?;
 
@@ -583,23 +803,26 @@ fn load_key_from_keychain(vault_id: &str) -> Result<KeyBytes, io::Error> {
         ));
     }
 
-    let hex_value = String::from_utf8(output.stdout)
+    Ok(String::from_utf8(output.stdout)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
         .trim()
-        .to_string();
-    let bytes = hex::decode(hex_value)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        .to_string())
+}
 
-    if bytes.len() != 32 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "stored key has invalid length",
-        ));
+fn delete_secret(account: &str) {
+    if let Some(dir) = keyring_dir() {
+        let _ = fs::remove_file(keyring_file(&dir, account));
+        return;
     }
-
-    let mut key = [0_u8; 32];
-    key.copy_from_slice(&bytes);
-    Ok(key)
+    let _ = Command::new("security")
+        .args([
+            "delete-generic-password",
+            "-s",
+            KEYCHAIN_SERVICE,
+            "-a",
+            account,
+        ])
+        .output();
 }
 
 fn err_string(error: impl std::fmt::Display) -> String {
@@ -675,6 +898,13 @@ fn main() {
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             add_vault,
+            auth_email_start,
+            auth_email_verify,
+            get_account,
+            get_auth_capabilities,
+            get_hosted_url,
+            list_remote_vaults,
+            sign_out,
             get_conflict_preview,
             get_manifest_diff,
             get_status,
@@ -924,6 +1154,105 @@ mod live_tests {
         println!("OBS-6: multi-vault switching verified");
 
         println!("ALL DESKTOP FLOWS VERIFIED: vaults={vault_id}, {vault_id_2}");
+        let _ = fs::remove_dir_all(&sandbox);
+    }
+
+    /// `#[ignore]`d live test for the ObSink Cloud account path: email code
+    /// sign-in, vault creation under the account, `get_account`, sign-out.
+    /// Needs a Worker running with `AUTH_DEV_RETURN_CODE=1` (wrangler dev):
+    ///   OBSINK_TEST_WORKER_URL=http://localhost:8799 \
+    ///   cargo test -p obsink-desktop account_flow_live -- --ignored --nocapture
+    #[ignore]
+    #[tokio::test]
+    async fn account_flow_live() {
+        let worker_url = env_or_panic("OBSINK_TEST_WORKER_URL");
+        let sandbox = PathBuf::from(format!("/tmp/obsink-desktop-acct-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&sandbox);
+        let dir = sandbox.join("vault");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("note.md"), "# cloud\n").unwrap();
+        std::env::set_var("HOME", &sandbox);
+        let keyring_dir = sandbox.join("keyring");
+        fs::create_dir_all(&keyring_dir).unwrap();
+        std::env::set_var("OBSINK_KEYRING_DIR", &keyring_dir);
+        // Make the Worker under test "ObSink Cloud" for hosted detection.
+        std::env::set_var("OBSINK_HOSTED_URL", &worker_url);
+
+        assert!(matches!(
+            get_account(worker_url.clone()).await.unwrap(),
+            AccountState::SignedOut
+        ));
+        // Without a credential, adding a vault must fail with a sign-in hint.
+        let denied = add_vault(AddVaultRequest {
+            mode: AddVaultMode::Create,
+            worker_url: worker_url.clone(),
+            api_key: String::new(),
+            local_path: dir.to_string_lossy().into_owned(),
+            vault_name: "denied".to_string(),
+            vault_id: String::new(),
+            passphrase: "pw".to_string(),
+        })
+        .await
+        .unwrap_err();
+        assert!(denied.contains("sign in"), "{denied}");
+
+        let email = format!("desktop-{}@example.com", std::process::id());
+        let code = auth_email_start(worker_url.clone(), email.clone())
+            .await
+            .unwrap()
+            .expect("dev Worker returns the code inline");
+        let state = auth_email_verify(worker_url.clone(), email.clone(), code)
+            .await
+            .unwrap();
+        match &state {
+            AccountState::Account { email: got, devices, .. } => {
+                assert_eq!(got.as_deref(), Some(email.as_str()));
+                assert_eq!(devices.len(), 1);
+                assert!(devices[0].current);
+            }
+            other => panic!("expected account, got {other:?}"),
+        }
+        assert!(fs::read_to_string(keyring_dir.join(format!("bearer_{}", normalize_worker_url(&worker_url).replace(['/', ':'], "_"))))
+            .unwrap()
+            .starts_with("os_"));
+
+        let summary = add_vault(AddVaultRequest {
+            mode: AddVaultMode::Create,
+            worker_url: worker_url.clone(),
+            api_key: String::new(),
+            local_path: dir.to_string_lossy().into_owned(),
+            vault_name: "cloud-vault".to_string(),
+            vault_id: String::new(),
+            passphrase: "pw".to_string(),
+        })
+        .await
+        .unwrap();
+        assert!(summary.hosted);
+        // app.json must not contain the bearer.
+        let app_json = fs::read_to_string(sandbox.join(".obsink/app.json")).unwrap();
+        assert!(!app_json.contains("os_"), "{app_json}");
+        assert!(!app_json.contains("api_key"), "{app_json}");
+
+        let listed = list_remote_vaults(worker_url.clone(), String::new()).await.unwrap();
+        assert_eq!(listed.iter().filter(|v| v.id == summary.id).count(), 1);
+
+        let state = AppState::default();
+        let response = sync_vault_inner(Some(summary.id.clone()), &state, &obsink_core::NoProgress)
+            .await
+            .unwrap();
+        assert!(response.completed_result.is_some());
+
+        sign_out(worker_url.clone()).await.unwrap();
+        assert!(matches!(
+            get_account(worker_url.clone()).await.unwrap(),
+            AccountState::SignedOut
+        ));
+        let err = sync_vault_inner(Some(summary.id.clone()), &state, &obsink_core::NoProgress)
+            .await
+            .unwrap_err();
+        assert!(err.to_lowercase().contains("unauthorized"), "{err}");
+
+        println!("ACCOUNT FLOW VERIFIED: vault={}", summary.id);
         let _ = fs::remove_dir_all(&sandbox);
     }
 
