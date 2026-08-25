@@ -152,4 +152,6 @@ assert_status 200
 assert_json 'String(data["note.md"].deleted)' true
 assert_json 'data["fresh.md"].hash' hash-3
 
+request_json DELETE "$BASE_URL/vaults/$VAULT_ID"
+assert_status 204
 printf 'Worker verification passed for %s\n' "$VAULT_ID"
