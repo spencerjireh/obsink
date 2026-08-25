@@ -34,6 +34,40 @@ enum KeychainStore {
         return item as? Data
     }
 
+    // MARK: Server bearer (ObSink Cloud session token or self-hosted API key)
+
+    /// Keychain account for a Worker's bearer. Canonicalised so the same
+    /// server always maps to one entry (mirrors core `normalize_worker_url`).
+    static func bearerAccount(for workerURL: String) -> String {
+        "bearer:" + canonicalWorkerURL(workerURL)
+    }
+
+    static func canonicalWorkerURL(_ url: String) -> String {
+        var trimmed = url.trimmingCharacters(in: .whitespacesAndNewlines)
+        while trimmed.hasSuffix("/") { trimmed.removeLast() }
+        guard let range = trimmed.range(of: "://") else { return trimmed }
+        let scheme = trimmed[..<range.lowerBound].lowercased()
+        let rest = trimmed[range.upperBound...]
+        if let slash = rest.firstIndex(of: "/") {
+            return scheme + "://" + rest[..<slash].lowercased() + rest[slash...]
+        }
+        return scheme + "://" + rest.lowercased()
+    }
+
+    @discardableResult
+    static func saveBearer(_ token: String, workerURL: String) -> Bool {
+        save(Data(token.utf8), account: bearerAccount(for: workerURL))
+    }
+
+    static func loadBearer(workerURL: String) -> String? {
+        load(account: bearerAccount(for: workerURL)).flatMap { String(data: $0, encoding: .utf8) }
+    }
+
+    @discardableResult
+    static func deleteBearer(workerURL: String) -> Bool {
+        delete(account: bearerAccount(for: workerURL))
+    }
+
     @discardableResult
     static func delete(account: String) -> Bool {
         let query: [String: Any] = [

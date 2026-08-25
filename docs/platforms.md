@@ -15,14 +15,25 @@ ObSink shares one Rust core across every client. This page covers per-platform s
 The CLI is the simplest way to use ObSink and the easiest to script.
 
 ```bash
-obsink init    --worker-url <url> --api-key <key> --vault-name <name> --directory <path> [--passphrase <p>]
-obsink connect --worker-url <url> --api-key <key> --vault-id <id>     --directory <path> [--passphrase <p>]
+# ObSink Cloud (default backend): sign in once per machine, then work with vaults
+obsink login [--email <you@example.com>]          # emailed 6-digit code
+obsink whoami                                     # account + signed-in devices
+obsink vaults
+obsink init    --vault-name <name> --directory <path> [--passphrase <p>]
+obsink connect --vault-id <id>     --directory <path> [--passphrase <p>]
+obsink logout
+
+# Self-hosted Worker: pass the URL and (once) the API key; both are remembered
+obsink init    --worker-url <url> --api-key <key> --vault-name <name> --directory <path>
+obsink connect --worker-url <url> --api-key <key> --vault-id <id>     --directory <path>
+
 obsink sync                       # full sync cycle; prompts to resolve conflicts
 obsink status [--directory <path>]
 ```
 
-- Config lives at `~/.obsink/config.toml`. Set `OBSINK_HOME` to relocate it (used for per-device isolation in tests).
-- The encryption key is stored in the macOS Keychain (service `obsink`, account = vault ID).
+- `--worker-url` / `--api-key` also read `OBSINK_WORKER_URL` / `OBSINK_API_KEY`; `OBSINK_HOSTED_URL` points "ObSink Cloud" at another Worker (harnesses, staging).
+- Config lives at `~/.obsink/config.toml` (Worker URL, vault ID, local path — **no secrets**). Set `OBSINK_HOME` to relocate it (used for per-device isolation in tests). A pre-accounts config containing `api_key` is migrated into the keychain on first use.
+- The macOS Keychain (service `obsink`) holds the encryption key (account = vault ID) and the server bearer (account = `bearer:<worker url>`). `OBSINK_KEYRING_DIR=<dir>` swaps it for a directory of files (Linux, CI).
 - `RUST_LOG=obsink_core=debug obsink sync` prints request/sync logging to stderr.
 
 If you omit `--passphrase`, the CLI prompts for it interactively.
@@ -34,9 +45,11 @@ A Tauri v2 + React menu-bar app (`desktop/`).
 ```bash
 cd desktop
 npm ci
-npm run tauri dev        # run against your deployed Worker
+npm run tauri dev        # run against ObSink Cloud or your deployed Worker
 npm run tauri build      # produce a .app/.dmg
 ```
+
+Vault Setup offers **ObSink Cloud** (email + code sign-in; the account line shows the signed-in email and a Sign out button) or **Self-hosted** (Worker URL + API key, remembered per URL). Connect lists the account's vaults in a dropdown. `~/.obsink/app.json` holds vault URLs/paths only; bearers live in the macOS Keychain (`bearer:<worker url>`; `OBSINK_KEYRING_DIR` file fallback for tests). The `#[ignore]`d `live_tests::account_flow_live` covers the Cloud path against a `wrangler dev` Worker started with `AUTH_DEV_RETURN_CODE=1`.
 
 Behavior:
 - Tray icon with **Sync Now / Show ObSink / Quit**; left-click surfaces the window.
@@ -86,7 +99,7 @@ xcodebuild -project ios/ObSink.xcodeproj -scheme ObSink -sdk iphonesimulator \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' CODE_SIGNING_ALLOWED=NO build
 ```
 
-The SwiftUI app (sync button, status, vault setup, multi-vault picker, conflict resolution with side-by-side preview) talks to the Rust core through the generated `VaultClient`. Files sync into the App Group container (`group.com.obsink.shared`), which the File Provider extension exposes to Obsidian/Files. The extension is **DB-backed** (`group.com.obsink.shared/obsink.sqlite` via GRDB): stable UUID identifiers, real `enumerateChanges` deltas (monotonic `rowVersion` + `isDeleted` tombstones), and the host app reconciles the DB + signals the enumerator after each sync. The derived key is stored in the iOS Keychain (per vault), so the passphrase isn't re-entered each launch.
+The SwiftUI app (sync button, status, Add Vault with an ObSink Cloud / Self-hosted choice — Sign in with Apple or email code for Cloud, URL + API key for self-hosted — multi-vault picker, conflict resolution with side-by-side preview) talks to the Rust core through the generated `VaultClient` and `auth*` functions. The bearer lives in the iOS Keychain under `bearer:<worker url>`; vault entries in the App Group UserDefaults carry no secrets (a legacy `apiKey` is migrated on launch). Sign in with Apple needs the `com.apple.developer.applesignin` entitlement (enabled on the App ID by automatic signing). Files sync into the App Group container (`group.com.obsink.shared`), which the File Provider extension exposes to Obsidian/Files. The extension is **DB-backed** (`group.com.obsink.shared/obsink.sqlite` via GRDB): stable UUID identifiers, real `enumerateChanges` deltas (monotonic `rowVersion` + `isDeleted` tombstones), and the host app reconciles the DB + signals the enumerator after each sync. The derived key is stored in the iOS Keychain (per vault), so the passphrase isn't re-entered each launch.
 
 > Slices A–E of the P4 plan are complete (21/28 items; see `docs/p4-plan.md`). The app + embedded FileProviderExt build, unit-test green (17 tests on the simulator), and install/launch cleanly.
 

@@ -84,6 +84,10 @@ final class SyncE2ETests: XCTestCase {
 
         app.buttons["addVaultButton"].tap()
 
+        // The sheet defaults to ObSink Cloud; the harness drives a self-hosted Worker.
+        let backend = app.segmentedControls["backendPicker"]
+        XCTAssertTrue(backend.waitForExistence(timeout: 10))
+        backend.buttons["Self-hosted"].tap()
         let url = app.textFields["addVaultWorkerURL"]
         XCTAssertTrue(url.waitForExistence(timeout: 10))
         url.tap()

@@ -91,6 +91,10 @@ jobs:
       KV_NAMESPACE_ID: ${{ vars.KV_NAMESPACE_ID }}
       R2_BUCKET_NAME: ${{ vars.R2_BUCKET_NAME }}
       MAX_BATCH_INLINE_BYTES: ${{ vars.MAX_BATCH_INLINE_BYTES || '52428800' }}
+      APPLE_CLIENT_IDS: ${{ vars.APPLE_CLIENT_IDS }}
+      MAIL_FROM: ${{ vars.MAIL_FROM || 'ObSink <onboarding@resend.dev>' }}
+      MAX_VAULTS_PER_USER: ${{ vars.MAX_VAULTS_PER_USER || '10' }}
+      MAX_VAULT_BYTES: ${{ vars.MAX_VAULT_BYTES || '1073741824' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -103,7 +107,11 @@ jobs:
       - name: Render Wrangler config
         working-directory: .
         run: ./scripts/render-worker-config.sh worker/wrangler.toml
-      - name: Sync Worker secret
-        run: printf '%s' "${{ secrets.WORKER_API_KEY }}" | npx wrangler secret put API_KEY
+      - name: Sync Worker secrets
+        run: |
+          printf '%s' "${{ secrets.WORKER_API_KEY }}" | npx wrangler secret put API_KEY
+          if [ -n "${{ secrets.RESEND_API_KEY }}" ]; then
+            printf '%s' "${{ secrets.RESEND_API_KEY }}" | npx wrangler secret put RESEND_API_KEY
+          fi
       - name: Deploy Worker
         run: npx wrangler deploy

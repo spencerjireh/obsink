@@ -89,6 +89,8 @@ Sync is observable through a `ProgressSink` trait (`Phase` / `FileStarted` / `Fi
 
 ## Worker storage keys
 
+- Operator vault list: `vaults`; account vault list: `vaults:<userId>`
+- Accounts: `user:<id>`, `user_email:<sha256(email)>`, `user_apple:<sub>`, `user_sessions:<userId>`; sessions: `session:<sha256(token)>` (TTL); one-time codes: `otp:<sha256(email)>` (TTL) and `otp_rl:<…>` (send cooldown)
 - Blob: `<vaultId>/<token>`
 - Version (on overwrite): `_versions/<vaultId>/<token>/<unixSeconds>`
 - Trash (on delete): `_trash/<vaultId>/<token>/<unixSeconds>`

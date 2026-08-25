@@ -4,10 +4,12 @@ Standing rules for any coding agent working in this repo. These override your
 defaults. When a rule here conflicts with something you'd normally do, follow
 this file. When this file conflicts with `spec.md`, ask.
 
-ObSink is a free, self-hosted, end-to-end encrypted sync engine for
-[Obsidian](https://obsidian.md) vaults. A shared Rust core drives a CLI, a
-Tauri desktop app (macOS), and (in progress) an iOS client; a
-Cloudflare Worker (TS) + R2 + KV is the backend. **`spec.md` is the spec source
+ObSink is a free, end-to-end encrypted sync engine for
+[Obsidian](https://obsidian.md) vaults, usable either **self-hosted** (your own
+Cloudflare Worker + `API_KEY`) or on **ObSink Cloud** (the operator-hosted
+Worker with self-serve accounts: email one-time code, Sign in with Apple on
+iOS). A shared Rust core drives a CLI, a Tauri desktop app (macOS), and an iOS
+client; a Cloudflare Worker (TS) + R2 + KV is the backend. **`spec.md` is the spec source
 of truth** — read it before your first task. Architecture/wire-format details
 live in `docs/architecture.md`; per-platform status in `docs/platforms.md`.
 
@@ -18,8 +20,10 @@ live in `docs/architecture.md`; per-platform status in `docs/platforms.md`.
   `hkdf` 0.12, `hmac` 0.12, `sha2` 0.10, `reqwest` 0.12 (rustls-tls),
   `tokio` 1, `tracing` 0.1.
 - **Worker** — Cloudflare Workers, `wrangler` 4.11, TypeScript 5.8,
-  Vitest 3.2. Bindings: R2 (`obsink-files`), KV (`META`), secret `API_KEY`,
-  two cron triggers.
+  Vitest 3.2. Bindings: R2 (`obsink-files`), KV (`META`), secrets `API_KEY`
+  (operator bearer) and `RESEND_API_KEY` (email sign-in), vars
+  `APPLE_CLIENT_IDS` / `MAIL_FROM` / `MAX_VAULTS_PER_USER` / `MAX_VAULT_BYTES`,
+  two cron triggers. Accounts + hosted mode: `docs/hosted.md`, spec §4.1.
 - **Desktop** — Tauri v2 (`@tauri-apps` 2.0), React 18.3, Vite 5.4, TypeScript 5.6.
 - **iOS** — Swift/SwiftUI + File Provider extension; Rust via **UniFFI 0.28**
   (`mobile/` crate). Project generated with XcodeGen (`ios/project.yml`).
@@ -106,8 +110,13 @@ RUST_LOG=obsink_core=debug cargo run -p obsink -- sync
 
 - `WORKER_URL` — `https://obsink-worker.spencer-080.workers.dev` (account
   `Spencer` / `080eb52a3c7398cf1e99d39f2c664bc8`).
-- `WORKER_API_KEY` — the Worker's `API_KEY` secret (client bearer; rotated
-  2026-07-30). Cloudflare secrets are write-only, so this is the only copy.
+- `WORKER_API_KEY` — the Worker's `API_KEY` secret (the *operator* bearer;
+  rotated 2026-07-30). Cloudflare secrets are write-only, so this is the only
+  copy. Since P7 this Worker is also **ObSink Cloud**: accounts get their own
+  session bearers and vault lists; the operator key only sees the legacy
+  `vaults` list. Never hand `WORKER_API_KEY` to a tester — they sign up.
+- Clients store bearers in the OS keychain (service `obsink`, account
+  `bearer:<worker url>`), never in `config.toml` / `app.json` / UserDefaults.
 
 The Cloudflare **account API token** used for `wrangler`/deploys is **not**
 stored here — create one in the dashboard on demand and revoke it after. A
@@ -129,8 +138,9 @@ stored here — create one in the dashboard on demand and revoke it after. A
 Status, tasks, decisions, and session logs live in the Plane project **OBS**
 ("ObSink"), reachable via the plane MCP tools. Conventions:
 
-- `spec.md` phases **P1–P6** are Plane *modules*; module status tracks phase
-  progression (P1/P2/P3 completed; P4/P6 in-progress; P5 backlog).
+- `spec.md` phases **P1–P7** are Plane *modules*; module status tracks phase
+  progression (P1/P2/P3 completed; P4/P6/P7 in-progress; P5 backlog). P7 =
+  accounts & hosted backend (OBS-76..80).
 - Work items are session-sized; move to **In Progress** when starting, comment
   outcomes (e.g. test output or a deploy URL), then mark **Done**. Reference the
   item in commits: `P4: file-provider enumerateChanges (OBS-12)`.

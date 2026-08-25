@@ -1,6 +1,8 @@
 # Self-Hosting Guide
 
-ObSink runs entirely on your own Cloudflare account. This guide takes you from zero to a deployed Worker that the CLI and desktop app can sync against.
+ObSink runs entirely on your own Cloudflare account. This guide takes you from zero to a deployed Worker that the CLI, desktop app, and iOS app can sync against.
+
+> Don't want to run anything? Every client also offers **ObSink Cloud** — the operator-hosted Worker with self-serve accounts. Pick "ObSink Cloud" at setup and sign in with your email (or Sign in with Apple on iOS). Operators: see [hosted.md](hosted.md).
 
 You need:
 
@@ -62,7 +64,9 @@ echo "$API_KEY"                                   # save this — clients need i
 printf '%s' "$API_KEY" | npx wrangler secret put API_KEY
 ```
 
-Treat this key like a password. Rotate it any time by running `wrangler secret put API_KEY` again (all clients must update).
+Treat this key like a password. Rotate it any time by running `wrangler secret put API_KEY` again (all clients must update). Clients keep it in the OS keychain (CLI: `obsink connect --worker-url <url> --api-key <key> …` remembers it for that URL).
+
+Optional: a self-hosted Worker can also offer **accounts** (email one-time code, Sign in with Apple) so family or team members get their own vault lists instead of sharing your key. Set `RESEND_API_KEY` (and `APPLE_CLIENT_IDS` in `wrangler.toml`) as described in [hosted.md](hosted.md); the `API_KEY` keeps working alongside.
 
 ## 6. Verify the deployment
 
@@ -81,7 +85,7 @@ Both should print `... verification passed`.
 ## What gets stored where
 
 - **R2 (`obsink-files`)** — encrypted file blobs, keyed by an opaque per-path token (`<vaultId>/<token>`); plus `_versions/` and `_trash/` prefixes for retained history.
-- **KV (`META`)** — the vault list (`vaults`) and one manifest per vault (`manifest:<vaultId>`). Manifests are keyed by path token and contain keyed hashes + the encrypted real path (`encPath`).
+- **KV (`META`)** — the operator's vault list (`vaults`), per-account vault lists (`vaults:<userId>`), one manifest per vault (`manifest:<vaultId>`), and — when accounts are enabled — user/session records (hashed tokens, no passwords; see [architecture.md](architecture.md)). Manifests are keyed by path token and contain keyed hashes + the encrypted real path (`encPath`).
 
 The server never sees plaintext paths, file contents, or content-derived hashes. See [architecture.md](architecture.md) for the crypto details.
 

@@ -1,3 +1,4 @@
+import AuthenticationServices
 import SwiftUI
 
 struct ContentView: View {
@@ -65,10 +66,28 @@ struct ContentView: View {
                     }
                 }
 
-                Section("Vault") {
-                    LabeledField("Worker URL", text: $model.workerURL)
-                    LabeledField("API key", text: $model.apiKey)
-                    LabeledField("Vault ID", text: $model.vaultID)
+                Section(model.activeIsHosted ? "ObSink Cloud" : "Vault") {
+                    if model.activeIsHosted {
+                        if model.hasBearer {
+                            Text(model.accountEmail.map { "Signed in as \($0)" } ?? "Signed in")
+                                .font(.callout)
+                                .accessibilityIdentifier("accountText")
+                            Button("Sign out", role: .destructive) { model.signOut() }
+                                .disabled(model.busy)
+                                .accessibilityIdentifier("signOutButton")
+                        } else {
+                            Text("Signed out — add the vault again to sign in.")
+                                .font(.caption).foregroundStyle(.orange)
+                        }
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Vault ID").font(.caption).foregroundStyle(.secondary)
+                            Text(model.vaultID).font(.caption.monospaced()).textSelection(.enabled)
+                        }
+                    } else {
+                        LabeledField("Worker URL", text: $model.workerURL)
+                        SecureLabeledField("API key", text: $model.apiKey)
+                        LabeledField("Vault ID", text: $model.vaultID)
+                    }
                     SecureField(model.hasStoredKey ? "Passphrase (saved — not needed)" : "Passphrase", text: $model.passphrase)
                         .accessibilityIdentifier("passphraseField")
                     if model.hasStoredKey {
@@ -160,6 +179,24 @@ private struct LabeledField: View {
     }
 }
 
+private struct SecureLabeledField: View {
+    let label: String
+    @Binding var text: String
+
+    init(_ label: String, text: Binding<String>) {
+        self.label = label
+        self._text = text
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label).font(.caption).foregroundStyle(.secondary)
+            SecureField(label, text: $text)
+                .accessibilityIdentifier(label)
+        }
+    }
+}
+
 private struct ConflictRow: View {
     let conflict: MobileConflict
     @Binding var choice: MobileChoice
@@ -233,13 +270,15 @@ private struct ConflictDetailView: View {
     }
 }
 
-/// Add a vault: create a new one or connect to an existing one on the Worker
-/// (spec §12.1/§12.2). Uses the `create_vault` / `list_vaults` facade methods and
-/// stores the derived key in the Keychain so later syncs need no passphrase.
+/// Add a vault: pick a backend (ObSink Cloud with an account, or a self-hosted
+/// Worker with an API key), then create a new vault or connect to an existing
+/// one (spec §12.1/§12.2). The bearer goes to the Keychain under the Worker
+/// URL; the derived vault key under the vault ID.
 struct AddVaultView: View {
     var onAdd: (VaultEntry) -> Void
     @Environment(\.dismiss) private var dismiss
 
+    @State private var backend: Backend = .cloud
     @State private var mode: Mode = .create
     @State private var workerURL = "https://"
     @State private var apiKey = ""
@@ -250,17 +289,57 @@ struct AddVaultView: View {
     @State private var status = ""
     @State private var busy = false
 
+    // ObSink Cloud sign-in state.
+    @State private var cloudEmail: String? = nil
+    @State private var cloudSignedIn = false
+    @State private var authEmail = ""
+    @State private var authCode = ""
+    @State private var codeSent = false
+
+    private enum Backend: String, CaseIterable, Identifiable {
+        case cloud = "ObSink Cloud", selfHosted = "Self-hosted"
+        var id: String { rawValue }
+    }
+
     private enum Mode: String, CaseIterable, Identifiable {
         case create = "Create", connect = "Connect"
         var id: String { rawValue }
+    }
+
+    private var hostedURL: String { hostedWorkerUrl() }
+    private var effectiveURL: String { backend == .cloud ? hostedURL : workerURL }
+    /// Bearer for the chosen backend, if we have one yet.
+    private var bearer: String? {
+        switch backend {
+        case .cloud: return KeychainStore.loadBearer(workerURL: hostedURL)
+        case .selfHosted: return apiKey.isEmpty ? KeychainStore.loadBearer(workerURL: workerURL) : apiKey
+        }
+    }
+    private var canSubmit: Bool {
+        !busy && bearer != nil && !passphrase.isEmpty
+            && (backend == .cloud || !workerURL.isEmpty)
+            && (mode == .create ? !name.isEmpty : pickedVaultID != nil)
     }
 
     var body: some View {
         NavigationStack {
             Form {
                 Section("Server") {
-                    LabeledField("Worker URL", text: $workerURL, identifier: "addVaultWorkerURL")
-                    LabeledField("API key", text: $apiKey, identifier: "addVaultAPIKey")
+                    Picker("Backend", selection: $backend) {
+                        ForEach(Backend.allCases) { Text($0.rawValue).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    .accessibilityIdentifier("backendPicker")
+                    .onChange(of: backend) { _, _ in
+                        available = []; pickedVaultID = nil; status = ""
+                    }
+
+                    if backend == .cloud {
+                        cloudSection
+                    } else {
+                        LabeledField("Worker URL", text: $workerURL, identifier: "addVaultWorkerURL")
+                        LabeledField("API key", text: $apiKey, identifier: "addVaultAPIKey")
+                    }
                 }
                 Section {
                     Picker("", selection: $mode) {
@@ -277,7 +356,7 @@ struct AddVaultView: View {
                 } else {
                     Section("Connect") {
                         Button("List vaults") { fetchVaults() }
-                            .disabled(busy || apiKey.isEmpty)
+                            .disabled(busy || bearer == nil)
                             .accessibilityIdentifier("listVaultsButton")
                         if available.isEmpty {
                             Text("Tap “List vaults”, then pick one.")
@@ -303,20 +382,162 @@ struct AddVaultView: View {
                 }
                 Section {
                     Button(mode == .create ? "Create Vault" : "Connect Vault") { submit() }
-                        .disabled(busy || workerURL.isEmpty || apiKey.isEmpty || passphrase.isEmpty
-                                  || (mode == .create ? name.isEmpty : pickedVaultID == nil))
+                        .disabled(!canSubmit)
                         .accessibilityIdentifier("addVaultSubmitButton")
                 }
             }
             .navigationTitle("Add Vault")
             .toolbar { Button("Cancel") { dismiss() } }
+            .onAppear { refreshCloudState() }
         }
     }
 
+    // MARK: ObSink Cloud sign-in
+
+    @ViewBuilder
+    private var cloudSection: some View {
+        if cloudSignedIn {
+            HStack {
+                Text(cloudEmail.map { "Signed in as \($0)" } ?? "Signed in")
+                    .font(.callout)
+                    .accessibilityIdentifier("addVaultAccountText")
+                Spacer()
+                Button("Sign out") { signOutCloud() }.disabled(busy)
+            }
+        } else {
+            SignInWithAppleButton(.signIn) { request in
+                request.requestedScopes = [.email]
+            } onCompletion: { result in
+                handleApple(result)
+            }
+            .signInWithAppleButtonStyle(.black)
+            .frame(height: 44)
+            .accessibilityIdentifier("signInWithAppleButton")
+            Text("or use your email").font(.caption).foregroundStyle(.secondary)
+            LabeledField("Email", text: $authEmail, identifier: "addVaultEmail")
+                .keyboardType(.emailAddress)
+                .disabled(codeSent)
+            if codeSent {
+                LabeledField("6-digit code", text: $authCode, identifier: "addVaultCode")
+                    .keyboardType(.numberPad)
+                Button("Verify and sign in") { verifyCode() }
+                    .disabled(busy || authCode.trimmingCharacters(in: .whitespaces).count != 6)
+                    .accessibilityIdentifier("verifyCodeButton")
+                Button("Change email") { codeSent = false; authCode = "" }.disabled(busy)
+            } else {
+                Button("Send sign-in code") { sendCode() }
+                    .disabled(busy || !authEmail.contains("@"))
+                    .accessibilityIdentifier("sendCodeButton")
+            }
+        }
+    }
+
+    private func refreshCloudState() {
+        guard let token = KeychainStore.loadBearer(workerURL: hostedURL) else {
+            cloudSignedIn = false
+            return
+        }
+        cloudSignedIn = true
+        let url = hostedURL
+        Task.detached {
+            let email = (try? authMe(workerUrl: url, token: token))?.email
+            await MainActor.run { cloudEmail = email }
+        }
+    }
+
+    private static var deviceName: String {
+        "\(UIDevice.current.name) (iOS)"
+    }
+
+    private func sendCode() {
+        busy = true; status = ""
+        let url = hostedURL, email = authEmail.trimmingCharacters(in: .whitespaces)
+        Task.detached {
+            do {
+                let devCode = try authEmailStart(workerUrl: url, email: email)
+                await MainActor.run {
+                    codeSent = true
+                    busy = false
+                    if let devCode { authCode = devCode }
+                }
+            } catch {
+                await MainActor.run { status = error.localizedDescription; busy = false }
+            }
+        }
+    }
+
+    private func verifyCode() {
+        busy = true; status = ""
+        let url = hostedURL, email = authEmail.trimmingCharacters(in: .whitespaces)
+        let code = authCode.trimmingCharacters(in: .whitespaces), device = Self.deviceName
+        Task.detached {
+            do {
+                let session = try authEmailVerify(workerUrl: url, email: email, code: code, deviceName: device)
+                KeychainStore.saveBearer(session.token, workerURL: url)
+                await MainActor.run {
+                    cloudEmail = session.email
+                    cloudSignedIn = true
+                    codeSent = false
+                    authCode = ""
+                    busy = false
+                }
+            } catch {
+                await MainActor.run { status = error.localizedDescription; busy = false }
+            }
+        }
+    }
+
+    private func handleApple(_ result: Result<ASAuthorization, Error>) {
+        switch result {
+        case .failure(let error):
+            // User cancel is not an error worth showing.
+            if (error as? ASAuthorizationError)?.code != .canceled {
+                status = error.localizedDescription
+            }
+        case .success(let authorization):
+            guard let credential = authorization.credential as? ASAuthorizationAppleIDCredential,
+                  let tokenData = credential.identityToken,
+                  let identityToken = String(data: tokenData, encoding: .utf8) else {
+                status = "Apple did not return an identity token."
+                return
+            }
+            busy = true; status = ""
+            let url = hostedURL, email = credential.email, device = Self.deviceName
+            Task.detached {
+                do {
+                    let session = try authApple(workerUrl: url, identityToken: identityToken, deviceName: device, email: email)
+                    KeychainStore.saveBearer(session.token, workerURL: url)
+                    await MainActor.run {
+                        cloudEmail = session.email
+                        cloudSignedIn = true
+                        busy = false
+                    }
+                } catch {
+                    await MainActor.run { status = error.localizedDescription; busy = false }
+                }
+            }
+        }
+    }
+
+    private func signOutCloud() {
+        let url = hostedURL
+        if let token = KeychainStore.loadBearer(workerURL: url), token.hasPrefix("os_") {
+            Task.detached { try? authLogout(workerUrl: url, token: token) }
+        }
+        KeychainStore.deleteBearer(workerURL: url)
+        cloudSignedIn = false
+        cloudEmail = nil
+        available = []
+        pickedVaultID = nil
+    }
+
+    // MARK: Vault create / connect
+
     private func fetchVaults() {
+        guard let key = bearer else { return }
         busy = true
         status = ""
-        let url = workerURL, key = apiKey
+        let url = effectiveURL
         Task.detached {
             do {
                 let vaults = try listVaults(workerUrl: url, apiKey: key)
@@ -333,20 +554,24 @@ struct AddVaultView: View {
     }
 
     private func submit() {
+        guard let key = bearer else { return }
         busy = true
         status = ""
-        let url = workerURL, key = apiKey, name = self.name, pass = passphrase
+        let url = effectiveURL, name = self.name, pass = passphrase
         let mode = self.mode, picked = pickedVaultID
         let availableNames = available
+        let isSelfHosted = backend == .selfHosted
         Task.detached {
             do {
+                // Remember a typed self-hosted API key for this Worker.
+                if isSelfHosted { KeychainStore.saveBearer(key, workerURL: url) }
                 switch mode {
                 case .create:
                     let summary = try createVault(workerUrl: url, apiKey: key, name: name)
                     let derived = try deriveMasterKey(passphrase: pass, vaultId: summary.id)
                     _ = KeychainStore.save(derived, account: summary.id)
                     await MainActor.run {
-                        onAdd(VaultEntry(workerURL: url, apiKey: key, vaultID: summary.id, name: summary.name))
+                        onAdd(VaultEntry(workerURL: url, vaultID: summary.id, name: summary.name))
                         dismiss()
                     }
                 case .connect:
@@ -358,7 +583,7 @@ struct AddVaultView: View {
                     _ = KeychainStore.save(derived, account: vid)
                     let vname = availableNames.first { $0.id == vid }?.name ?? vid
                     await MainActor.run {
-                        onAdd(VaultEntry(workerURL: url, apiKey: key, vaultID: vid, name: vname))
+                        onAdd(VaultEntry(workerURL: url, vaultID: vid, name: vname))
                         dismiss()
                     }
                 }

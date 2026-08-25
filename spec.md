@@ -83,7 +83,32 @@ This prevents most accidental conflicts.
 
 ### 4.1 Authentication
 
-Shared API key in `Authorization: Bearer <token>` header. Stored as a Cloudflare Worker secret. Both clients send it with every request.
+Every vault request carries `Authorization: Bearer <token>`. The Worker resolves the bearer to a **principal**, and every vault route is scoped to that principal's own vault list:
+
+| Principal | Bearer | Vault list (KV) | Who uses it |
+|---|---|---|---|
+| operator | the `API_KEY` Worker secret (compared in constant time) | `vaults` (pre-accounts key, no migration) | self-hosters; the operator's own scripts |
+| user | an `os_…` session token minted by `/auth/*`, stored hashed (`session:<sha256>`) with a 180-day TTL | `vaults:<userId>` | ObSink Cloud accounts |
+
+Two backend modes follow from this, and every client offers both at setup:
+
+- **ObSink Cloud** — the operator-hosted Worker (URL baked into the clients; `OBSINK_HOSTED_URL` overrides it). Users sign in with an emailed 6-digit one-time code (all platforms) or Sign in with Apple (iOS). Per-account quotas: `MAX_VAULTS_PER_USER` (default 10) and `MAX_VAULT_BYTES` per vault (default 1 GiB).
+- **Self-hosted** — your own Worker with the `API_KEY` secret; unchanged from v1. A self-hosted Worker may additionally enable accounts by setting `RESEND_API_KEY` / `APPLE_CLIENT_IDS`.
+
+Accounts decide only *which encrypted vaults* a bearer may list and write. They never touch vault content: rule §6 (server never sees plaintext) is unaffected, and the vault ID stays the KDF salt.
+
+Auth endpoints (no bearer unless noted):
+
+- `GET /` → `{ service, auth: { email, apple, api_key } }` — which sign-in methods are configured.
+- `POST /auth/email/start { email }` → sends the code (Resend). One per email per 60 s; code valid 10 min, 5 attempts. `AUTH_DEV_RETURN_CODE=1` (dev only) returns the code in the response.
+- `POST /auth/email/verify { email, code, device_name }` → `{ token, session, user }`.
+- `POST /auth/apple { identity_token, device_name, email? }` → same; verifies the RS256 JWT against Apple's JWKS (`iss`, `aud ∈ APPLE_CLIENT_IDS`, `exp`) and links to an existing email account when the emails match.
+- `GET /auth/me` (bearer) → `{ kind, user, sessions[] }`.
+- `DELETE /auth/session` (bearer) → sign out this device; `DELETE /auth/sessions/:id` → sign out another device.
+- `DELETE /auth/account` (bearer) → delete the account, its sessions, and every vault it owns (blobs, versions, trash, manifests). Required by App Store guideline 5.1.1(v).
+- `DELETE /vaults/:id` (bearer) → delete one vault and its data.
+
+Clients keep the bearer in the OS keychain (service `obsink`, account `bearer:<canonical worker URL>`), never in a config file. A `401` surfaces as "sign in again".
 
 ### 4.2 Data Model
 
@@ -357,15 +382,14 @@ Stable UUIDs assigned on first encounter. **Never** use file paths as identifier
 
 ### 12.1 First Device (Creating a Vault)
 
-1. Enter Cloudflare Worker URL
-2. Enter API key
-3. Choose: "Create new vault" or "Connect to existing vault"
-4. If creating: enter vault name, choose passphrase → app derives key, stores in keychain, creates vault on server, optionally imports existing local Obsidian vault folder
-5. If connecting: app lists vaults from server, user picks one, enters passphrase → key derived, stored in keychain, initial pull of all files
+1. Choose the backend: **ObSink Cloud** (sign in with email code or Sign in with Apple) or **Self-hosted** (enter Worker URL + API key). The credential goes to the keychain, so this happens once per device.
+2. Choose: "Create new vault" or "Connect to existing vault"
+3. If creating: enter vault name, choose passphrase → app derives key, stores in keychain, creates vault on server, optionally imports existing local Obsidian vault folder
+4. If connecting: app lists vaults from server, user picks one, enters passphrase → key derived, stored in keychain, initial pull of all files
 
 ### 12.2 Adding a New Device
 
-1. Enter Worker URL and API key (manually typed or from QR code in future)
+1. Sign in to the same ObSink Cloud account (or enter the same Worker URL + API key)
 2. App lists available vaults
 3. User selects vault(s) and enters passphrase for each
 4. Initial sync pulls all files

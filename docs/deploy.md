@@ -21,6 +21,7 @@ For now, infrastructure changes must be applied locally. Once you move Terraform
 - `CLOUDFLARE_API_TOKEN`
 - `CLOUDFLARE_ACCOUNT_ID`
 - `WORKER_API_KEY`
+- `RESEND_API_KEY` (optional — enables email sign-in for accounts; see [hosted.md](hosted.md))
 
 ## Required GitHub Repository Variables
 
@@ -29,6 +30,7 @@ For now, infrastructure changes must be applied locally. Once you move Terraform
 - `KV_NAMESPACE_TITLE`
 - `KV_NAMESPACE_ID`
 - `MAX_BATCH_INLINE_BYTES`
+- `APPLE_CLIENT_IDS`, `MAIL_FROM`, `MAX_VAULTS_PER_USER`, `MAX_VAULT_BYTES` (optional; accounts / hosted mode)
 
 `KV_NAMESPACE_ID` comes from Terraform output after the initial local apply.
 
