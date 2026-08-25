@@ -273,5 +273,10 @@ else
     fail "OBS-34: app sync failed"
 fi
 
+# Remove this run's vault so the operator vault list does not grow per run.
+if [ -n "${VAULT_ID:-}" ]; then
+    curl -s -o /dev/null -w "cleanup: DELETE vault $VAULT_ID -> %{http_code}\n" -X DELETE \
+        "$WORKER_URL/vaults/$VAULT_ID" -H "Authorization: Bearer $WORKER_API_KEY" || true
+fi
 printf '\n==== Result: %d passed, %d failed. Logs: %s ====\n' "$PASS_COUNT" "$FAIL_COUNT" "$WORK"
 [ "$FAIL_COUNT" -eq 0 ]

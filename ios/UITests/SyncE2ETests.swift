@@ -112,10 +112,19 @@ final class SyncE2ETests: XCTestCase {
         let vaultName = env["OBSINK_TEST_VAULT_NAME"] ?? "e2e-sim"
         // The menu picker pushes/pops a selection list; the option is a button
         // in most layouts, a static text in others.
-        let option = app.buttons[vaultName].waitForExistence(timeout: 10)
-            ? app.buttons[vaultName].firstMatch
-            : app.staticTexts[vaultName].firstMatch
-        XCTAssertTrue(option.waitForExistence(timeout: 10), "vault '\(vaultName)' not listed")
+        // Long vault lists push the newest entry off-screen (absent from the
+        // accessibility tree); scroll until it shows up.
+        var option = app.buttons[vaultName].firstMatch
+        for _ in 0..<12 {
+            if app.buttons[vaultName].firstMatch.waitForExistence(timeout: 2) {
+                option = app.buttons[vaultName].firstMatch; break
+            }
+            if app.staticTexts[vaultName].firstMatch.exists {
+                option = app.staticTexts[vaultName].firstMatch; break
+            }
+            app.swipeUp()
+        }
+        XCTAssertTrue(option.exists, "vault '\(vaultName)' not listed")
         option.tap()
 
         let pass = app.secureTextFields["addVaultPassphraseField"]
