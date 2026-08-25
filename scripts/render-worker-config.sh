@@ -10,6 +10,13 @@ OUTPUT_PATH="${1:-worker/wrangler.toml}"
 
 COMPATIBILITY_DATE="${COMPATIBILITY_DATE:-2026-04-14}"
 MAX_BATCH_INLINE_BYTES="${MAX_BATCH_INLINE_BYTES:-52428800}"
+# Hosted-mode (accounts) settings. Leave APPLE_CLIENT_IDS empty on a
+# self-hosted deployment that only uses API_KEY; email sign-in additionally
+# needs the RESEND_API_KEY secret (wrangler secret put).
+APPLE_CLIENT_IDS="${APPLE_CLIENT_IDS:-}"
+MAIL_FROM="${MAIL_FROM:-ObSink <onboarding@resend.dev>}"
+MAX_VAULTS_PER_USER="${MAX_VAULTS_PER_USER:-10}"
+MAX_VAULT_BYTES="${MAX_VAULT_BYTES:-1073741824}"
 
 cat > "$OUTPUT_PATH" <<EOF
 name = "$WORKER_NAME"
@@ -26,6 +33,10 @@ bucket_name = "$R2_BUCKET_NAME"
 
 [vars]
 MAX_BATCH_INLINE_BYTES = $MAX_BATCH_INLINE_BYTES
+APPLE_CLIENT_IDS = "$APPLE_CLIENT_IDS"
+MAIL_FROM = "$MAIL_FROM"
+MAX_VAULTS_PER_USER = "$MAX_VAULTS_PER_USER"
+MAX_VAULT_BYTES = "$MAX_VAULT_BYTES"
 
 [triggers]
 crons = ["0 3 * * *", "30 3 * * *"]

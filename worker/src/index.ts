@@ -1,8 +1,24 @@
-export interface Env {
+import {
+  AuthError,
+  OPERATOR_TENANT,
+  appleSignIn,
+  deleteAccount,
+  emailStart,
+  emailVerify,
+  maxVaultsPerUser,
+  me,
+  resolvePrincipal,
+  revokeSession,
+  type AuthEnv,
+  type Principal,
+} from './auth'
+
+export interface Env extends AuthEnv {
   META: KVNamespace
   FILES: R2Bucket
-  API_KEY: string
   MAX_BATCH_INLINE_BYTES?: string
+  /** Per-vault byte budget for account (non-operator) vaults. Default 1 GiB. */
+  MAX_VAULT_BYTES?: string
 }
 
 export interface FileEntry {
@@ -55,7 +71,10 @@ interface BatchOperationResult {
 }
 
 const DEFAULT_MAX_FILE_SIZE = 50 * 1024 * 1024
+const DEFAULT_MAX_VAULT_BYTES = 1024 * 1024 * 1024
 const MANIFEST_PREFIX = 'manifest:'
+/** The operator's (self-hosting) vault list keeps the pre-accounts key so
+ * existing deployments need no migration; account vault lists are per user. */
 const VAULTS_KEY = 'vaults'
 const VERSION_RETENTION_SECS = 14 * 24 * 60 * 60
 const TRASH_RETENTION_SECS = 30 * 24 * 60 * 60
@@ -63,20 +82,59 @@ const MAX_VERSIONS_PER_FILE = 10
 
 export default {
   async fetch(request, env, ctx): Promise<Response> {
-    if (!isAuthorized(request, env)) {
-      return json({ error: 'unauthorized' }, 401)
-    }
-
     const url = new URL(request.url)
     const path = trimPath(url.pathname)
 
     try {
+      // Unauthenticated: capabilities + sign-in.
+      if (request.method === 'GET' && path === '') {
+        return json(capabilities(env))
+      }
+      if (request.method === 'POST' && path === 'auth/email/start') {
+        const body = await readJson(request)
+        return json(await emailStart(env, body.email))
+      }
+      if (request.method === 'POST' && path === 'auth/email/verify') {
+        const body = await readJson(request)
+        return json(await emailVerify(env, body.email, body.code, body.device_name))
+      }
+      if (request.method === 'POST' && path === 'auth/apple') {
+        const body = await readJson(request)
+        return json(await appleSignIn(env, body.identity_token, body.device_name, body.email))
+      }
+
+      const principal = await resolvePrincipal(request, env)
+      if (!principal) {
+        return json({ error: 'unauthorized' }, 401)
+      }
+      const tenant = principal.tenant
+
+      if (request.method === 'GET' && path === 'auth/me') {
+        return json(await me(env, principal))
+      }
+      if (request.method === 'DELETE' && path === 'auth/session') {
+        await revokeSession(env, principal)
+        return new Response(null, { status: 204 })
+      }
+      if (request.method === 'DELETE' && path.startsWith('auth/sessions/')) {
+        await revokeSession(env, principal, path.slice('auth/sessions/'.length))
+        return new Response(null, { status: 204 })
+      }
+      if (request.method === 'DELETE' && path === 'auth/account') {
+        for (const vault of await listVaults(env, tenant)) {
+          await deleteVaultData(env, vault.id)
+        }
+        await env.META.delete(vaultsKey(tenant))
+        await deleteAccount(env, principal)
+        return new Response(null, { status: 204 })
+      }
+
       if (request.method === 'GET' && path === 'vaults') {
-        return json(await listVaults(env))
+        return json(await listVaults(env, tenant))
       }
 
       if (request.method === 'POST' && path === 'vaults') {
-        return json(await createVault(request, env), 201)
+        return json(await createVault(request, env, tenant), 201)
       }
 
       const route = parseVaultRoute(path)
@@ -84,24 +142,29 @@ export default {
         return json({ error: 'not_found' }, 404)
       }
 
+      if (request.method === 'DELETE' && route.kind === 'vault') {
+        await deleteVault(env, route.vaultId, tenant)
+        return new Response(null, { status: 204 })
+      }
+
       if (request.method === 'GET' && route.kind === 'manifest') {
-        return json(await getManifest(env, route.vaultId))
+        return json(await getManifest(env, route.vaultId, tenant))
       }
 
       if (request.method === 'GET' && route.kind === 'file') {
-        return await getFile(env, route.vaultId, route.filePath)
+        return await getFile(env, route.vaultId, route.filePath, tenant)
       }
 
       if (request.method === 'PUT' && route.kind === 'file') {
-        return await putFile(request, env, route.vaultId, route.filePath)
+        return await putFile(request, env, route.vaultId, route.filePath, tenant)
       }
 
       if (request.method === 'DELETE' && route.kind === 'file') {
-        return await deleteFile(request, env, route.vaultId, route.filePath)
+        return await deleteFile(request, env, route.vaultId, route.filePath, tenant)
       }
 
       if (request.method === 'POST' && route.kind === 'batch') {
-        return await batch(request, env, route.vaultId)
+        return await batch(request, env, route.vaultId, tenant)
       }
 
       return json({ error: 'not_found' }, 404)
@@ -117,9 +180,30 @@ export default {
   },
 } satisfies ExportedHandler<Env>
 
-function isAuthorized(request: Request, env: Env): boolean {
-  const auth = request.headers.get('Authorization')
-  return auth === `Bearer ${env.API_KEY}`
+/** What sign-in methods this deployment offers; clients read it before
+ * showing the account UI. Public by design (no secrets, no state). */
+function capabilities(env: Env): { service: string; auth: { email: boolean; apple: boolean; api_key: boolean } } {
+  return {
+    service: 'obsink',
+    auth: {
+      email: Boolean(env.RESEND_API_KEY) || env.AUTH_DEV_RETURN_CODE === '1',
+      apple: Boolean(env.APPLE_CLIENT_IDS),
+      api_key: Boolean(env.API_KEY),
+    },
+  }
+}
+
+async function readJson(request: Request): Promise<Record<string, unknown>> {
+  try {
+    const body = (await request.json()) as unknown
+    return body && typeof body === 'object' ? (body as Record<string, unknown>) : {}
+  } catch {
+    throw new HttpError(400, 'body must be JSON')
+  }
+}
+
+function vaultsKey(tenant: string): string {
+  return tenant === OPERATOR_TENANT ? VAULTS_KEY : `${VAULTS_KEY}:${tenant}`
 }
 
 function trimPath(pathname: string): string {
@@ -127,6 +211,7 @@ function trimPath(pathname: string): string {
 }
 
 function parseVaultRoute(path: string):
+  | { vaultId: string; kind: 'vault' }
   | { vaultId: string; kind: 'manifest' }
   | { vaultId: string; kind: 'batch' }
   | { vaultId: string; kind: 'file'; filePath: string }
@@ -134,6 +219,10 @@ function parseVaultRoute(path: string):
   const parts = path.split('/')
   if (parts[0] !== 'vaults' || !parts[1]) {
     return null
+  }
+
+  if (parts.length === 2) {
+    return { vaultId: parts[1], kind: 'vault' }
   }
 
   if (parts[2] === 'manifest' && parts.length === 3) {
@@ -155,37 +244,70 @@ function parseVaultRoute(path: string):
   return null
 }
 
-async function listVaults(env: Env): Promise<VaultSummary[]> {
-  return (await env.META.get(VAULTS_KEY, 'json')) ?? []
+async function listVaults(env: Env, tenant: string = OPERATOR_TENANT): Promise<VaultSummary[]> {
+  return (await env.META.get(vaultsKey(tenant), 'json')) ?? []
 }
 
-async function createVault(request: Request, env: Env): Promise<{ vault: VaultSummary }> {
+async function createVault(
+  request: Request,
+  env: Env,
+  tenant: string = OPERATOR_TENANT,
+): Promise<{ vault: VaultSummary }> {
   const body = (await request.json()) as CreateVaultRequest
   if (!body.name?.trim()) {
     throw new HttpError(400, 'vault name is required')
   }
 
-  const vaults = await listVaults(env)
+  const vaults = await listVaults(env, tenant)
+  if (tenant !== OPERATOR_TENANT && vaults.length >= maxVaultsPerUser(env)) {
+    throw new HttpError(403, `vault limit reached (${maxVaultsPerUser(env)} per account)`)
+  }
   const vault: VaultSummary = {
     id: `vault_${crypto.randomUUID()}`,
     name: body.name.trim(),
     created: nowSeconds(),
-    max_file_size: body.max_file_size ?? DEFAULT_MAX_FILE_SIZE,
+    max_file_size: Math.min(body.max_file_size ?? DEFAULT_MAX_FILE_SIZE, DEFAULT_MAX_FILE_SIZE),
   }
 
   vaults.push(vault)
-  await env.META.put(VAULTS_KEY, JSON.stringify(vaults))
+  await env.META.put(vaultsKey(tenant), JSON.stringify(vaults))
   await writeManifest(env, vault.id, {})
   return { vault }
 }
 
-async function getManifest(env: Env, vaultId: string): Promise<Manifest> {
-  await requireVault(env, vaultId)
+/** Remove a vault from its owner's list and delete every blob, version, and
+ * trash entry it owns. Irreversible; the client confirms before calling. */
+async function deleteVault(env: Env, vaultId: string, tenant: string = OPERATOR_TENANT): Promise<void> {
+  await requireVault(env, vaultId, tenant)
+  await deleteVaultData(env, vaultId)
+  const remaining = (await listVaults(env, tenant)).filter((vault) => vault.id !== vaultId)
+  await env.META.put(vaultsKey(tenant), JSON.stringify(remaining))
+}
+
+async function deleteVaultData(env: Env, vaultId: string): Promise<void> {
+  for (const prefix of [`${vaultId}/`, `_versions/${vaultId}/`, `_trash/${vaultId}/`]) {
+    let cursor: string | undefined
+    do {
+      const page = await env.FILES.list({ prefix, cursor })
+      await Promise.all(page.objects.map((object) => env.FILES.delete(object.key)))
+      cursor = page.truncated ? page.cursor : undefined
+    } while (cursor)
+  }
+  await env.META.delete(`${MANIFEST_PREFIX}${vaultId}`)
+}
+
+async function getManifest(env: Env, vaultId: string, tenant: string = OPERATOR_TENANT): Promise<Manifest> {
+  await requireVault(env, vaultId, tenant)
   return readManifest(env, vaultId)
 }
 
-async function getFile(env: Env, vaultId: string, filePath: string): Promise<Response> {
-  await requireVault(env, vaultId)
+async function getFile(
+  env: Env,
+  vaultId: string,
+  filePath: string,
+  tenant: string = OPERATOR_TENANT,
+): Promise<Response> {
+  await requireVault(env, vaultId, tenant)
   const object = await env.FILES.get(fileObjectKey(vaultId, filePath))
   if (!object) {
     return json({ error: 'not_found' }, 404)
@@ -204,8 +326,9 @@ async function putFile(
   env: Env,
   vaultId: string,
   filePath: string,
+  tenant: string = OPERATOR_TENANT,
 ): Promise<Response> {
-  const vault = await requireVault(env, vaultId)
+  const vault = await requireVault(env, vaultId, tenant)
   const manifest = await readManifest(env, vaultId)
   const current = manifest[filePath]
   const parentHash = request.headers.get('X-Parent-Hash')
@@ -219,6 +342,14 @@ async function putFile(
   const body = new Uint8Array(await request.arrayBuffer())
   if (body.byteLength > vault.max_file_size) {
     throw new HttpError(413, 'file too large')
+  }
+  if (tenant !== OPERATOR_TENANT) {
+    const used = Object.entries(manifest)
+      .filter(([path, entry]) => !entry.deleted && path !== filePath)
+      .reduce((total, [, entry]) => total + entry.size, 0)
+    if (used + body.byteLength > maxVaultBytes(env)) {
+      throw new HttpError(413, 'vault storage limit reached')
+    }
   }
 
   if (current && current.hash !== parentHash) {
@@ -247,8 +378,9 @@ async function deleteFile(
   env: Env,
   vaultId: string,
   filePath: string,
+  tenant: string = OPERATOR_TENANT,
 ): Promise<Response> {
-  await requireVault(env, vaultId)
+  await requireVault(env, vaultId, tenant)
   const manifest = await readManifest(env, vaultId)
   const current = manifest[filePath]
   const parentHash = request.headers.get('X-Parent-Hash')
@@ -276,7 +408,12 @@ async function deleteFile(
   return new Response(null, { status: 200 })
 }
 
-async function batch(request: Request, env: Env, vaultId: string): Promise<Response> {
+async function batch(
+  request: Request,
+  env: Env,
+  vaultId: string,
+  tenant: string = OPERATOR_TENANT,
+): Promise<Response> {
   const body = (await request.json()) as BatchRequest
   if (!Array.isArray(body.operations)) {
     throw new HttpError(400, 'operations must be an array')
@@ -306,6 +443,7 @@ async function batch(request: Request, env: Env, vaultId: string): Promise<Respo
           env,
           vaultId,
           operation.path,
+          tenant,
         )
 
         if (response.status === 409) {
@@ -328,6 +466,7 @@ async function batch(request: Request, env: Env, vaultId: string): Promise<Respo
           env,
           vaultId,
           operation.path,
+          tenant,
         )
 
         if (response.status === 409) {
@@ -352,8 +491,8 @@ async function batch(request: Request, env: Env, vaultId: string): Promise<Respo
   return json({ results })
 }
 
-async function requireVault(env: Env, vaultId: string): Promise<VaultSummary> {
-  const vault = (await listVaults(env)).find((item) => item.id === vaultId)
+async function requireVault(env: Env, vaultId: string, tenant: string = OPERATOR_TENANT): Promise<VaultSummary> {
+  const vault = (await listVaults(env, tenant)).find((item) => item.id === vaultId)
   if (!vault) {
     throw new HttpError(404, 'vault not found')
   }
@@ -435,6 +574,11 @@ function extractTimestamp(key: string): number {
   return Number.isFinite(value) ? value : 0
 }
 
+function maxVaultBytes(env: Env): number {
+  const value = Number(env.MAX_VAULT_BYTES ?? DEFAULT_MAX_VAULT_BYTES)
+  return Number.isFinite(value) && value > 0 ? value : DEFAULT_MAX_VAULT_BYTES
+}
+
 function nowSeconds(): number {
   return Math.floor(Date.now() / 1000)
 }
@@ -447,7 +591,7 @@ function json(data: unknown, status = 200): Response {
 }
 
 function handleError(error: unknown): Response {
-  if (error instanceof HttpError) {
+  if (error instanceof HttpError || error instanceof AuthError) {
     return json({ error: error.message }, error.status)
   }
 
@@ -469,8 +613,8 @@ export const internal = {
   createVault,
   deleteFile,
   getFile,
+  deleteVault,
   getManifest,
-  isAuthorized,
   listVaults,
   parseVaultRoute,
   pruneTrash,

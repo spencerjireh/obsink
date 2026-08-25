@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import worker, { internal, type Env } from '../src/index'
 
-class FakeKVNamespace {
+export class FakeKVNamespace {
   private readonly store = new Map<string, string>()
 
   async get(key: string, type?: 'json'): Promise<any> {
@@ -16,11 +16,19 @@ class FakeKVNamespace {
   async put(key: string, value: string): Promise<void> {
     this.store.set(key, value)
   }
+
+  async delete(key: string): Promise<void> {
+    this.store.delete(key)
+  }
+
+  keys(): string[] {
+    return Array.from(this.store.keys()).sort()
+  }
 }
 
 type StoredObject = { key: string; body: Uint8Array }
 
-class FakeR2Bucket {
+export class FakeR2Bucket {
   private readonly store = new Map<string, Uint8Array>()
 
   has(key: string): boolean {
@@ -87,7 +95,7 @@ class FakeR2Bucket {
   }
 }
 
-function createEnv(): Env {
+export function createEnv(): Env {
   return {
     API_KEY: 'secret',
     META: new FakeKVNamespace() as unknown as KVNamespace,
@@ -96,11 +104,11 @@ function createEnv(): Env {
   }
 }
 
-function createRequest(input: string, init?: RequestInit): Request<unknown, IncomingRequestCfProperties<unknown>> {
+export function createRequest(input: string, init?: RequestInit): Request<unknown, IncomingRequestCfProperties<unknown>> {
   return new Request(input, init) as Request<unknown, IncomingRequestCfProperties<unknown>>
 }
 
-function createContext(): ExecutionContext {
+export function createContext(): ExecutionContext {
   return {
     waitUntil() {},
     passThroughOnException() {},
