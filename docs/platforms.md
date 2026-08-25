@@ -122,10 +122,30 @@ as WARN. Simulator builds force-enable the domain via
 sets `ENABLE_DEBUG_DYLIB=NO` (the debug-dylib stub prevents principal-class
 loading).
 
-Remaining (device-only): the visual Files-app/Obsidian checkpoint (OBS-19) and
-code-signing + TestFlight — `DEVELOPMENT_TEAM` is read from the gitignored
-`.env` by `scripts/build-ios.sh` and substituted by XcodeGen. See
-`docs/p4-plan.md` and spec.md §11 for the File Provider design.
+### TestFlight release
+
+```bash
+# .env: DEVELOPMENT_TEAM, ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_PATH (App Store
+# Connect team API key, App Manager role — drives signing and upload).
+./scripts/release-ios.sh                 # archive + sign + upload; build = commit count
+set -a; . ./.env; set +a
+uv run scripts/testflight.py status      # processing state per build
+uv run scripts/testflight.py distribute --group "Internal Testers" --encryption exempt
+```
+
+`release-ios.sh` uses automatic signing through the API key
+(`-allowProvisioningUpdates`), so no Xcode account login is needed. Each build
+is a unique, monotonic number (the commit count) because App Store Connect
+rejects re-uploads. `distribute` waits for processing, records the
+export-compliance answer, and attaches the build to the group; internal groups
+with automatic build access need no assignment (and no Beta App Review).
+Testers in an internal group must be App Store Connect users on the team.
+Privacy manifests (`PrivacyInfo.xcprivacy`, app + extension) declare the
+required-reason APIs in use (UserDefaults, file timestamps).
+
+Remaining (device-only): the visual Files-app/Obsidian checkpoint (OBS-19),
+which runs from the TestFlight install. See `docs/p4-plan.md` and spec.md §11
+for the File Provider design.
 
 ## Windows (planned)
 
