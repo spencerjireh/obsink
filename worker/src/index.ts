@@ -73,9 +73,13 @@ interface BatchOperationResult {
 const DEFAULT_MAX_FILE_SIZE = 50 * 1024 * 1024
 const DEFAULT_MAX_VAULT_BYTES = 1024 * 1024 * 1024
 const MANIFEST_PREFIX = 'manifest:'
-/** The operator's (self-hosting) vault list keeps the pre-accounts key so
- * existing deployments need no migration; account vault lists are per user. */
-const VAULTS_KEY = 'vaults'
+/** Pre-accounts deployments kept one JSON array under `vaults`. Still read for
+ * the operator (no migration step), but new vaults get one key each:
+ * `vault:<tenant>:<vaultId>`. A single-key list is a read-modify-write that
+ * loses updates under KV's ≤60 s edge cache (OBS-81); per-vault keys make
+ * create/delete independent and let a just-created vault be used at once. */
+const LEGACY_VAULTS_KEY = 'vaults'
+const VAULT_PREFIX = 'vault:'
 const VERSION_RETENTION_SECS = 14 * 24 * 60 * 60
 const TRASH_RETENTION_SECS = 30 * 24 * 60 * 60
 const MAX_VERSIONS_PER_FILE = 10
@@ -123,8 +127,8 @@ export default {
       if (request.method === 'DELETE' && path === 'auth/account') {
         for (const vault of await listVaults(env, tenant)) {
           await deleteVaultData(env, vault.id)
+          await env.META.delete(vaultKey(tenant, vault.id))
         }
-        await env.META.delete(vaultsKey(tenant))
         await deleteAccount(env, principal)
         return new Response(null, { status: 204 })
       }
@@ -202,8 +206,19 @@ async function readJson(request: Request): Promise<Record<string, unknown>> {
   }
 }
 
-function vaultsKey(tenant: string): string {
-  return tenant === OPERATOR_TENANT ? VAULTS_KEY : `${VAULTS_KEY}:${tenant}`
+function vaultKey(tenant: string, vaultId: string): string {
+  return `${VAULT_PREFIX}${tenant}:${vaultId}`
+}
+
+async function listKeys(env: Env, prefix: string): Promise<string[]> {
+  const keys: string[] = []
+  let cursor: string | undefined
+  do {
+    const page = await env.META.list({ prefix, cursor })
+    keys.push(...page.keys.map((key) => key.name))
+    cursor = page.list_complete ? undefined : page.cursor
+  } while (cursor)
+  return keys
 }
 
 function trimPath(pathname: string): string {
@@ -245,7 +260,16 @@ function parseVaultRoute(path: string):
 }
 
 async function listVaults(env: Env, tenant: string = OPERATOR_TENANT): Promise<VaultSummary[]> {
-  return (await env.META.get(vaultsKey(tenant), 'json')) ?? []
+  const keys = await listKeys(env, `${VAULT_PREFIX}${tenant}:`)
+  const own = (await Promise.all(keys.map((key) => env.META.get<VaultSummary>(key, 'json')))).filter(
+    (vault): vault is VaultSummary => vault != null,
+  )
+  if (tenant !== OPERATOR_TENANT) {
+    return own
+  }
+  const legacy: VaultSummary[] = (await env.META.get(LEGACY_VAULTS_KEY, 'json')) ?? []
+  const seen = new Set(own.map((vault) => vault.id))
+  return [...legacy.filter((vault) => !seen.has(vault.id)), ...own]
 }
 
 async function createVault(
@@ -269,8 +293,7 @@ async function createVault(
     max_file_size: Math.min(body.max_file_size ?? DEFAULT_MAX_FILE_SIZE, DEFAULT_MAX_FILE_SIZE),
   }
 
-  vaults.push(vault)
-  await env.META.put(vaultsKey(tenant), JSON.stringify(vaults))
+  await env.META.put(vaultKey(tenant, vault.id), JSON.stringify(vault))
   await writeManifest(env, vault.id, {})
   return { vault }
 }
@@ -280,8 +303,13 @@ async function createVault(
 async function deleteVault(env: Env, vaultId: string, tenant: string = OPERATOR_TENANT): Promise<void> {
   await requireVault(env, vaultId, tenant)
   await deleteVaultData(env, vaultId)
-  const remaining = (await listVaults(env, tenant)).filter((vault) => vault.id !== vaultId)
-  await env.META.put(vaultsKey(tenant), JSON.stringify(remaining))
+  await env.META.delete(vaultKey(tenant, vaultId))
+  if (tenant === OPERATOR_TENANT) {
+    const legacy: VaultSummary[] = (await env.META.get(LEGACY_VAULTS_KEY, 'json')) ?? []
+    if (legacy.some((vault) => vault.id === vaultId)) {
+      await env.META.put(LEGACY_VAULTS_KEY, JSON.stringify(legacy.filter((vault) => vault.id !== vaultId)))
+    }
+  }
 }
 
 async function deleteVaultData(env: Env, vaultId: string): Promise<void> {
@@ -492,7 +520,13 @@ async function batch(
 }
 
 async function requireVault(env: Env, vaultId: string, tenant: string = OPERATOR_TENANT): Promise<VaultSummary> {
-  const vault = (await listVaults(env, tenant)).find((item) => item.id === vaultId)
+  // Direct key first: a vault created moments ago is readable even while a
+  // cached legacy list would still miss it.
+  let vault = await env.META.get<VaultSummary>(vaultKey(tenant, vaultId), 'json')
+  if (!vault && tenant === OPERATOR_TENANT) {
+    const legacy: VaultSummary[] = (await env.META.get(LEGACY_VAULTS_KEY, 'json')) ?? []
+    vault = legacy.find((item) => item.id === vaultId) ?? null
+  }
   if (!vault) {
     throw new HttpError(404, 'vault not found')
   }

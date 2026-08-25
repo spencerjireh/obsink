@@ -24,6 +24,15 @@ export class FakeKVNamespace {
   keys(): string[] {
     return Array.from(this.store.keys()).sort()
   }
+
+  async list(options?: { prefix?: string; cursor?: string }): Promise<any> {
+    const prefix = options?.prefix ?? ''
+    return {
+      keys: this.keys().filter((name) => name.startsWith(prefix)).map((name) => ({ name })),
+      list_complete: true,
+      cursor: undefined,
+    }
+  }
 }
 
 type StoredObject = { key: string; body: Uint8Array }

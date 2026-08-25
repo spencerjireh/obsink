@@ -89,7 +89,7 @@ Sync is observable through a `ProgressSink` trait (`Phase` / `FileStarted` / `Fi
 
 ## Worker storage keys
 
-- Operator vault list: `vaults`; account vault list: `vaults:<userId>`
+- One key per vault: `vault:<tenant>:<vaultId>` (`tenant` = `default` for the operator, else the user id); lists are `KV.list({prefix})`. The pre-accounts `vaults` array is still read for the operator. Single-key lists were a read-modify-write that lost updates under KV's 60 s edge cache (OBS-81)
 - Accounts: `user:<id>`, `user_email:<sha256(email)>`, `user_apple:<sub>`, `user_sessions:<userId>`; sessions: `session:<sha256(token)>` (TTL); one-time codes: `otp:<sha256(email)>` (TTL) and `otp_rl:<…>` (send cooldown)
 - Blob: `<vaultId>/<token>`
 - Version (on overwrite): `_versions/<vaultId>/<token>/<unixSeconds>`

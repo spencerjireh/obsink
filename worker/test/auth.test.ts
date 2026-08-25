@@ -316,7 +316,7 @@ describe('sessions and account deletion', () => {
     expect((await call(env, 'GET', '/auth/me', laptop)).status).toBe(401)
     expect(await internal.readManifest(env, id!)).toEqual({})
     const keys = (env.META as unknown as FakeKVNamespace).keys()
-    expect(keys.filter((k) => k.startsWith('user') || k.startsWith('session') || k.startsWith('vaults:'))).toEqual([])
+    expect(keys.filter((k) => k.startsWith('user') || k.startsWith('session') || k.startsWith('vault:'))).toEqual([])
   })
 
   it('the operator bearer has no session to revoke', async () => {
