@@ -81,12 +81,35 @@ final class SyncModel: ObservableObject {
     @Published var progress: SyncProgressInfo?
     @Published var failures: [MobileSyncFailure] = []
 
+    /// Remote files this device hasn't pulled yet — the stale-vault warning's
+    /// data source (spec §3.4, OBS-33). Refreshed on open and vault switch.
+    @Published var staleDownloads: Int = 0
+
     private var client: VaultClient?
     private let defaults: UserDefaults
+    private var resetFileProviderDomain = false
 
     init() {
         let defaults = UserDefaults(suiteName: Self.appGroup) ?? .standard
         self.defaults = defaults
+
+        // UI-test hook: OBSINK_UITEST_SEED carries a JSON [VaultEntry] to start
+        // from a known state without driving the Add Vault flow. Inert unless
+        // the harness sets it.
+        let env = ProcessInfo.processInfo.environment
+        let resetForUITest = env["OBSINK_UITEST_RESET"] == "1"
+        if resetForUITest {
+            defaults.removeObject(forKey: "vaultEntries")
+            defaults.removeObject(forKey: "activeVaultID")
+            defaults.removeObject(forKey: "vaultID")
+        }
+        self.resetFileProviderDomain = resetForUITest
+        if let seed = env["OBSINK_UITEST_SEED"],
+           let data = seed.data(using: .utf8),
+           let seeded = try? JSONDecoder().decode([VaultEntry].self, from: data) {
+            Self.saveEntries(seeded, active: seeded.first?.vaultID ?? "", to: defaults)
+        }
+
         self.entries = Self.loadEntries(from: defaults)
 
         if let active = defaults.string(forKey: "activeVaultID"), entries.contains(where: { $0.vaultID == active }) {
@@ -109,6 +132,7 @@ final class SyncModel: ObservableObject {
         loadActiveIntoFields()
         refreshPending()
         refreshStoredKey()
+        registerFileProviderDomain()
     }
 
     var activeEntry: VaultEntry? {
@@ -139,8 +163,10 @@ final class SyncModel: ObservableObject {
         conflicts = []
         choices = [:]
         previews = [:]
+        staleDownloads = 0
         refreshStoredKey()
         status = "Switched to \(activeEntry?.name ?? id)"
+        checkStale()
     }
 
     /// Add (or replace) a vault and make it active.
@@ -284,6 +310,7 @@ final class SyncModel: ObservableObject {
             : " · \(outcome.failures.count) failed"
         if outcome.completed {
             status = "Synced · ↑\(outcome.uploaded) ↓\(outcome.downloaded)\(failedSuffix)"
+            staleDownloads = 0
             // OBS-20/21: mirror the freshly synced vault into the item DB, then
             // tell the File Provider to re-enumerate so Obsidian/Files see it.
             try? ItemStore.shared.reconcileAfterSync(completed: true, vaultRoot: vaultDirectory)
@@ -316,11 +343,80 @@ final class SyncModel: ObservableObject {
         }
     }
 
+    // MARK: File Provider domain
+
+    /// The single ObSink File Provider domain (spec §11). Registered on launch
+    /// so synced files appear under "ObSink" in the Files app and Obsidian.
+    static let fpDomain = NSFileProviderDomain(
+        identifier: NSFileProviderDomainIdentifier(rawValue: "obsink"),
+        displayName: "ObSink"
+    )
+
+    /// Register the domain with the system. Adding an already-registered domain
+    /// is a no-op, so this is safe to call on every launch.
+    private func registerFileProviderDomain() {
+        let domain = Self.fpDomain
+        #if targetEnvironment(simulator)
+        // The simulator keeps third-party domains user-disabled (FP error
+        // -2011) with no UI to enable them; testing modes force the domain on.
+        // Simulator builds only — on device the user enables it in Files.
+        domain.testingModes = [.alwaysEnabled, .interactive]
+        #endif
+        let add = {
+            NSFileProviderManager.add(domain) { error in
+                if let error {
+                    NSLog("ObSink: File Provider domain registration failed: \(error.localizedDescription)")
+                }
+            }
+        }
+        if resetFileProviderDomain {
+            // UI-test reset: domain state survives app reinstall, so drop it
+            // before re-adding to start from a clean slate.
+            NSFileProviderManager.remove(domain) { _ in add() }
+        } else {
+            add()
+        }
+    }
+
     /// Ask the system to re-enumerate the working set so the File Provider picks
     /// up the DB changes from `reconcileAfterSync`. Errors are ignored: on a fresh
-    /// install or in the simulator the default domain may not be registered yet.
+    /// install the domain registration may still be in flight.
     private func signalFileProvider() {
-        NSFileProviderManager.default.signalEnumerator(for: .workingSet) { _ in }
+        NSFileProviderManager(for: Self.fpDomain)?.signalEnumerator(for: .workingSet) { _ in }
+    }
+
+    // MARK: Stale-vault warning (spec §3.4, OBS-33)
+
+    /// Compare the local working manifest against the server without syncing.
+    /// Runs only when the vault is fully configured with a stored key (no
+    /// passphrase prompt on open); quietly does nothing otherwise.
+    func checkStale() {
+        guard !busy, !vaultID.isEmpty else { return }
+        let config = MobileVaultConfig(
+            workerUrl: workerURL,
+            apiKey: apiKey,
+            vaultId: vaultID,
+            localPath: vaultDirectory.path
+        )
+        guard let key = KeychainStore.load(account: vaultID) else { return }
+        Task.detached { [weak self] in
+            // Retry a couple of times: a transient network error on open would
+            // otherwise silently suppress the warning until the next foreground.
+            var pending: UInt32 = 0
+            for attempt in 1...3 {
+                do {
+                    pending = try VaultClient(config: config, key: key).vaultStatus().pendingDownloads
+                    break
+                } catch {
+                    NSLog("ObSink: stale check attempt %d failed: %@", attempt, error.localizedDescription)
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                }
+            }
+            await MainActor.run { [weak self] in
+                guard let self, !self.busy else { return }
+                self.staleDownloads = Int(pending)
+            }
+        }
     }
 
     private func fail(_ error: Error) {

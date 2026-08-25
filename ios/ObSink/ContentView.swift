@@ -21,14 +21,24 @@ struct ContentView: View {
                                 Text(entry.name).tag(entry.vaultID)
                             }
                         }
+                        .accessibilityIdentifier("activeVaultPicker")
                     }
                     Button("Add Vault…") { showingAddVault = true }
+                        .accessibilityIdentifier("addVaultButton")
                 }
 
                 Section("Status") {
                     Text(model.status)
                         .font(.callout)
                         .foregroundStyle(model.status.hasPrefix("Error") ? .red : .primary)
+                        .accessibilityIdentifier("statusText")
+                    if model.staleDownloads > 0 {
+                        // Stale-vault warning (spec §3.4, OBS-33).
+                        Label("\(model.staleDownloads) file\(model.staleDownloads == 1 ? "" : "s") changed on another device. Sync before editing.", systemImage: "exclamationmark.triangle")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                            .accessibilityIdentifier("staleBanner")
+                    }
                     if model.pendingLocalChanges > 0 {
                         Label("\(model.pendingLocalChanges) local change\(model.pendingLocalChanges == 1 ? "" : "s") — Sync to push", systemImage: "arrow.up.circle")
                             .font(.caption)
@@ -41,6 +51,7 @@ struct ContentView: View {
                         }
                     }
                     .disabled(model.busy || model.vaultID.isEmpty || (model.passphrase.isEmpty && !model.hasStoredKey))
+                    .accessibilityIdentifier("syncButton")
 
                     if model.busy, let p = model.progress {
                         VStack(alignment: .leading, spacing: 4) {
@@ -59,6 +70,7 @@ struct ContentView: View {
                     LabeledField("API key", text: $model.apiKey)
                     LabeledField("Vault ID", text: $model.vaultID)
                     SecureField(model.hasStoredKey ? "Passphrase (saved — not needed)" : "Passphrase", text: $model.passphrase)
+                        .accessibilityIdentifier("passphraseField")
                     if model.hasStoredKey {
                         Text("Key saved in Keychain for this vault.")
                             .font(.caption).foregroundStyle(.green)
@@ -83,9 +95,11 @@ struct ContentView: View {
                                     set: { model.choices[conflict.path] = $0 }
                                 ))
                             }
+                            .accessibilityIdentifier("conflictRow")
                         }
                         Button("Apply Resolutions", action: model.resolve)
                             .disabled(model.busy)
+                            .accessibilityIdentifier("applyResolutionsButton")
                     }
                 }
 
@@ -108,8 +122,12 @@ struct ContentView: View {
                 }
             }
             .navigationTitle("ObSink")
+            .task { model.checkStale() }
             .onChange(of: scenePhase) { _, phase in
-                if phase == .active { model.refreshPending() }
+                if phase == .active {
+                    model.refreshPending()
+                    model.checkStale()
+                }
             }
             .sheet(isPresented: $showingAddVault) {
                 AddVaultView { model.addVault($0) }
@@ -120,10 +138,14 @@ struct ContentView: View {
 
 private struct LabeledField: View {
     let label: String
+    let identifier: String
     @Binding var text: String
 
-    init(_ label: String, text: Binding<String>) {
+    /// `identifier` defaults to the label; the Add Vault sheet passes distinct
+    /// ids so UI tests don't collide with the identical root-form fields.
+    init(_ label: String, text: Binding<String>, identifier: String? = nil) {
         self.label = label
+        self.identifier = identifier ?? label
         self._text = text
     }
 
@@ -133,6 +155,7 @@ private struct LabeledField: View {
             TextField(label, text: $text)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
+                .accessibilityIdentifier(identifier)
         }
     }
 }
@@ -151,6 +174,7 @@ private struct ConflictRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(conflict.path).font(.subheadline.weight(.semibold))
+                .accessibilityIdentifier("conflictRowTitle")
             VStack(alignment: .leading, spacing: 1) {
                 Text("This device · \(conflict.localSize)B · \(Self.formatter.string(from: Date(timeIntervalSince1970: TimeInterval(conflict.localModified))))")
                 Text("Other device · \(conflict.remoteSize)B · \(Self.formatter.string(from: Date(timeIntervalSince1970: TimeInterval(conflict.remoteModified))))")
@@ -183,6 +207,7 @@ private struct ConflictDetailView: View {
                     Text("Keep both").tag(MobileChoice.keepBoth)
                 }
                 .pickerStyle(.segmented)
+                .accessibilityIdentifier("winnerPicker")
             }
             Section("This device") {
                 previewText(model.previews[path]?.localText, deleted: model.previews[path]?.localDeleted ?? false)
@@ -234,8 +259,8 @@ struct AddVaultView: View {
         NavigationStack {
             Form {
                 Section("Server") {
-                    LabeledField("Worker URL", text: $workerURL)
-                    LabeledField("API key", text: $apiKey)
+                    LabeledField("Worker URL", text: $workerURL, identifier: "addVaultWorkerURL")
+                    LabeledField("API key", text: $apiKey, identifier: "addVaultAPIKey")
                 }
                 Section {
                     Picker("", selection: $mode) {
@@ -243,15 +268,17 @@ struct AddVaultView: View {
                     }
                     .pickerStyle(.segmented)
                     .labelsHidden()
+                    .accessibilityIdentifier("modePicker")
                 }
                 if mode == .create {
                     Section("New vault") {
-                        LabeledField("Vault name", text: $name)
+                        LabeledField("Vault name", text: $name, identifier: "addVaultName")
                     }
                 } else {
                     Section("Connect") {
                         Button("List vaults") { fetchVaults() }
                             .disabled(busy || apiKey.isEmpty)
+                            .accessibilityIdentifier("listVaultsButton")
                         if available.isEmpty {
                             Text("Tap “List vaults”, then pick one.")
                                 .font(.caption).foregroundStyle(.secondary)
@@ -262,19 +289,23 @@ struct AddVaultView: View {
                                     Text(v.name).tag(Optional(v.id))
                                 }
                             }
+                            .accessibilityIdentifier("vaultPicker")
                         }
                     }
                 }
                 Section {
                     SecureField("Passphrase", text: $passphrase)
+                        .accessibilityIdentifier("addVaultPassphraseField")
                 }
                 if !status.isEmpty {
                     Text(status).font(.caption).foregroundStyle(.red)
+                        .accessibilityIdentifier("addVaultStatusText")
                 }
                 Section {
                     Button(mode == .create ? "Create Vault" : "Connect Vault") { submit() }
                         .disabled(busy || workerURL.isEmpty || apiKey.isEmpty || passphrase.isEmpty
                                   || (mode == .create ? name.isEmpty : pickedVaultID == nil))
+                        .accessibilityIdentifier("addVaultSubmitButton")
                 }
             }
             .navigationTitle("Add Vault")

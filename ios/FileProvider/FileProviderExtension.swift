@@ -16,6 +16,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
     required init(domain: NSFileProviderDomain) {
         self.root = FileProviderPaths.vaultRoot
         super.init()
+        NSLog("ObSinkFP: init domain=%@", domain.identifier.rawValue)
     }
 
     func invalidate() {}
@@ -25,6 +26,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
         request _: NSFileProviderRequest,
         completionHandler: @escaping (NSFileProviderItem?, Error?) -> Void
     ) -> Progress {
+        NSLog("ObSinkFP: item(for:) %@", identifier.rawValue)
         if identifier == .rootContainer {
             completionHandler(FileProviderItem.root(), nil)
             return Progress()
@@ -182,7 +184,8 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
         for containerItemIdentifier: NSFileProviderItemIdentifier,
         request _: NSFileProviderRequest
     ) throws -> NSFileProviderEnumerator {
-        FileProviderEnumerator(container: containerItemIdentifier)
+        NSLog("ObSinkFP: enumerator(for:) %@", containerItemIdentifier.rawValue)
+        return FileProviderEnumerator(container: containerItemIdentifier)
     }
 
     // MARK: Helpers

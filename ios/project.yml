@@ -50,6 +50,11 @@ targets:
         CODE_SIGN_ENTITLEMENTS: ObSink/ObSink.entitlements
         ENABLE_USER_SCRIPT_SANDBOXING: NO
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+      configs:
+        # Debug adds the File Provider testing-mode entitlement so simulator
+        # runs can force-enable the domain (see SyncModel.registerFileProviderDomain).
+        Debug:
+          CODE_SIGN_ENTITLEMENTS: ObSink/ObSinkDebug.entitlements
 
   FileProviderExt:
     type: app-extension
@@ -64,6 +69,13 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.obsink.ios.FileProvider
         INFOPLIST_FILE: FileProvider/Info.plist
         CODE_SIGN_ENTITLEMENTS: FileProvider/FileProvider.entitlements
+        # Xcode's debug-dylib stub breaks NSExtension principal-class loading
+        # for the File Provider appex (extension launches, class never
+        # instantiated). Link the extension normally in all configs.
+        ENABLE_DEBUG_DYLIB: NO
+      configs:
+        Debug:
+          CODE_SIGN_ENTITLEMENTS: FileProvider/FileProviderDebug.entitlements
 
   ObSinkTests:
     type: bundle.unit-test
@@ -82,15 +94,30 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.obsink.ios.Tests
         GENERATE_INFOPLIST_FILE: YES
 
+  ObSinkUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: UITests
+    dependencies:
+      - target: ObSink
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.obsink.ios.UITests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_TARGET_NAME: ObSink
+
 schemes:
   ObSink:
     build:
       targets:
         ObSink: all
         ObSinkTests: [test]
+        ObSinkUITests: [test]
     run:
       config: Debug
     test:
       config: Debug
       targets:
         - ObSinkTests
+        - ObSinkUITests

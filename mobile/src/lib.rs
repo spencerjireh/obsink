@@ -9,7 +9,8 @@
 use std::{fs, path::Path, sync::{Arc, Mutex}};
 
 use obsink_core::{
-    complete_sync, decrypt, derive_key, derive_keys, prepare_sync, ApiClient, ConflictResolution,
+    build_working_manifest_for_path, complete_sync, decrypt, derive_key, derive_keys,
+    diff_local_and_remote, prepare_sync, ApiClient, ConflictResolution,
     ConflictResolutionChoice, CreateVaultRequest, KeyBytes, ProgressEvent, ProgressSink,
     SyncActionKind, SyncFailure, SyncPlan, SyncPhase, VaultConfig, VaultSummary,
 };
@@ -155,6 +156,15 @@ impl From<VaultSummary> for MobileVaultSummary {
             max_file_size: v.max_file_size,
         }
     }
+}
+
+/// Local-vs-remote diff counts without transferring anything — the data source
+/// for the stale-vault warning (spec §3.4, OBS-33). Mirrors desktop `get_status`.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MobileVaultStatus {
+    pub pending_uploads: u32,
+    pub pending_downloads: u32,
+    pub pending_conflicts: u32,
 }
 
 /// Read-only content preview of both sides of a conflict (OBS-25).
@@ -379,6 +389,22 @@ impl VaultClient {
             remote_deleted,
          })
      }
+
+    /// Diff the local working manifest against the remote one without touching
+    /// any files. Powers the stale-vault warning on open (spec §3.4, OBS-33).
+    pub fn vault_status(&self) -> Result<MobileVaultStatus, MobileError> {
+        let keys = derive_keys(&self.key);
+        let local = build_working_manifest_for_path(Path::new(&self.config.local_path), &keys)
+            .map_err(sync_err)?;
+        let remote =
+            block_on(ApiClient::new(self.config.clone()).get_manifest(&keys)).map_err(sync_err)?;
+        let diff = diff_local_and_remote(&local, &remote);
+        Ok(MobileVaultStatus {
+            pending_uploads: diff.upload.len() as u32,
+            pending_downloads: diff.download.len() as u32,
+            pending_conflicts: diff.conflicts.len() as u32,
+        })
+    }
 }
 
 /// Internal helpers (not FFI-exported) taking `Arc<dyn ProgressListener>` so
