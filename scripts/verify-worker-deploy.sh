@@ -104,9 +104,15 @@ assert_status 201
 VAULT_ID="$(json_eval 'data.vault.id')"
 printf 'Created vault %s\n' "$VAULT_ID"
 
-request_json GET "$BASE_URL/vaults"
-assert_status 200
-assert_json 'data.some((vault) => vault.id === args[0])' true "$VAULT_ID"
+# KV.list() is eventually consistent: a just-created vault can take a few
+# seconds to show up in GET /vaults (its own key is readable at once).
+for attempt in $(seq 1 30); do
+    request_json GET "$BASE_URL/vaults"
+    assert_status 200
+    if [[ "$(json_eval 'data.some((vault) => vault.id === args[0])' "$VAULT_ID")" == true ]]; then break; fi
+    [ "$attempt" = 30 ] && { echo "vault never appeared in GET /vaults"; exit 1; }
+    sleep 3
+done
 
 request_json GET "$BASE_URL/vaults/$VAULT_ID/manifest"
 assert_status 200
