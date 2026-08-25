@@ -8,7 +8,7 @@ ObSink shares one Rust core across every client. This page covers per-platform s
 | macOS desktop | ✅ Verified end-to-end | Tauri v2 menu-bar app; flows covered by `live_tests::desktop_flows_live` (`#[ignore]`) |
 | Linux desktop | 🟡 Builds in CI | `.deb` bundled in CI; keychain backend (libsecret) not yet wired |
 | Windows desktop | ⬜ Planned | Needs DPAPI/Credential Manager keychain |
-| iOS | 🟡 App + File Provider code-complete | DB-backed replicated FP (UUID IDs, change deltas), Keychain, multi-vault, conflict preview; needs E2E + TestFlight |
+| iOS | 🟡 E2E-verified on simulator | Mac↔iOS sync, conflicts, deletions, stale banner all pass on-simulator (`scripts/verify-ios-sim-e2e.sh`); Files/Obsidian visual check + TestFlight need a device |
 
 ## CLI
 
@@ -97,7 +97,35 @@ xcodebuild test -project ios/ObSink.xcodeproj -scheme ObSink -sdk iphonesimulato
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' CODE_SIGNING_ALLOWED=NO
 ```
 
-Remaining (Slice F — manual validation + signing): a visual check that synced files appear in the iOS Files app / Obsidian (OBS-19), Mac↔iOS end-to-end scenarios (OBS-29–34), and code-signing + TestFlight — set `DEVELOPMENT_TEAM` in `ios/project.yml` and upload via Xcode (the project uses automatic signing). See `docs/p4-plan.md` and spec.md §11 for the File Provider design.
+### Simulator E2E harness (OBS-29–34)
+
+The Mac↔iOS scenarios are automated end to end on a simulator:
+
+```bash
+# Uses .env (WORKER_URL, WORKER_API_KEY, DEVELOPMENT_TEAM) and a throwaway vault.
+OBSINK_SIM_NAME=obsink-e2e ./scripts/verify-ios-sim-e2e.sh
+```
+
+The CLI plays "device A" against the live Worker; XCUITest phases
+(`ios/UITests/SyncE2ETests.swift`) drive the app as "device B"; on-disk state is
+verified through the app-group container. Verified green: Add Vault → Connect,
+Mac→iOS and iOS→Mac propagation, deletions both ways, the stale-vault banner,
+all three conflict resolutions, and a realistic vault (`.obsidian/` config,
+nested folders, binary attachment) byte-identical on both sides.
+
+Known simulator limitation: the iOS 26 simulator's `fileproviderd` never
+instantiates third-party replicated File Provider extensions (libxpc assertion;
+the Files listing hangs at LOADING), so the harness reports the Files-app phase
+as WARN. Simulator builds force-enable the domain via
+`NSFileProviderDomain.testingModes` plus the Debug-only
+`com.apple.developer.fileprovider.testing-mode` entitlement; the extension also
+sets `ENABLE_DEBUG_DYLIB=NO` (the debug-dylib stub prevents principal-class
+loading).
+
+Remaining (device-only): the visual Files-app/Obsidian checkpoint (OBS-19) and
+code-signing + TestFlight — `DEVELOPMENT_TEAM` is read from the gitignored
+`.env` by `scripts/build-ios.sh` and substituted by XcodeGen. See
+`docs/p4-plan.md` and spec.md §11 for the File Provider design.
 
 ## Windows (planned)
 
