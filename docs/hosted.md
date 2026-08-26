@@ -30,8 +30,10 @@ the same name):
 | `RESEND_API_KEY` | [Resend](https://resend.com) API key. Absent = email sign-in returns `503` and clients hide the email option. |
 
 Resend's free tier covers a beta. Until you verify a sending domain, Resend
-only delivers from `onboarding@resend.dev` to the account owner's own address;
-verify a domain and set `MAIL_FROM` before inviting testers.
+only delivers from `onboarding@resend.dev` to the account owner's own address
+(403 otherwise); verify a domain and set `MAIL_FROM` before inviting testers.
+The live deployment sends from `ObSink <login@resend.spencerjireh.com>`
+(domain verified in the shared Resend account; key in the gitignored `.env`).
 
 Local development: `worker/.dev.vars` (gitignored) with
 `AUTH_DEV_RETURN_CODE=1` makes `/auth/email/start` return the code in the
@@ -55,7 +57,8 @@ response so no email is needed. Never set it on a deployed Worker.
 
 ```bash
 set -a; . ./.env; set +a
-APPLE_CLIENT_IDS=com.obsink.ios WORKER_NAME=obsink-worker KV_NAMESPACE_ID=… R2_BUCKET_NAME=obsink-files \
+APPLE_CLIENT_IDS=com.obsink.ios MAIL_FROM='ObSink <login@resend.spencerjireh.com>' \
+WORKER_NAME=obsink-worker KV_NAMESPACE_ID=… R2_BUCKET_NAME=obsink-files \
   bash scripts/render-worker-config.sh worker/wrangler.toml
 (cd worker && npx wrangler deploy)
 printf '%s' "$RESEND_API_KEY" | (cd worker && npx wrangler secret put RESEND_API_KEY)

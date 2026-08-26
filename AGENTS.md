@@ -115,6 +115,9 @@ RUST_LOG=obsink_core=debug cargo run -p obsink -- sync
   copy. Since P7 this Worker is also **ObSink Cloud**: accounts get their own
   session bearers and vault lists; the operator key only sees the legacy
   `vaults` list. Never hand `WORKER_API_KEY` to a tester — they sign up.
+- `RESEND_API_KEY` — Resend key for hosted email sign-in (shared with the
+  restaurant project; verified domain `resend.spencerjireh.com`, Worker var
+  `MAIL_FROM` set to `login@` on it). Set on the Worker 2026-08-26.
 - Clients store bearers in the OS keychain (service `obsink`, account
   `bearer:<worker url>`), never in `config.toml` / `app.json` / UserDefaults.
 
