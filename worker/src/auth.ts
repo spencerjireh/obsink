@@ -139,7 +139,14 @@ export async function emailStart(env: AuthEnv, rawEmail: unknown): Promise<Email
   await env.META.put(otpCooldownKey(emailHash), '1', { expirationTtl: OTP_RESEND_COOLDOWN_SECS })
 
   if (env.RESEND_API_KEY) {
-    await sendCodeEmail(env, email, code)
+    try {
+      await sendCodeEmail(env, email, code)
+    } catch (error) {
+      // A failed send must not burn the resend cooldown or leave a code behind.
+      await env.META.delete(otpKey(emailHash))
+      await env.META.delete(otpCooldownKey(emailHash))
+      throw error
+    }
   }
 
   return devReturn ? { sent: Boolean(env.RESEND_API_KEY), code } : { sent: true }
