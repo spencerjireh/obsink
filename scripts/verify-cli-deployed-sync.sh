@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
+#
+# Two-device CLI sync against a running server (operator bearer): create,
+# connect, propagate, and resolve a conflict; deletes the vault afterwards.
+#   set -a; . ./.env; set +a; scripts/verify-cli-deployed-sync.sh
 
 set -euo pipefail
 
-: "${WORKER_URL:?WORKER_URL is required}"
-: "${WORKER_API_KEY:?WORKER_API_KEY is required}"
+: "${OBSINK_SERVER_URL:?OBSINK_SERVER_URL is required}"
+: "${OBSINK_API_KEY:?OBSINK_API_KEY is required}"
 
 PASSPHRASE="${OBSINK_TEST_PASSPHRASE:-obsink-test-passphrase}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -23,6 +27,8 @@ VAULT_ID=''
 cleanup() {
   if [[ -n "$VAULT_ID" ]]; then
     security delete-generic-password -s obsink -a "$VAULT_ID" >/dev/null 2>&1 || true
+    curl -sS -o /dev/null -X DELETE -H "Authorization: Bearer $OBSINK_API_KEY" \
+      "${OBSINK_SERVER_URL%/}/vaults/$VAULT_ID" || true
   fi
   rm -rf "$TMP_DIR"
 }
@@ -44,8 +50,8 @@ run_cli() {
 
 printf 'Creating deployed test vault via CLI\n'
 run_cli "$HOME_ONE" init \
-  --worker-url "$WORKER_URL" \
-  --api-key "$WORKER_API_KEY" \
+  --server-url "$OBSINK_SERVER_URL" \
+  --api-key "$OBSINK_API_KEY" \
   --vault-name "verify-cli-$(date +%s)" \
   --directory "$VAULT_ONE" \
   --passphrase "$PASSPHRASE"
@@ -65,8 +71,8 @@ run_cli "$HOME_ONE" sync
 
 printf 'Connecting second device\n'
 run_cli "$HOME_TWO" connect \
-  --worker-url "$WORKER_URL" \
-  --api-key "$WORKER_API_KEY" \
+  --server-url "$OBSINK_SERVER_URL" \
+  --api-key "$OBSINK_API_KEY" \
   --vault-id "$VAULT_ID" \
   --directory "$VAULT_TWO" \
   --passphrase "$PASSPHRASE"

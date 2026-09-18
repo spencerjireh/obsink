@@ -9,8 +9,8 @@ pub mod types;
 
 pub use api_client::{ApiClient, ApiError};
 pub use auth::{
-    hosted_worker_url, normalize_worker_url, AuthClient, AuthError, AuthMethods, Capabilities,
-    EmailStartResult, Me, MeSession, MeUser, Session, SessionInfo, UserInfo, HOSTED_WORKER_URL,
+    normalize_server_url, AuthClient, AuthError, AuthMethods, Capabilities, EmailStartResult, Me,
+    MeSession, MeUser, Session, SessionInfo, UserInfo,
 };
 pub use crypto::{
     content_hmac, decrypt, decrypt_path, derive_key, derive_keys, encrypt, encrypt_path,

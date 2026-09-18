@@ -2,26 +2,38 @@ import FileProvider
 import Foundation
 
 /// One configured vault (spec §10 — multi-vault). The derived key lives in the
-/// Keychain under `account = vaultID`; the server bearer (ObSink Cloud session
-/// or self-hosted API key) under `bearer:<workerURL>`. `apiKey` is only decoded
-/// from pre-accounts configs and UI-test seeds, then moved into the Keychain.
+/// Keychain under `account = vaultID`; the server bearer (session token) under
+/// `bearer:<serverURL>`. Entries written before the server pivot used the
+/// `workerURL` key; decoding accepts both.
 struct VaultEntry: Codable, Identifiable, Equatable {
-    var workerURL: String
-    var apiKey: String? = nil
+    var serverURL: String
     var vaultID: String
     var name: String
     var id: String { vaultID }
 
-    init(workerURL: String, apiKey: String? = nil, vaultID: String, name: String) {
-        self.workerURL = workerURL
-        self.apiKey = apiKey
+    init(serverURL: String, vaultID: String, name: String) {
+        self.serverURL = serverURL
         self.vaultID = vaultID
         self.name = name
     }
 
-    /// True when the vault lives on ObSink Cloud (the hosted Worker).
-    var isHosted: Bool {
-        KeychainStore.canonicalWorkerURL(workerURL) == KeychainStore.canonicalWorkerURL(hostedWorkerUrl())
+    private enum CodingKeys: String, CodingKey {
+        case serverURL, workerURL, vaultID, name
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        serverURL = try c.decodeIfPresent(String.self, forKey: .serverURL)
+            ?? c.decode(String.self, forKey: .workerURL)
+        vaultID = try c.decode(String.self, forKey: .vaultID)
+        name = try c.decode(String.self, forKey: .name)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(serverURL, forKey: .serverURL)
+        try c.encode(vaultID, forKey: .vaultID)
+        try c.encode(name, forKey: .name)
     }
 }
 
@@ -80,14 +92,10 @@ final class SyncModel: ObservableObject {
     @Published var entries: [VaultEntry] = []
     @Published var activeVaultID: String = ""
 
-    @Published var workerURL: String = "https://"
-    /// Editable self-hosted API key for the active vault; mirrors the Keychain
-    /// bearer for `workerURL` (hidden for ObSink Cloud vaults).
-    @Published var apiKey: String = ""
+    @Published var serverURL: String = "https://"
     @Published var vaultID: String = ""
     @Published var passphrase: String = ""
-    /// Email of the ObSink Cloud account behind the active vault (nil when
-    /// self-hosted or signed out).
+    /// Email of the account behind the active vault (nil when signed out).
     @Published var accountEmail: String?
     @Published var hasBearer: Bool = false
 
@@ -113,9 +121,10 @@ final class SyncModel: ObservableObject {
         let defaults = UserDefaults(suiteName: Self.appGroup) ?? .standard
         self.defaults = defaults
 
-        // UI-test hook: OBSINK_UITEST_SEED carries a JSON [VaultEntry] to start
-        // from a known state without driving the Add Vault flow. Inert unless
-        // the harness sets it.
+        // UI-test hooks: OBSINK_UITEST_SEED carries a JSON [VaultEntry] to start
+        // from a known state without driving the Add Vault flow;
+        // OBSINK_UITEST_BEARER (+ _URL) seeds the server bearer into the
+        // Keychain the way a sign-in would. Inert unless the harness sets them.
         let env = ProcessInfo.processInfo.environment
         let resetForUITest = env["OBSINK_UITEST_RESET"] == "1"
         if resetForUITest {
@@ -129,30 +138,17 @@ final class SyncModel: ObservableObject {
            let seeded = try? JSONDecoder().decode([VaultEntry].self, from: data) {
             Self.saveEntries(seeded, active: seeded.first?.vaultID ?? "", to: defaults)
         }
+        if let bearer = env["OBSINK_UITEST_BEARER"], let url = env["OBSINK_UITEST_BEARER_URL"],
+           !bearer.isEmpty, !url.isEmpty {
+            KeychainStore.saveBearer(bearer, serverURL: url)
+        }
 
         self.entries = Self.loadEntries(from: defaults)
-        if Self.migrateBearers(&self.entries) {
-            Self.saveEntries(self.entries, active: defaults.string(forKey: "activeVaultID") ?? "", to: defaults)
-        }
 
         if let active = defaults.string(forKey: "activeVaultID"), entries.contains(where: { $0.vaultID == active }) {
             self.activeVaultID = active
         } else if let first = entries.first {
             self.activeVaultID = first.vaultID
-        } else if let oldID = defaults.string(forKey: "vaultID"), !oldID.isEmpty {
-            // Migrate a legacy single-vault config into the multi-vault list.
-            var entry = VaultEntry(
-                workerURL: defaults.string(forKey: "workerURL") ?? "https://",
-                apiKey: defaults.string(forKey: "apiKey"),
-                vaultID: oldID,
-                name: oldID
-            )
-            var migrating = [entry]
-            _ = Self.migrateBearers(&migrating)
-            entry = migrating[0]
-            self.entries = [entry]
-            self.activeVaultID = oldID
-            Self.saveEntries(self.entries, active: self.activeVaultID, to: defaults)
         }
 
         loadActiveIntoFields()
@@ -165,68 +161,48 @@ final class SyncModel: ObservableObject {
         entries.first { $0.vaultID == activeVaultID }
     }
 
-    var activeIsHosted: Bool { activeEntry?.isHosted ?? false }
-
-    /// Bearer for the active vault's Worker: Keychain first, then the field.
+    /// Bearer for the active vault's server (Keychain), empty when signed out.
     var bearer: String {
-        KeychainStore.loadBearer(workerURL: workerURL) ?? apiKey
-    }
-
-    /// Move any plaintext `apiKey` (legacy config / UI-test seed) into the
-    /// Keychain. Returns true when the entry list changed and must be re-saved.
-    static func migrateBearers(_ entries: inout [VaultEntry]) -> Bool {
-        var changed = false
-        for idx in entries.indices {
-            if let key = entries[idx].apiKey, !key.isEmpty {
-                KeychainStore.saveBearer(key, workerURL: entries[idx].workerURL)
-                entries[idx].apiKey = nil
-                changed = true
-            }
-        }
-        return changed
+        KeychainStore.loadBearer(serverURL: serverURL) ?? ""
     }
 
     /// Load the active vault's connection details into the editable fields.
     private func loadActiveIntoFields() {
         if let entry = activeEntry {
-            workerURL = entry.workerURL
-            apiKey = entry.isHosted ? "" : (KeychainStore.loadBearer(workerURL: entry.workerURL) ?? "")
+            serverURL = entry.serverURL
             vaultID = entry.vaultID
         } else {
-            workerURL = "https://"
-            apiKey = ""
+            serverURL = "https://"
             vaultID = ""
         }
         passphrase = ""
-        hasBearer = KeychainStore.loadBearer(workerURL: workerURL) != nil
+        hasBearer = KeychainStore.loadBearer(serverURL: serverURL) != nil
         accountEmail = nil
         refreshAccount()
     }
 
-    /// Resolve the ObSink Cloud account behind the active vault (for the
-    /// "signed in as" line). No-op for self-hosted vaults.
+    /// Resolve the account behind the active vault (for the "signed in as"
+    /// line). The operator bearer has no account; the line stays generic.
     func refreshAccount() {
-        guard activeIsHosted, let token = KeychainStore.loadBearer(workerURL: workerURL),
-              token.hasPrefix("os_") else { return }
-        let url = workerURL
+        guard let token = KeychainStore.loadBearer(serverURL: serverURL) else { return }
+        let url = serverURL
         Task.detached { [weak self] in
-            let email = (try? authMe(workerUrl: url, token: token))?.email
+            let email = (try? authMe(serverUrl: url, token: token))?.email
             await MainActor.run { [weak self] in
-                guard let self, self.workerURL == url else { return }
+                guard let self, self.serverURL == url else { return }
                 self.accountEmail = email
             }
         }
     }
 
-    /// Sign out of the active vault's Worker: revoke the Cloud session (best
-    /// effort) and forget the bearer. Vault entries stay; sync needs a sign-in.
+    /// Sign out of the active vault's server: revoke the session (best effort)
+    /// and forget the bearer. Vault entries stay; sync needs a sign-in.
     func signOut() {
-        let url = workerURL
-        if let token = KeychainStore.loadBearer(workerURL: url), token.hasPrefix("os_") {
-            Task.detached { try? authLogout(workerUrl: url, token: token) }
+        let url = serverURL
+        if let token = KeychainStore.loadBearer(serverURL: url) {
+            Task.detached { try? authLogout(serverUrl: url, token: token) }
         }
-        KeychainStore.deleteBearer(workerURL: url)
-        apiKey = ""
+        KeychainStore.deleteBearer(serverURL: url)
         accountEmail = nil
         hasBearer = false
         status = "Signed out"
@@ -279,16 +255,12 @@ final class SyncModel: ObservableObject {
         defaults.set(active, forKey: "activeVaultID")
     }
 
-    /// Persist the active vault's current fields: URL into the entry list, a
-    /// (self-hosted) API key into the Keychain.
+    /// Persist the active vault's current fields (URL into the entry list).
     func persistConfig() {
         guard let idx = entries.firstIndex(where: { $0.vaultID == activeVaultID }) else { return }
-        entries[idx].workerURL = workerURL
+        entries[idx].serverURL = serverURL
         Self.saveEntries(entries, active: activeVaultID, to: defaults)
-        if !activeIsHosted, !apiKey.isEmpty, KeychainStore.loadBearer(workerURL: workerURL) != apiKey {
-            KeychainStore.saveBearer(apiKey, workerURL: workerURL)
-        }
-        hasBearer = KeychainStore.loadBearer(workerURL: workerURL) != nil
+        hasBearer = KeychainStore.loadBearer(serverURL: serverURL) != nil
     }
 
     // MARK: Sync state helpers
@@ -325,7 +297,7 @@ final class SyncModel: ObservableObject {
         failures = []
 
         let config = MobileVaultConfig(
-            workerUrl: workerURL,
+            serverUrl: serverURL,
             apiKey: bearer,
             vaultId: vaultID,
             localPath: vaultDirectory.path
@@ -476,7 +448,7 @@ final class SyncModel: ObservableObject {
     func checkStale() {
         guard !busy, !vaultID.isEmpty else { return }
         let config = MobileVaultConfig(
-            workerUrl: workerURL,
+            serverUrl: serverURL,
             apiKey: bearer,
             vaultId: vaultID,
             localPath: vaultDirectory.path

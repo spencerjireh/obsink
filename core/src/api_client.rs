@@ -33,9 +33,9 @@ pub enum ApiError {
     },
     #[error("crypto error: {0}")]
     Crypto(#[from] CryptoError),
-    /// 401: the bearer (self-hosted `API_KEY` or a hosted session token) was
+    /// 401: the bearer (a session token or the operator `API_KEY`) was
     /// rejected — the session may have been revoked or expired.
-    #[error("unauthorized: sign in again or check the API key")]
+    #[error("unauthorized: sign in again")]
     Unauthorized,
     #[error("unexpected status {status}: {body}")]
     UnexpectedStatus { status: StatusCode, body: String },
@@ -79,7 +79,7 @@ impl ApiClient {
     }
 
     pub fn vault_url(&self, suffix: &str) -> String {
-        let base = self.config.worker_url.trim_end_matches('/');
+        let base = self.config.server_url.trim_end_matches('/');
         let suffix = suffix.trim_start_matches('/');
         if suffix.is_empty() {
             return format!("{base}/vaults/{}", self.config.vault_id);
@@ -88,7 +88,7 @@ impl ApiClient {
     }
 
     fn root_url(&self, suffix: &str) -> String {
-        let base = self.config.worker_url.trim_end_matches('/');
+        let base = self.config.server_url.trim_end_matches('/');
         format!("{base}/{}", suffix.trim_start_matches('/'))
     }
 
@@ -277,7 +277,7 @@ mod tests {
 
     fn config(base_url: String) -> VaultConfig {
         VaultConfig {
-            worker_url: base_url,
+            server_url: base_url,
             api_key: "token".to_string(),
             vault_id: "vault_123".to_string(),
             local_path: ".".to_string(),

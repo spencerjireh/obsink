@@ -1,10 +1,10 @@
-//! Account sign-in for the hosted ("ObSink Cloud") backend.
+//! Account sign-in against an ObSink server.
 //!
-//! The Worker offers two ways to obtain a session bearer: an emailed one-time
-//! code (all platforms) and Sign in with Apple (iOS). The resulting `os_…`
-//! token is stored by the client in the OS keychain and used as
+//! The server offers two ways to obtain a session bearer: an emailed one-time
+//! code (all platforms) and Sign in with Apple (iOS). The resulting token is
+//! stored by the client in the OS keychain and used as
 //! [`VaultConfig::api_key`](crate::VaultConfig) — the sync engine does not
-//! distinguish a session from a self-hosted `API_KEY`.
+//! distinguish a session from the operator `API_KEY`.
 
 use std::time::Duration;
 
@@ -12,26 +12,18 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// The operator-run Worker every client offers as "ObSink Cloud". Overridable
-/// per process with `OBSINK_HOSTED_URL` (harnesses, staging).
-pub const HOSTED_WORKER_URL: &str = "https://obsink-worker.spencer-080.workers.dev";
-
-/// Resolve the hosted Worker URL, honouring `OBSINK_HOSTED_URL`.
-pub fn hosted_worker_url() -> String {
-    std::env::var("OBSINK_HOSTED_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| HOSTED_WORKER_URL.to_string())
-}
-
-/// Normalise a Worker URL so the same server always maps to the same
+/// Normalise a server URL so the same server always maps to the same
 /// keychain entry: trimmed, no trailing slash, lowercase scheme+host.
-pub fn normalize_worker_url(url: &str) -> String {
+pub fn normalize_server_url(url: &str) -> String {
     let trimmed = url.trim().trim_end_matches('/');
     match trimmed.split_once("://") {
         Some((scheme, rest)) => {
             let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
-            let mut out = format!("{}://{}", scheme.to_ascii_lowercase(), host.to_ascii_lowercase());
+            let mut out = format!(
+                "{}://{}",
+                scheme.to_ascii_lowercase(),
+                host.to_ascii_lowercase()
+            );
             if !path.is_empty() {
                 out.push('/');
                 out.push_str(path);
@@ -51,7 +43,7 @@ pub enum AuthError {
     Server { status: StatusCode, message: String },
 }
 
-/// What sign-in methods a Worker offers (`GET /`).
+/// What sign-in methods a server offers (`GET /`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capabilities {
     pub service: String,
@@ -123,18 +115,18 @@ pub struct AuthClient {
 }
 
 impl AuthClient {
-    pub fn new(worker_url: &str) -> Self {
+    pub fn new(server_url: &str) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {
-            base: normalize_worker_url(worker_url),
+            base: normalize_server_url(server_url),
             client,
         }
     }
 
-    pub fn worker_url(&self) -> &str {
+    pub fn server_url(&self) -> &str {
         &self.base
     }
 
@@ -247,7 +239,9 @@ impl AuthClient {
     }
 }
 
-async fn parse<T: serde::de::DeserializeOwned>(response: reqwest::Response) -> Result<T, AuthError> {
+async fn parse<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+) -> Result<T, AuthError> {
     let status = response.status();
     if status.is_success() {
         return Ok(response.json().await?);
@@ -285,16 +279,16 @@ async fn server_error(status: StatusCode, response: reqwest::Response) -> AuthEr
 mod tests {
     use httpmock::{Method::DELETE, Method::GET, Method::POST, MockServer};
 
-    use super::{normalize_worker_url, AuthClient, AuthError};
+    use super::{normalize_server_url, AuthClient, AuthError};
 
     #[test]
     fn normalizes_urls() {
         assert_eq!(
-            normalize_worker_url(" HTTPS://Example.Workers.dev/ "),
-            "https://example.workers.dev"
+            normalize_server_url(" HTTPS://Example.ObSink.test/ "),
+            "https://example.obsink.test"
         );
         assert_eq!(
-            normalize_worker_url("https://x.dev/Path/"),
+            normalize_server_url("https://x.dev/Path/"),
             "https://x.dev/Path"
         );
     }
@@ -307,7 +301,8 @@ mod tests {
                 when.method(POST)
                     .path("/auth/email/start")
                     .json_body(serde_json::json!({ "email": "a@b.co" }));
-                then.status(200).json_body(serde_json::json!({ "sent": true }));
+                then.status(200)
+                    .json_body(serde_json::json!({ "sent": true }));
             })
             .await;
         let verify = server
@@ -341,7 +336,10 @@ mod tests {
 
         let client = AuthClient::new(&server.base_url());
         assert!(client.email_start("a@b.co").await.unwrap().sent);
-        let session = client.email_verify("a@b.co", "123456", "cli").await.unwrap();
+        let session = client
+            .email_verify("a@b.co", "123456", "cli")
+            .await
+            .unwrap();
         assert_eq!(session.token, "os_abc");
         let me_response = client.me("os_abc").await.unwrap();
         assert_eq!(me_response.sessions[0].device_name, "cli");
@@ -364,7 +362,10 @@ mod tests {
             })
             .await;
         let client = AuthClient::new(&server.base_url());
-        let error = client.email_verify("a@b.co", "000000", "cli").await.unwrap_err();
+        let error = client
+            .email_verify("a@b.co", "000000", "cli")
+            .await
+            .unwrap_err();
         match error {
             AuthError::Server { status, message } => {
                 assert_eq!(status.as_u16(), 401);

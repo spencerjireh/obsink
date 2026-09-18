@@ -6,14 +6,17 @@
 //! `VaultClient` object holds the derived key and the pending sync plan between
 //! the `prepare` and `complete` phases, mirroring the desktop flow.
 
-use std::{fs, path::Path, sync::{Arc, Mutex}};
+use std::{
+    fs,
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 use obsink_core::{
     build_working_manifest_for_path, complete_sync, decrypt, derive_key, derive_keys,
-    diff_local_and_remote, hosted_worker_url as core_hosted_worker_url, normalize_worker_url,
-    prepare_sync, ApiClient, AuthClient, ConflictResolution, ConflictResolutionChoice,
-    CreateVaultRequest, KeyBytes, ProgressEvent, ProgressSink, SyncActionKind, SyncFailure,
-    SyncPlan, SyncPhase, VaultConfig, VaultSummary,
+    diff_local_and_remote, normalize_server_url, prepare_sync, ApiClient, AuthClient,
+    ConflictResolution, ConflictResolutionChoice, CreateVaultRequest, KeyBytes, ProgressEvent,
+    ProgressSink, SyncActionKind, SyncFailure, SyncPhase, SyncPlan, VaultConfig, VaultSummary,
 };
 
 uniffi::setup_scaffolding!();
@@ -37,7 +40,7 @@ fn sync_err(error: impl std::fmt::Display) -> MobileError {
 /// Connection details for one vault, supplied by the host app.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct MobileVaultConfig {
-    pub worker_url: String,
+    pub server_url: String,
     pub api_key: String,
     pub vault_id: String,
     pub local_path: String,
@@ -46,7 +49,7 @@ pub struct MobileVaultConfig {
 impl From<MobileVaultConfig> for VaultConfig {
     fn from(value: MobileVaultConfig) -> Self {
         VaultConfig {
-            worker_url: value.worker_url,
+            server_url: value.server_url,
             api_key: value.api_key,
             vault_id: value.vault_id,
             local_path: value.local_path,
@@ -93,11 +96,28 @@ pub enum MobileSyncPhase {
 /// callback during a sync.
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum MobileProgressEvent {
-    Phase { phase: MobileSyncPhase },
-    FileStarted { path: String, kind: MobileActionKind, index: u32, total: u32 },
-    FileCompleted { path: String, bytes: u64 },
-    FileFailed { path: String, error: String },
-    Done { uploaded: u32, downloaded: u32, failed: u32 },
+    Phase {
+        phase: MobileSyncPhase,
+    },
+    FileStarted {
+        path: String,
+        kind: MobileActionKind,
+        index: u32,
+        total: u32,
+    },
+    FileCompleted {
+        path: String,
+        bytes: u64,
+    },
+    FileFailed {
+        path: String,
+        error: String,
+    },
+    Done {
+        uploaded: u32,
+        downloaded: u32,
+        failed: u32,
+    },
 }
 
 /// A conflict the host must resolve before the sync can complete.
@@ -178,10 +198,10 @@ pub struct MobileConflictPreview {
     pub remote_deleted: bool,
 }
 
-/// A Worker-only config (no vault id / local path) for list/create calls.
-fn worker_only(worker_url: String, api_key: String) -> VaultConfig {
+/// A server-only config (no vault id / local path) for list/create calls.
+fn server_only(server_url: String, api_key: String) -> VaultConfig {
     VaultConfig {
-        worker_url,
+        server_url,
         api_key,
         vault_id: String::new(),
         local_path: String::new(),
@@ -196,18 +216,21 @@ pub fn derive_master_key(passphrase: String, vault_id: String) -> Result<Vec<u8>
         .map_err(sync_err)
 }
 
-/// List vaults reachable at a Worker (OBS-28).
+/// List vaults reachable at a server (OBS-28).
 #[uniffi::export]
-pub fn list_vaults(worker_url: String, api_key: String) -> Result<Vec<MobileVaultSummary>, MobileError> {
-    let vaults =
-        block_on(ApiClient::new(worker_only(worker_url, api_key)).list_vaults()).map_err(sync_err)?;
+pub fn list_vaults(
+    server_url: String,
+    api_key: String,
+) -> Result<Vec<MobileVaultSummary>, MobileError> {
+    let vaults = block_on(ApiClient::new(server_only(server_url, api_key)).list_vaults())
+        .map_err(sync_err)?;
     Ok(vaults.into_iter().map(MobileVaultSummary::from).collect())
 }
 
-/// Create a new vault at a Worker; returns its id + metadata (OBS-28).
+/// Create a new vault at a server; returns its id + metadata (OBS-28).
 #[uniffi::export]
 pub fn create_vault(
-    worker_url: String,
+    server_url: String,
     api_key: String,
     name: String,
 ) -> Result<MobileVaultSummary, MobileError> {
@@ -216,31 +239,24 @@ pub fn create_vault(
         max_file_size: 50 * 1024 * 1024,
     };
     let response =
-        block_on(ApiClient::new(worker_only(worker_url, api_key)).create_vault(&request))
+        block_on(ApiClient::new(server_only(server_url, api_key)).create_vault(&request))
             .map_err(sync_err)?;
     Ok(response.vault.into())
 }
 
-// --- Accounts (hosted mode) ------------------------------------------------
+// --- Accounts ---------------------------------------------------------------
 
-/// The Worker every client offers as "ObSink Cloud".
+/// Canonical form of a server URL (the keychain account for its bearer).
 #[uniffi::export]
-pub fn hosted_worker_url() -> String {
-    core_hosted_worker_url()
+pub fn canonical_server_url(url: String) -> String {
+    normalize_server_url(&url)
 }
 
-/// Canonical form of a Worker URL (the keychain account for its bearer).
-#[uniffi::export]
-pub fn canonical_worker_url(url: String) -> String {
-    normalize_worker_url(&url)
-}
-
-/// Which sign-in methods a Worker offers (`GET /`).
+/// Which sign-in methods a server offers (`GET /`).
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct MobileCapabilities {
     pub email: bool,
     pub apple: bool,
-    pub api_key: bool,
 }
 
 /// A signed-in session: `token` is the bearer to store in the Keychain.
@@ -269,31 +285,30 @@ pub struct MobileDevice {
 }
 
 #[uniffi::export]
-pub fn auth_capabilities(worker_url: String) -> Result<MobileCapabilities, MobileError> {
-    let caps = block_on(AuthClient::new(&worker_url).capabilities()).map_err(sync_err)?;
+pub fn auth_capabilities(server_url: String) -> Result<MobileCapabilities, MobileError> {
+    let caps = block_on(AuthClient::new(&server_url).capabilities()).map_err(sync_err)?;
     Ok(MobileCapabilities {
         email: caps.auth.email,
         apple: caps.auth.apple,
-        api_key: caps.auth.api_key,
     })
 }
 
 /// Send a one-time code to `email`. Returns the code only against a dev
 /// server (`AUTH_DEV_RETURN_CODE=1`), otherwise `None`.
 #[uniffi::export]
-pub fn auth_email_start(worker_url: String, email: String) -> Result<Option<String>, MobileError> {
-    let result = block_on(AuthClient::new(&worker_url).email_start(&email)).map_err(sync_err)?;
+pub fn auth_email_start(server_url: String, email: String) -> Result<Option<String>, MobileError> {
+    let result = block_on(AuthClient::new(&server_url).email_start(&email)).map_err(sync_err)?;
     Ok(result.code)
 }
 
 #[uniffi::export]
 pub fn auth_email_verify(
-    worker_url: String,
+    server_url: String,
     email: String,
     code: String,
     device_name: String,
 ) -> Result<MobileSession, MobileError> {
-    let session = block_on(AuthClient::new(&worker_url).email_verify(&email, &code, &device_name))
+    let session = block_on(AuthClient::new(&server_url).email_verify(&email, &code, &device_name))
         .map_err(sync_err)?;
     Ok(to_mobile_session(session))
 }
@@ -303,12 +318,12 @@ pub fn auth_email_verify(
 /// authorization only).
 #[uniffi::export]
 pub fn auth_apple(
-    worker_url: String,
+    server_url: String,
     identity_token: String,
     device_name: String,
     email: Option<String>,
 ) -> Result<MobileSession, MobileError> {
-    let session = block_on(AuthClient::new(&worker_url).apple_sign_in(
+    let session = block_on(AuthClient::new(&server_url).apple_sign_in(
         &identity_token,
         &device_name,
         email.as_deref(),
@@ -318,9 +333,11 @@ pub fn auth_apple(
 }
 
 #[uniffi::export]
-pub fn auth_me(worker_url: String, token: String) -> Result<MobileAccount, MobileError> {
-    let me = block_on(AuthClient::new(&worker_url).me(&token)).map_err(sync_err)?;
-    let user = me.user.ok_or_else(|| sync_err("this credential is a self-hosted API key, not an account"))?;
+pub fn auth_me(server_url: String, token: String) -> Result<MobileAccount, MobileError> {
+    let me = block_on(AuthClient::new(&server_url).me(&token)).map_err(sync_err)?;
+    let user = me
+        .user
+        .ok_or_else(|| sync_err("this credential is the operator API key, not an account"))?;
     Ok(MobileAccount {
         user_id: user.id,
         email: user.email,
@@ -339,21 +356,25 @@ pub fn auth_me(worker_url: String, token: String) -> Result<MobileAccount, Mobil
 
 /// Revoke the current session (sign out this device).
 #[uniffi::export]
-pub fn auth_logout(worker_url: String, token: String) -> Result<(), MobileError> {
-    block_on(AuthClient::new(&worker_url).logout(&token)).map_err(sync_err)
+pub fn auth_logout(server_url: String, token: String) -> Result<(), MobileError> {
+    block_on(AuthClient::new(&server_url).logout(&token)).map_err(sync_err)
 }
 
 /// Delete the account and every vault it owns. Irreversible.
 #[uniffi::export]
-pub fn auth_delete_account(worker_url: String, token: String) -> Result<(), MobileError> {
-    block_on(AuthClient::new(&worker_url).delete_account(&token)).map_err(sync_err)
+pub fn auth_delete_account(server_url: String, token: String) -> Result<(), MobileError> {
+    block_on(AuthClient::new(&server_url).delete_account(&token)).map_err(sync_err)
 }
 
 /// Delete a vault (and its server-side blobs) the bearer owns.
 #[uniffi::export]
-pub fn delete_vault(worker_url: String, api_key: String, vault_id: String) -> Result<(), MobileError> {
+pub fn delete_vault(
+    server_url: String,
+    api_key: String,
+    vault_id: String,
+) -> Result<(), MobileError> {
     let config = VaultConfig {
-        worker_url,
+        server_url,
         api_key,
         vault_id,
         local_path: String::new(),
@@ -410,21 +431,32 @@ fn to_mobile_event(event: ProgressEvent) -> MobileProgressEvent {
         ProgressEvent::Phase(phase) => MobileProgressEvent::Phase {
             phase: to_mobile_phase(phase),
         },
-        ProgressEvent::FileStarted { path, kind, index, total } => MobileProgressEvent::FileStarted {
+        ProgressEvent::FileStarted {
+            path,
+            kind,
+            index,
+            total,
+        } => MobileProgressEvent::FileStarted {
             path,
             kind: to_mobile_kind(kind),
             index: index as u32,
             total: total as u32,
         },
-        ProgressEvent::FileCompleted { path, bytes } => MobileProgressEvent::FileCompleted { path, bytes },
-        ProgressEvent::FileFailed { path, error } => MobileProgressEvent::FileFailed { path, error },
-        ProgressEvent::Done { uploaded, downloaded, failed } => {
-            MobileProgressEvent::Done {
-                uploaded: uploaded as u32,
-                downloaded: downloaded as u32,
-                failed: failed as u32,
-            }
+        ProgressEvent::FileCompleted { path, bytes } => {
+            MobileProgressEvent::FileCompleted { path, bytes }
         }
+        ProgressEvent::FileFailed { path, error } => {
+            MobileProgressEvent::FileFailed { path, error }
+        }
+        ProgressEvent::Done {
+            uploaded,
+            downloaded,
+            failed,
+        } => MobileProgressEvent::Done {
+            uploaded: uploaded as u32,
+            downloaded: downloaded as u32,
+            failed: failed as u32,
+        },
     }
 }
 
@@ -525,8 +557,8 @@ impl VaultClient {
         let (remote_text, remote_deleted) = if conflict.remote.deleted {
             (String::new(), true)
         } else {
-            let blob =
-                block_on(ApiClient::new(self.config.clone()).get_file(&path, &keys)).map_err(sync_err)?;
+            let blob = block_on(ApiClient::new(self.config.clone()).get_file(&path, &keys))
+                .map_err(sync_err)?;
             let bytes = decrypt(&keys.content_enc, &blob).map_err(sync_err)?;
             (String::from_utf8_lossy(&bytes).into_owned(), false)
         };
@@ -537,8 +569,8 @@ impl VaultClient {
             remote_text,
             local_deleted: conflict.local.deleted,
             remote_deleted,
-         })
-     }
+        })
+    }
 
     /// Diff the local working manifest against the remote one without touching
     /// any files. Powers the stale-vault warning on open (spec §3.4, OBS-33).

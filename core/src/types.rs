@@ -66,7 +66,7 @@ pub struct SyncResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VaultConfig {
-    pub worker_url: String,
+    pub server_url: String,
     pub api_key: String,
     pub vault_id: String,
     pub local_path: String,

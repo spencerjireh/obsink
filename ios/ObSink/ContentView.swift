@@ -66,27 +66,25 @@ struct ContentView: View {
                     }
                 }
 
-                Section(model.activeIsHosted ? "ObSink Cloud" : "Vault") {
-                    if model.activeIsHosted {
-                        if model.hasBearer {
-                            Text(model.accountEmail.map { "Signed in as \($0)" } ?? "Signed in")
-                                .font(.callout)
-                                .accessibilityIdentifier("accountText")
-                            Button("Sign out", role: .destructive) { model.signOut() }
-                                .disabled(model.busy)
-                                .accessibilityIdentifier("signOutButton")
-                        } else {
-                            Text("Signed out — add the vault again to sign in.")
-                                .font(.caption).foregroundStyle(.orange)
-                        }
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Vault ID").font(.caption).foregroundStyle(.secondary)
-                            Text(model.vaultID).font(.caption.monospaced()).textSelection(.enabled)
-                        }
+                Section("Account") {
+                    if model.hasBearer {
+                        Text(model.accountEmail.map { "Signed in as \($0)" } ?? "Signed in")
+                            .font(.callout)
+                            .accessibilityIdentifier("accountText")
+                        Button("Sign out", role: .destructive) { model.signOut() }
+                            .disabled(model.busy)
+                            .accessibilityIdentifier("signOutButton")
                     } else {
-                        LabeledField("Worker URL", text: $model.workerURL)
-                        SecureLabeledField("API key", text: $model.apiKey)
-                        LabeledField("Vault ID", text: $model.vaultID)
+                        Text("Signed out — add the vault again to sign in.")
+                            .font(.caption).foregroundStyle(.orange)
+                    }
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Server").font(.caption).foregroundStyle(.secondary)
+                        Text(model.serverURL).font(.caption.monospaced()).textSelection(.enabled)
+                    }
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Vault ID").font(.caption).foregroundStyle(.secondary)
+                        Text(model.vaultID).font(.caption.monospaced()).textSelection(.enabled)
                     }
                     SecureField(model.hasStoredKey ? "Passphrase (saved — not needed)" : "Passphrase", text: $model.passphrase)
                         .accessibilityIdentifier("passphraseField")
@@ -270,18 +268,20 @@ private struct ConflictDetailView: View {
     }
 }
 
-/// Add a vault: pick a backend (ObSink Cloud with an account, or a self-hosted
-/// Worker with an API key), then create a new vault or connect to an existing
-/// one (spec §12.1/§12.2). The bearer goes to the Keychain under the Worker
-/// URL; the derived vault key under the vault ID.
+/// Add a vault: enter the server URL, sign in (Sign in with Apple or an
+/// emailed code), then create a new vault or connect to an existing one
+/// (spec §12.1/§12.2). The bearer goes to the Keychain under the server URL;
+/// the derived vault key under the vault ID.
 struct AddVaultView: View {
     var onAdd: (VaultEntry) -> Void
     @Environment(\.dismiss) private var dismiss
 
-    @State private var backend: Backend = .cloud
+    private static let lastServerKey = "lastServerURL"
+
     @State private var mode: Mode = .create
-    @State private var workerURL = "https://"
-    @State private var apiKey = ""
+    @State private var serverURL: String = {
+        (UserDefaults(suiteName: SyncModel.appGroup) ?? .standard).string(forKey: AddVaultView.lastServerKey) ?? "https://"
+    }()
     @State private var name = ""
     @State private var passphrase = ""
     @State private var available: [MobileVaultSummary] = []
@@ -289,35 +289,29 @@ struct AddVaultView: View {
     @State private var status = ""
     @State private var busy = false
 
-    // ObSink Cloud sign-in state.
-    @State private var cloudEmail: String? = nil
-    @State private var cloudSignedIn = false
+    // Sign-in state for the typed server.
+    @State private var accountEmail: String? = nil
+    @State private var signedIn = false
     @State private var authEmail = ""
     @State private var authCode = ""
     @State private var codeSent = false
-
-    private enum Backend: String, CaseIterable, Identifiable {
-        case cloud = "ObSink Cloud", selfHosted = "Self-hosted"
-        var id: String { rawValue }
-    }
 
     private enum Mode: String, CaseIterable, Identifiable {
         case create = "Create", connect = "Connect"
         var id: String { rawValue }
     }
 
-    private var hostedURL: String { hostedWorkerUrl() }
-    private var effectiveURL: String { backend == .cloud ? hostedURL : workerURL }
-    /// Bearer for the chosen backend, if we have one yet.
+    private var canonicalURL: String { KeychainStore.canonicalServerURL(serverURL) }
+    private var hasServer: Bool {
+        let url = canonicalURL
+        return url.contains("://") && url != "https://" && url != "http://"
+    }
+    /// Bearer for the typed server, if we have one yet.
     private var bearer: String? {
-        switch backend {
-        case .cloud: return KeychainStore.loadBearer(workerURL: hostedURL)
-        case .selfHosted: return apiKey.isEmpty ? KeychainStore.loadBearer(workerURL: workerURL) : apiKey
-        }
+        hasServer ? KeychainStore.loadBearer(serverURL: canonicalURL) : nil
     }
     private var canSubmit: Bool {
         !busy && bearer != nil && !passphrase.isEmpty
-            && (backend == .cloud || !workerURL.isEmpty)
             && (mode == .create ? !name.isEmpty : pickedVaultID != nil)
     }
 
@@ -325,21 +319,13 @@ struct AddVaultView: View {
         NavigationStack {
             Form {
                 Section("Server") {
-                    Picker("Backend", selection: $backend) {
-                        ForEach(Backend.allCases) { Text($0.rawValue).tag($0) }
-                    }
-                    .pickerStyle(.segmented)
-                    .accessibilityIdentifier("backendPicker")
-                    .onChange(of: backend) { _, _ in
-                        available = []; pickedVaultID = nil; status = ""
-                    }
-
-                    if backend == .cloud {
-                        cloudSection
-                    } else {
-                        LabeledField("Worker URL", text: $workerURL, identifier: "addVaultWorkerURL")
-                        LabeledField("API key", text: $apiKey, identifier: "addVaultAPIKey")
-                    }
+                    LabeledField("Server URL", text: $serverURL, identifier: "addVaultServerURL")
+                        .keyboardType(.URL)
+                        .onChange(of: serverURL) { _, _ in
+                            available = []; pickedVaultID = nil; status = ""
+                            refreshSignInState()
+                        }
+                    signInSection
                 }
                 Section {
                     Picker("", selection: $mode) {
@@ -388,21 +374,23 @@ struct AddVaultView: View {
             }
             .navigationTitle("Add Vault")
             .toolbar { Button("Cancel") { dismiss() } }
-            .onAppear { refreshCloudState() }
+            .onAppear { refreshSignInState() }
         }
     }
 
-    // MARK: ObSink Cloud sign-in
+    // MARK: Sign-in
 
     @ViewBuilder
-    private var cloudSection: some View {
-        if cloudSignedIn {
+    private var signInSection: some View {
+        if !hasServer {
+            Text("Enter your server's URL to sign in.").font(.caption).foregroundStyle(.secondary)
+        } else if signedIn {
             HStack {
-                Text(cloudEmail.map { "Signed in as \($0)" } ?? "Signed in")
+                Text(accountEmail.map { "Signed in as \($0)" } ?? "Signed in")
                     .font(.callout)
                     .accessibilityIdentifier("addVaultAccountText")
                 Spacer()
-                Button("Sign out") { signOutCloud() }.disabled(busy)
+                Button("Sign out") { signOut() }.disabled(busy)
             }
         } else {
             SignInWithAppleButton(.signIn) { request in
@@ -432,17 +420,22 @@ struct AddVaultView: View {
         }
     }
 
-    private func refreshCloudState() {
-        guard let token = KeychainStore.loadBearer(workerURL: hostedURL) else {
-            cloudSignedIn = false
+    private func refreshSignInState() {
+        guard hasServer, let token = KeychainStore.loadBearer(serverURL: canonicalURL) else {
+            signedIn = false
+            accountEmail = nil
             return
         }
-        cloudSignedIn = true
-        let url = hostedURL
+        signedIn = true
+        let url = canonicalURL
         Task.detached {
-            let email = (try? authMe(workerUrl: url, token: token))?.email
-            await MainActor.run { cloudEmail = email }
+            let email = (try? authMe(serverUrl: url, token: token))?.email
+            await MainActor.run { if canonicalURL == url { accountEmail = email } }
         }
+    }
+
+    private func rememberServer() {
+        (UserDefaults(suiteName: SyncModel.appGroup) ?? .standard).set(canonicalURL, forKey: Self.lastServerKey)
     }
 
     private static var deviceName: String {
@@ -451,10 +444,10 @@ struct AddVaultView: View {
 
     private func sendCode() {
         busy = true; status = ""
-        let url = hostedURL, email = authEmail.trimmingCharacters(in: .whitespaces)
+        let url = canonicalURL, email = authEmail.trimmingCharacters(in: .whitespaces)
         Task.detached {
             do {
-                let devCode = try authEmailStart(workerUrl: url, email: email)
+                let devCode = try authEmailStart(serverUrl: url, email: email)
                 await MainActor.run {
                     codeSent = true
                     busy = false
@@ -468,18 +461,19 @@ struct AddVaultView: View {
 
     private func verifyCode() {
         busy = true; status = ""
-        let url = hostedURL, email = authEmail.trimmingCharacters(in: .whitespaces)
+        let url = canonicalURL, email = authEmail.trimmingCharacters(in: .whitespaces)
         let code = authCode.trimmingCharacters(in: .whitespaces), device = Self.deviceName
         Task.detached {
             do {
-                let session = try authEmailVerify(workerUrl: url, email: email, code: code, deviceName: device)
-                KeychainStore.saveBearer(session.token, workerURL: url)
+                let session = try authEmailVerify(serverUrl: url, email: email, code: code, deviceName: device)
+                KeychainStore.saveBearer(session.token, serverURL: url)
                 await MainActor.run {
-                    cloudEmail = session.email
-                    cloudSignedIn = true
+                    accountEmail = session.email
+                    signedIn = true
                     codeSent = false
                     authCode = ""
                     busy = false
+                    rememberServer()
                 }
             } catch {
                 await MainActor.run { status = error.localizedDescription; busy = false }
@@ -502,15 +496,16 @@ struct AddVaultView: View {
                 return
             }
             busy = true; status = ""
-            let url = hostedURL, email = credential.email, device = Self.deviceName
+            let url = canonicalURL, email = credential.email, device = Self.deviceName
             Task.detached {
                 do {
-                    let session = try authApple(workerUrl: url, identityToken: identityToken, deviceName: device, email: email)
-                    KeychainStore.saveBearer(session.token, workerURL: url)
+                    let session = try authApple(serverUrl: url, identityToken: identityToken, deviceName: device, email: email)
+                    KeychainStore.saveBearer(session.token, serverURL: url)
                     await MainActor.run {
-                        cloudEmail = session.email
-                        cloudSignedIn = true
+                        accountEmail = session.email
+                        signedIn = true
                         busy = false
+                        rememberServer()
                     }
                 } catch {
                     await MainActor.run { status = error.localizedDescription; busy = false }
@@ -519,14 +514,14 @@ struct AddVaultView: View {
         }
     }
 
-    private func signOutCloud() {
-        let url = hostedURL
-        if let token = KeychainStore.loadBearer(workerURL: url), token.hasPrefix("os_") {
-            Task.detached { try? authLogout(workerUrl: url, token: token) }
+    private func signOut() {
+        let url = canonicalURL
+        if let token = KeychainStore.loadBearer(serverURL: url) {
+            Task.detached { try? authLogout(serverUrl: url, token: token) }
         }
-        KeychainStore.deleteBearer(workerURL: url)
-        cloudSignedIn = false
-        cloudEmail = nil
+        KeychainStore.deleteBearer(serverURL: url)
+        signedIn = false
+        accountEmail = nil
         available = []
         pickedVaultID = nil
     }
@@ -537,15 +532,15 @@ struct AddVaultView: View {
         guard let key = bearer else { return }
         busy = true
         status = ""
-        let url = effectiveURL
+        let url = canonicalURL
         Task.detached {
             do {
-                let vaults = try listVaults(workerUrl: url, apiKey: key)
+                let vaults = try listVaults(serverUrl: url, apiKey: key)
                 await MainActor.run {
                     available = vaults
                     pickedVaultID = nil
                     busy = false
-                    if vaults.isEmpty { status = "No vaults found at this Worker." }
+                    if vaults.isEmpty { status = "No vaults found at this server." }
                 }
             } catch {
                 await MainActor.run { status = error.localizedDescription; busy = false }
@@ -557,21 +552,19 @@ struct AddVaultView: View {
         guard let key = bearer else { return }
         busy = true
         status = ""
-        let url = effectiveURL, name = self.name, pass = passphrase
+        let url = canonicalURL, name = self.name, pass = passphrase
         let mode = self.mode, picked = pickedVaultID
         let availableNames = available
-        let isSelfHosted = backend == .selfHosted
         Task.detached {
             do {
-                // Remember a typed self-hosted API key for this Worker.
-                if isSelfHosted { KeychainStore.saveBearer(key, workerURL: url) }
                 switch mode {
                 case .create:
-                    let summary = try createVault(workerUrl: url, apiKey: key, name: name)
+                    let summary = try createVault(serverUrl: url, apiKey: key, name: name)
                     let derived = try deriveMasterKey(passphrase: pass, vaultId: summary.id)
                     _ = KeychainStore.save(derived, account: summary.id)
                     await MainActor.run {
-                        onAdd(VaultEntry(workerURL: url, vaultID: summary.id, name: summary.name))
+                        rememberServer()
+                        onAdd(VaultEntry(serverURL: url, vaultID: summary.id, name: summary.name))
                         dismiss()
                     }
                 case .connect:
@@ -583,7 +576,8 @@ struct AddVaultView: View {
                     _ = KeychainStore.save(derived, account: vid)
                     let vname = availableNames.first { $0.id == vid }?.name ?? vid
                     await MainActor.run {
-                        onAdd(VaultEntry(workerURL: url, vaultID: vid, name: vname))
+                        rememberServer()
+                        onAdd(VaultEntry(serverURL: url, vaultID: vid, name: vname))
                         dismiss()
                     }
                 }

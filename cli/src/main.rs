@@ -9,9 +9,9 @@ use clap::{Parser, Subcommand};
 use dirs::home_dir;
 use obsink_core::{
     build_manifest_from_dir, complete_sync, derive_key, derive_keys, diff_local_and_remote,
-    hosted_worker_url, normalize_worker_url, prepare_sync, sync_manifest_path, ApiClient,
-    AuthClient, Conflict, ConflictResolution, ConflictResolutionChoice, CreateVaultRequest,
-    KeyBytes, ProgressEvent, ProgressSink, SyncActionKind, SyncPhase, VaultConfig,
+    normalize_server_url, prepare_sync, sync_manifest_path, ApiClient, AuthClient, Conflict,
+    ConflictResolution, ConflictResolutionChoice, CreateVaultRequest, KeyBytes, ProgressEvent,
+    ProgressSink, SyncActionKind, SyncPhase, VaultConfig,
 };
 use rpassword::prompt_password;
 use serde::{Deserialize, Serialize};
@@ -27,47 +27,58 @@ struct Cli {
     command: Commands,
 }
 
-/// Which server to talk to and how to authenticate. `--worker-url` defaults
-/// to ObSink Cloud (the hosted Worker); `--api-key` is the self-hosted
-/// credential and is remembered in the keychain, so it is needed once.
+/// Which server to talk to and how to authenticate. `--server-url` falls back
+/// to the URL in the saved config; `--api-key` is the operator bearer (admin
+/// and harness use) and is remembered in the keychain, so it is needed once.
 #[derive(Debug, clap::Args)]
 struct ServerArgs {
-    #[arg(long, env = "OBSINK_WORKER_URL")]
-    worker_url: Option<String>,
+    #[arg(long, env = "OBSINK_SERVER_URL")]
+    server_url: Option<String>,
     #[arg(long, env = "OBSINK_API_KEY", hide_env_values = true)]
     api_key: Option<String>,
 }
 
 impl ServerArgs {
-    fn url(&self) -> String {
-        normalize_worker_url(self.worker_url.as_deref().unwrap_or(&hosted_worker_url()))
+    fn url(&self) -> Result<String, Box<dyn std::error::Error>> {
+        resolve_server_url(self.server_url.as_deref())
     }
+}
+
+/// Explicit flag/env first, then the saved config, otherwise an error: there
+/// is no built-in default server.
+fn resolve_server_url(explicit: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
+    if let Some(url) = explicit.map(str::trim).filter(|url| !url.is_empty()) {
+        return Ok(normalize_server_url(url));
+    }
+    if let Ok(config) = load_config() {
+        return Ok(config.server_url);
+    }
+    Err("no server: pass --server-url or set OBSINK_SERVER_URL".into())
 }
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Sign in to ObSink Cloud (or a self-hosted Worker with accounts enabled)
-    /// with an emailed one-time code.
+    /// Sign in to a server with an emailed one-time code.
     Login {
         #[arg(long)]
         email: Option<String>,
         /// Skip the prompt (scripts): the 6-digit code from the email.
         #[arg(long)]
         code: Option<String>,
-        #[arg(long, env = "OBSINK_WORKER_URL")]
-        worker_url: Option<String>,
+        #[arg(long, env = "OBSINK_SERVER_URL")]
+        server_url: Option<String>,
         #[arg(long)]
         device_name: Option<String>,
     },
     /// Sign out this device (revokes the session and forgets the credential).
     Logout {
-        #[arg(long, env = "OBSINK_WORKER_URL")]
-        worker_url: Option<String>,
+        #[arg(long, env = "OBSINK_SERVER_URL")]
+        server_url: Option<String>,
     },
     /// Show the signed-in account and its devices.
     Whoami {
-        #[arg(long, env = "OBSINK_WORKER_URL")]
-        worker_url: Option<String>,
+        #[arg(long, env = "OBSINK_SERVER_URL")]
+        server_url: Option<String>,
     },
     /// List the vaults the current credential can see.
     Vaults {
@@ -103,16 +114,15 @@ enum Commands {
     Sync,
 }
 
-/// On-disk config. The bearer (session token or self-hosted API key) is NOT
-/// here — it lives in the keychain under `bearer:<worker_url>`. `api_key` is
-/// only read for one-time migration of pre-accounts configs.
+/// On-disk config. The bearer (session token or operator API key) is NOT
+/// here — it lives in the keychain under `bearer:<server_url>`. The
+/// `server_url` alias reads configs written before the server pivot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CliConfig {
-    worker_url: String,
+    #[serde(alias = "server_url")]
+    server_url: String,
     vault_id: String,
     local_path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    api_key: Option<String>,
 }
 
 fn main() {
@@ -142,15 +152,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Login {
             email,
             code,
-            worker_url,
+            server_url,
             device_name,
         } => {
-            let url = normalize_worker_url(worker_url.as_deref().unwrap_or(&hosted_worker_url()));
+            let url = resolve_server_url(server_url.as_deref())?;
             let auth = AuthClient::new(&url);
             let caps = auth.capabilities().await?;
             if !caps.auth.email {
                 return Err(format!(
-                    "{url} does not offer email sign-in; use --api-key with a self-hosted Worker"
+                    "{url} does not offer email sign-in (the operator has not configured SMTP)"
                 )
                 .into());
             }
@@ -178,16 +188,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 session.user.email.unwrap_or(session.user.id)
             );
         }
-        Commands::Logout { worker_url } => {
-            let url = normalize_worker_url(worker_url.as_deref().unwrap_or(&hosted_worker_url()));
+        Commands::Logout { server_url } => {
+            let url = resolve_server_url(server_url.as_deref())?;
             let account = bearer_account(&url);
             match load_secret(&account) {
-                Ok(token) if token.starts_with("os_") => {
+                Ok(token) => {
                     if let Err(error) = AuthClient::new(&url).logout(&token).await {
                         eprintln!("warning: could not revoke the session server-side: {error}");
                     }
                 }
-                Ok(_) => {}
                 Err(_) => {
                     println!("not signed in to {url}");
                     return Ok(());
@@ -196,8 +205,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             delete_secret(&account);
             println!("signed out of {url}");
         }
-        Commands::Whoami { worker_url } => {
-            let url = normalize_worker_url(worker_url.as_deref().unwrap_or(&hosted_worker_url()));
+        Commands::Whoami { server_url } => {
+            let url = resolve_server_url(server_url.as_deref())?;
             let token = load_secret(&bearer_account(&url))
                 .map_err(|_| format!("not signed in to {url}; run `obsink login`"))?;
             let me = AuthClient::new(&url).me(&token).await?;
@@ -209,17 +218,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         println!(
                             "  device: {}{}",
                             session.device_name,
-                            if session.current { " (this device)" } else { "" }
+                            if session.current {
+                                " (this device)"
+                            } else {
+                                ""
+                            }
                         );
                     }
                 }
-                None => println!("credential: self-hosted API key ({})", me.kind),
+                None => println!("credential: operator API key ({})", me.kind),
             }
         }
         Commands::Vaults { server } => {
             let (url, bearer) = resolve_server(&server)?;
             let client = ApiClient::new(VaultConfig {
-                worker_url: url,
+                server_url: url,
                 api_key: bearer,
                 vault_id: String::new(),
                 local_path: String::new(),
@@ -238,7 +251,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let (url, bearer) = resolve_server(&server)?;
             let client = ApiClient::new(VaultConfig {
-                worker_url: url.clone(),
+                server_url: url.clone(),
                 api_key: bearer,
                 vault_id: String::new(),
                 local_path: directory.display().to_string(),
@@ -255,10 +268,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             save_secret(&vault_id, &hex::encode(key))?;
 
             let config = CliConfig {
-                worker_url: url,
+                server_url: url,
                 vault_id,
                 local_path: directory.display().to_string(),
-                api_key: None,
             };
             save_config(&config)?;
             run_sync_for_config(&config, &key).await?;
@@ -276,10 +288,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let key = derive_key_from_passphrase(passphrase, &vault_id)?;
 
             let config = CliConfig {
-                worker_url: url,
+                server_url: url,
                 vault_id,
                 local_path: directory.display().to_string(),
-                api_key: None,
             };
 
             validate_passphrase(&config, &key).await?;
@@ -318,11 +329,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Work out the Worker URL and bearer for a server-facing command. A supplied
+/// Work out the server URL and bearer for a server-facing command. A supplied
 /// `--api-key` is remembered in the keychain for the URL; otherwise the stored
 /// credential (session token from `login`, or an earlier `--api-key`) is used.
 fn resolve_server(server: &ServerArgs) -> Result<(String, String), Box<dyn std::error::Error>> {
-    let url = server.url();
+    let url = server.url()?;
     let account = bearer_account(&url);
     if let Some(api_key) = server.api_key.as_deref().filter(|key| !key.is_empty()) {
         save_secret(&account, api_key)?;
@@ -331,14 +342,14 @@ fn resolve_server(server: &ServerArgs) -> Result<(String, String), Box<dyn std::
     match load_secret(&account) {
         Ok(bearer) => Ok((url, bearer)),
         Err(_) => Err(format!(
-            "no credential for {url}: run `obsink login` (ObSink Cloud) or pass --api-key (self-hosted)"
+            "no credential for {url}: run `obsink login --server-url {url}` (or pass --api-key for the operator bearer)"
         )
         .into()),
     }
 }
 
-fn bearer_account(worker_url: &str) -> String {
-    format!("bearer:{}", normalize_worker_url(worker_url))
+fn bearer_account(server_url: &str) -> String {
+    format!("bearer:{}", normalize_server_url(server_url))
 }
 
 fn default_device_name() -> String {
@@ -377,7 +388,10 @@ impl ProgressSink for CliProgress {
                 SyncPhase::Uploading => eprintln!("uploading…"),
             },
             ProgressEvent::FileStarted {
-                path, kind, index, total,
+                path,
+                kind,
+                index,
+                total,
             } => {
                 let verb = match kind {
                     SyncActionKind::Download => "downloading",
@@ -421,10 +435,7 @@ async fn run_sync_for_config(
 
         if !result.failures.is_empty() {
             let fatal = result.failures.iter().any(|failure| failure.fatal);
-            eprintln!(
-                "{} file(s) failed this sync:",
-                result.failures.len()
-            );
+            eprintln!("{} file(s) failed this sync:", result.failures.len());
             for failure in &result.failures {
                 let tag = if failure.fatal { "FATAL" } else { "skipped" };
                 eprintln!("  [{tag}] {}: {}", failure.path, failure.error);
@@ -520,14 +531,14 @@ fn derive_key_from_passphrase(
 }
 
 fn to_vault_config(config: &CliConfig) -> Result<VaultConfig, Box<dyn std::error::Error>> {
-    let bearer = load_secret(&bearer_account(&config.worker_url)).map_err(|_| {
+    let bearer = load_secret(&bearer_account(&config.server_url)).map_err(|_| {
         format!(
             "no credential for {}: run `obsink login` or `obsink connect --api-key ...`",
-            config.worker_url
+            config.server_url
         )
     })?;
     Ok(VaultConfig {
-        worker_url: config.worker_url.clone(),
+        server_url: config.server_url.clone(),
         api_key: bearer,
         vault_id: config.vault_id.clone(),
         local_path: config.local_path.clone(),
@@ -554,18 +565,11 @@ fn save_config(config: &CliConfig) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Load the config, migrating a pre-accounts file (plaintext `api_key`) by
-/// moving the key into the keychain and rewriting the file without it.
 fn load_config() -> Result<CliConfig, Box<dyn std::error::Error>> {
     let path = config_path()?;
     let contents = fs::read_to_string(path)?;
     let mut config: CliConfig = toml::from_str(&contents)?;
-    config.worker_url = normalize_worker_url(&config.worker_url);
-    if let Some(api_key) = config.api_key.take() {
-        save_secret(&bearer_account(&config.worker_url), &api_key)?;
-        save_config(&config)?;
-        eprintln!("moved the API key from config.toml into the keychain");
-    }
+    config.server_url = normalize_server_url(&config.server_url);
     Ok(config)
 }
 
@@ -574,7 +578,7 @@ fn load_config() -> Result<CliConfig, Box<dyn std::error::Error>> {
 // Two kinds of secret share the `obsink` service: the derived vault key
 // (account = vault ID, hex) and the server bearer (account = `bearer:<url>`).
 // `OBSINK_KEYRING_DIR` swaps the macOS keychain for a directory of files
-// (Linux, CI, harnesses).
+// (CI, harnesses).
 
 fn keyring_dir() -> Option<PathBuf> {
     std::env::var_os("OBSINK_KEYRING_DIR").map(PathBuf::from)

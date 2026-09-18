@@ -3,13 +3,15 @@
 # Simulator E2E for the Mac↔iOS checklist (OBS-29–34).
 #
 # "Device A" is the CLI (the reference client) driven from this script against
-# the live Worker; "device B" is the ObSink app + File Provider on an iOS
+# a running server; "device B" is the ObSink app + File Provider on an iOS
 # simulator, driven through the XCUITest phases in ios/UITests/SyncE2ETests.swift.
 # On-disk state on the iOS side is verified straight through the app-group
 # container (`simctl get_app_container … groups`), which the host can read.
 #
-# Requires: .env at the repo root (WORKER_URL, WORKER_API_KEY, DEVELOPMENT_TEAM),
-# a built xcframework + generated project (scripts/build-ios.sh), and Xcode.
+# Requires: .env at the repo root (OBSINK_SERVER_URL, OBSINK_API_KEY,
+# DEVELOPMENT_TEAM), a server reachable at OBSINK_SERVER_URL started with the
+# same OBSINK_API_KEY (e.g. `docker compose up -d`), a built xcframework +
+# generated project (scripts/build-ios.sh), and Xcode.
 #
 # Usage: scripts/verify-ios-sim-e2e.sh [work-dir]
 # The work dir (default: mktemp) holds device A's vault + config and all logs.
@@ -40,22 +42,8 @@ step() { printf '\n==> %s\n' "$*"; }
 pass() { printf 'PASS: %s\n' "$*"; PASS_COUNT=$((PASS_COUNT+1)); }
 fail() { printf 'FAIL: %s\n' "$*"; FAIL_COUNT=$((FAIL_COUNT+1)); }
 
-# Cloudflare KV caches reads at the edge for up to 60 s, so a manifest the
-# app read moments ago can shadow a CLI write for that long. After any CLI
-# write, the next XCUITest phase waits KV_SETTLE seconds (OBSINK_KV_SETTLE=0
-# to disable, e.g. against wrangler dev).
-KV_SETTLE="${OBSINK_KV_SETTLE:-65}"
-NEED_SETTLE=0
 cli() {
     OBSINK_HOME="$A_HOME" cargo run -q -p obsink -- "$@"
-    case "$1" in sync|init|connect) NEED_SETTLE=1 ;; esac
-}
-settle() {
-    if [ "$NEED_SETTLE" = 1 ] && [ "$KV_SETTLE" -gt 0 ]; then
-        echo "    (waiting ${KV_SETTLE}s for KV edge caches to expire)"
-        sleep "$KV_SETTLE"
-    fi
-    NEED_SETTLE=0
 }
 
 # Run one XCUITest phase; extra env for the app goes via TEST_RUNNER_*.
@@ -64,10 +52,9 @@ run_test() {
     local test_name="$1"; shift
     RUN_N=$((RUN_N+1))
     local log="$WORK/xcuitest-$(printf '%02d' "$RUN_N")-$test_name.log"
-    settle
     if env "$@" \
-        TEST_RUNNER_OBSINK_TEST_WORKER_URL="$WORKER_URL" \
-        TEST_RUNNER_OBSINK_TEST_API_KEY="$WORKER_API_KEY" \
+        TEST_RUNNER_OBSINK_TEST_SERVER_URL="$OBSINK_SERVER_URL" \
+        TEST_RUNNER_OBSINK_TEST_API_KEY="$OBSINK_API_KEY" \
         TEST_RUNNER_OBSINK_TEST_VAULT_ID="$VAULT_ID" \
         TEST_RUNNER_OBSINK_TEST_VAULT_NAME="$VAULT_NAME" \
         TEST_RUNNER_OBSINK_TEST_PASSPHRASE="$PASSPHRASE" \
@@ -110,7 +97,7 @@ step "Device A: init vault '$VAULT_NAME' with starter files"
 echo "# Hello from Mac" > "$A_VAULT/hello.md"
 mkdir -p "$A_VAULT/notes"
 echo "note one" > "$A_VAULT/notes/note1.md"
-cli init --worker-url "$WORKER_URL" --api-key "$WORKER_API_KEY" \
+cli init --server-url "$OBSINK_SERVER_URL" --api-key "$OBSINK_API_KEY" \
     --vault-name "$VAULT_NAME" --directory "$A_VAULT" --passphrase "$PASSPHRASE" \
     >"$WORK/cli-init.log" 2>&1
 VAULT_ID="$(sed -n 's/^vault_id = "\(.*\)"/\1/p' "$A_HOME/.obsink/config.toml")"
@@ -276,7 +263,7 @@ fi
 # Remove this run's vault so the operator vault list does not grow per run.
 if [ -n "${VAULT_ID:-}" ]; then
     curl -s -o /dev/null -w "cleanup: DELETE vault $VAULT_ID -> %{http_code}\n" -X DELETE \
-        "$WORKER_URL/vaults/$VAULT_ID" -H "Authorization: Bearer $WORKER_API_KEY" || true
+        "${OBSINK_SERVER_URL%/}/vaults/$VAULT_ID" -H "Authorization: Bearer $OBSINK_API_KEY" || true
 fi
 printf '\n==== Result: %d passed, %d failed. Logs: %s ====\n' "$PASS_COUNT" "$FAIL_COUNT" "$WORK"
 [ "$FAIL_COUNT" -eq 0 ]

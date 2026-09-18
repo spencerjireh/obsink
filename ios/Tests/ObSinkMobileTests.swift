@@ -20,19 +20,19 @@ final class ObSinkMobileTests: XCTestCase {
 
     func testLiveSyncDownloadsSeededFile() throws {
         let env = ProcessInfo.processInfo.environment
-        guard let url = env["OBSINK_TEST_WORKER_URL"],
+        guard let url = env["OBSINK_TEST_SERVER_URL"],
               let apiKey = env["OBSINK_TEST_API_KEY"],
               let vaultID = env["OBSINK_TEST_VAULT_ID"],
               let passphrase = env["OBSINK_TEST_PASSPHRASE"]
         else {
-            throw XCTSkip("live worker env not set")
+            throw XCTSkip("live server env not set")
         }
 
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
 
-        let config = MobileVaultConfig(workerUrl: url, apiKey: apiKey, vaultId: vaultID, localPath: dir.path)
+        let config = MobileVaultConfig(serverUrl: url, apiKey: apiKey, vaultId: vaultID, localPath: dir.path)
         let key = try deriveMasterKey(passphrase: passphrase, vaultId: vaultID)
         let client = try VaultClient(config: config, key: key)
 

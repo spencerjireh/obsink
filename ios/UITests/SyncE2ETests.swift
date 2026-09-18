@@ -3,13 +3,13 @@ import XCTest
 /// Simulator E2E driver for the Mac↔iOS verification checklist (OBS-29–34).
 ///
 /// These tests only drive the app UI; the surrounding harness
-/// (`scripts/verify-ios-sim-e2e.sh`) plays "device A" with the CLI against the
-/// live Worker, stages files, and verifies on-disk state through
+/// (`scripts/verify-ios-sim-e2e.sh`) plays "device A" with the CLI against a
+/// running server, stages files, and verifies on-disk state through
 /// `simctl get_app_container`. Each test is one script-orchestrated phase, so
 /// they are run individually with `-only-testing`, not as a suite.
 ///
 /// Configuration arrives via `TEST_RUNNER_`-prefixed environment variables:
-///   OBSINK_TEST_WORKER_URL / OBSINK_TEST_API_KEY  — Worker connection
+///   OBSINK_TEST_SERVER_URL / OBSINK_TEST_API_KEY  — server connection (operator bearer)
 ///   OBSINK_TEST_VAULT_ID / OBSINK_TEST_VAULT_NAME — target vault
 ///   OBSINK_TEST_PASSPHRASE                        — vault passphrase
 ///   OBSINK_TEST_CHOICE                            — conflict winner (resolve test)
@@ -27,17 +27,25 @@ final class SyncE2ETests: XCTestCase {
         app.descendants(matching: .any).matching(identifier: id).firstMatch
     }
 
+    /// The harness's operator bearer, seeded into the Keychain the way a
+    /// sign-in would (the CLI "device A" uses the same principal, so both
+    /// devices see the same vault list).
+    private func seedBearer(_ app: XCUIApplication) {
+        app.launchEnvironment["OBSINK_UITEST_BEARER"] = env["OBSINK_TEST_API_KEY"]!
+        app.launchEnvironment["OBSINK_UITEST_BEARER_URL"] = env["OBSINK_TEST_SERVER_URL"]!
+    }
+
     /// Launch the app with the vault seeded into the app-group defaults so
     /// tests skip the Add Vault UI (the dedicated connect test drives it).
     private func launchSeeded(reset: Bool = false) -> XCUIApplication {
         let app = XCUIApplication()
         let seed = """
-        [{"workerURL":"\(env["OBSINK_TEST_WORKER_URL"]!)",\
-        "apiKey":"\(env["OBSINK_TEST_API_KEY"]!)",\
+        [{"serverURL":"\(env["OBSINK_TEST_SERVER_URL"]!)",\
         "vaultID":"\(env["OBSINK_TEST_VAULT_ID"]!)",\
         "name":"\(env["OBSINK_TEST_VAULT_NAME"] ?? "e2e-sim")"}]
         """
         app.launchEnvironment["OBSINK_UITEST_SEED"] = seed
+        seedBearer(app)
         if reset { app.launchEnvironment["OBSINK_UITEST_RESET"] = "1" }
         app.launch()
         return app
@@ -76,29 +84,28 @@ final class SyncE2ETests: XCTestCase {
 
     // MARK: Phases
 
-    /// Add Vault → Connect flow against the live Worker (vault setup UI).
+    /// Add Vault → Connect flow against the running server (vault setup UI).
+    /// The bearer is pre-seeded, so typing the server URL should show the
+    /// "signed in" row instead of the sign-in controls.
     func testConnectVaultFlow() throws {
         let app = XCUIApplication()
         app.launchEnvironment["OBSINK_UITEST_RESET"] = "1"
+        seedBearer(app)
         app.launch()
 
         app.buttons["addVaultButton"].tap()
 
-        // The sheet defaults to ObSink Cloud; the harness drives a self-hosted Worker.
-        let backend = app.segmentedControls["backendPicker"]
-        XCTAssertTrue(backend.waitForExistence(timeout: 10))
-        backend.buttons["Self-hosted"].tap()
-        let url = app.textFields["addVaultWorkerURL"]
+        let url = app.textFields["addVaultServerURL"]
         XCTAssertTrue(url.waitForExistence(timeout: 10))
         url.tap()
-        // Clear the "https://" prefill, then type the full URL.
+        // Clear the prefill, then type the full URL.
         url.press(forDuration: 1.2)
         if app.menuItems["Select All"].waitForExistence(timeout: 3) { app.menuItems["Select All"].tap() }
-        url.typeText(env["OBSINK_TEST_WORKER_URL"]!)
+        url.typeText(env["OBSINK_TEST_SERVER_URL"]!)
+        if app.keyboards.buttons["Return"].exists { app.keyboards.buttons["Return"].tap() }
 
-        let key = app.textFields["addVaultAPIKey"]
-        key.tap()
-        key.typeText(env["OBSINK_TEST_API_KEY"]!)
+        XCTAssertTrue(anyElement(app, "addVaultAccountText").waitForExistence(timeout: 10),
+                      "seeded bearer not recognised for the typed server URL")
 
         app.buttons["Connect"].tap()
         app.buttons["listVaultsButton"].tap()

@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
+#
+# Contract check for a running ObSink server using the operator bearer:
+# vault lifecycle, manifest ETag / 304, conflict gating, multipart batch,
+# soft delete, /auth/me, invites. Needs curl and node.
+#   set -a; . ./.env; set +a; scripts/verify-server-deploy.sh
 
 set -euo pipefail
 
-: "${WORKER_URL:?WORKER_URL is required}"
-: "${WORKER_API_KEY:?WORKER_API_KEY is required}"
+: "${OBSINK_SERVER_URL:?OBSINK_SERVER_URL is required}"
+: "${OBSINK_API_KEY:?OBSINK_API_KEY is required}"
 
-BASE_URL="${WORKER_URL%/}"
+BASE_URL="${OBSINK_SERVER_URL%/}"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
@@ -21,7 +26,7 @@ request_json() {
   local -a args=(
     -sS
     -X "$method"
-    -H "Authorization: Bearer $WORKER_API_KEY"
+    -H "Authorization: Bearer $OBSINK_API_KEY"
     -H "Content-Type: application/json"
     -o "$LAST_BODY"
     -w '%{http_code}'
@@ -44,7 +49,7 @@ request_bytes() {
   local -a args=(
     -sS
     -X "$method"
-    -H "Authorization: Bearer $WORKER_API_KEY"
+    -H "Authorization: Bearer $OBSINK_API_KEY"
     -o "$LAST_BODY"
     -w '%{http_code}'
     --data-binary "$body"
@@ -96,7 +101,7 @@ assert_json() {
   fi
 }
 
-printf 'Verifying Worker at %s\n' "$BASE_URL"
+printf 'Verifying server at %s\n' "$BASE_URL"
 
 VAULT_NAME="verify-$(date +%s)"
 request_json POST "$BASE_URL/vaults" "{\"name\":\"$VAULT_NAME\",\"max_file_size\":1024}"
@@ -104,31 +109,35 @@ assert_status 201
 VAULT_ID="$(json_eval 'data.vault.id')"
 printf 'Created vault %s\n' "$VAULT_ID"
 
-# KV.list() is eventually consistent: a just-created vault can take a few
-# seconds to show up in GET /vaults (its own key is readable at once).
-for attempt in $(seq 1 30); do
-    request_json GET "$BASE_URL/vaults"
-    assert_status 200
-    if [[ "$(json_eval 'data.some((vault) => vault.id === args[0])' "$VAULT_ID")" == true ]]; then break; fi
-    [ "$attempt" = 30 ] && { echo "vault never appeared in GET /vaults"; exit 1; }
-    sleep 3
-done
+request_json GET "$BASE_URL/vaults"
+assert_status 200
+assert_json 'data.some((vault) => vault.id === args[0])' true "$VAULT_ID"
 
 request_json GET "$BASE_URL/vaults/$VAULT_ID/manifest"
 assert_status 200
 assert_json 'Object.keys(data).length' 0
 
-request_bytes PUT "$BASE_URL/vaults/$VAULT_ID/files/note.md" 'hello worker' 'X-Content-Hash: hash-1'
+request_bytes PUT "$BASE_URL/vaults/$VAULT_ID/files/note.md" 'hello server' 'X-Content-Hash: hash-1'
 assert_status 200
+
+# Manifest ETag: a second GET with If-None-Match must return 304 with no body.
+ETAG="$(curl -sS -D - -o /dev/null -H "Authorization: Bearer $OBSINK_API_KEY" "$BASE_URL/vaults/$VAULT_ID/manifest" | awk 'tolower($1)=="etag:" {print $2}' | tr -d '\r')"
+if [[ -z "$ETAG" ]]; then
+  printf 'Manifest response carried no ETag\n' >&2
+  exit 1
+fi
+LAST_BODY="$TMP_DIR/etag.bin"
+LAST_STATUS="$(curl -sS -o "$LAST_BODY" -w '%{http_code}' -H "Authorization: Bearer $OBSINK_API_KEY" -H "If-None-Match: $ETAG" "$BASE_URL/vaults/$VAULT_ID/manifest")"
+assert_status 304
 
 request_json GET "$BASE_URL/vaults/$VAULT_ID/manifest"
 assert_status 200
 assert_json 'data["note.md"].hash' hash-1
 
 LAST_BODY="$TMP_DIR/file.bin"
-LAST_STATUS="$(curl -sS -X GET -H "Authorization: Bearer $WORKER_API_KEY" -o "$LAST_BODY" -w '%{http_code}' "$BASE_URL/vaults/$VAULT_ID/files/note.md")"
+LAST_STATUS="$(curl -sS -X GET -H "Authorization: Bearer $OBSINK_API_KEY" -o "$LAST_BODY" -w '%{http_code}' "$BASE_URL/vaults/$VAULT_ID/files/note.md")"
 assert_status 200
-if [[ "$(cat "$LAST_BODY")" != 'hello worker' ]]; then
+if [[ "$(cat "$LAST_BODY")" != 'hello server' ]]; then
   printf 'Unexpected file payload\n' >&2
   exit 1
 fi
@@ -137,14 +146,24 @@ request_bytes PUT "$BASE_URL/vaults/$VAULT_ID/files/note.md" 'stale write' 'X-Pa
 assert_status 409
 assert_json 'data.current.hash' hash-1
 
-FRESH_BASE64="$(printf 'fresh' | base64 | tr -d '\n')"
-SECOND_BASE64="$(printf 'second' | base64 | tr -d '\n')"
-request_json POST "$BASE_URL/vaults/$VAULT_ID/batch" "{\"operations\":[{\"action\":\"put\",\"path\":\"note.md\",\"parentHash\":\"stale\",\"contentHash\":\"hash-2\",\"content\":\"$SECOND_BASE64\"},{\"action\":\"put\",\"path\":\"fresh.md\",\"contentHash\":\"hash-3\",\"content\":\"$FRESH_BASE64\"}]}"
+# Batch is multipart/form-data: an `operations` JSON part plus one `content`
+# part per put, named by operation index.
+printf 'second' > "$TMP_DIR/second.bin"
+printf 'fresh' > "$TMP_DIR/fresh.bin"
+cat > "$TMP_DIR/ops.json" <<'JSON'
+{"operations":[{"action":"put","path":"note.md","parentHash":"stale","contentHash":"hash-2"},{"action":"put","path":"fresh.md","contentHash":"hash-3"}]}
+JSON
+LAST_BODY="$TMP_DIR/batch.json"
+LAST_STATUS="$(curl -sS -o "$LAST_BODY" -w '%{http_code}' -H "Authorization: Bearer $OBSINK_API_KEY" \
+  -F "operations=@$TMP_DIR/ops.json;type=application/json" \
+  -F "content=@$TMP_DIR/second.bin;filename=0;type=application/octet-stream" \
+  -F "content=@$TMP_DIR/fresh.bin;filename=1;type=application/octet-stream" \
+  "$BASE_URL/vaults/$VAULT_ID/batch")"
 assert_status 200
 assert_json 'data.results.map((result) => result.status).join(",")' 409,200
 
 LAST_BODY="$TMP_DIR/delete.json"
-LAST_STATUS="$(curl -sS -X DELETE -H "Authorization: Bearer $WORKER_API_KEY" -H 'X-Parent-Hash: hash-1' -o "$LAST_BODY" -w '%{http_code}' "$BASE_URL/vaults/$VAULT_ID/files/note.md")"
+LAST_STATUS="$(curl -sS -X DELETE -H "Authorization: Bearer $OBSINK_API_KEY" -H 'X-Parent-Hash: hash-1' -o "$LAST_BODY" -w '%{http_code}' "$BASE_URL/vaults/$VAULT_ID/files/note.md")"
 assert_status 200
 
 request_json GET "$BASE_URL/vaults/$VAULT_ID/manifest"
@@ -152,6 +171,15 @@ assert_status 200
 assert_json 'String(data["note.md"].deleted)' true
 assert_json 'data["fresh.md"].hash' hash-3
 
+request_json GET "$BASE_URL/auth/me"
+assert_status 200
+assert_json 'data.kind' operator
+assert_json 'data.usage.vaults.some((vault) => vault.id === args[0])' true "$VAULT_ID"
+
+request_json POST "$BASE_URL/auth/invites" '{}'
+assert_status 201
+assert_json 'typeof data.invite.code === "string" && data.invite.code.length > 0' true
+
 request_json DELETE "$BASE_URL/vaults/$VAULT_ID"
 assert_status 204
-printf 'Worker verification passed for %s\n' "$VAULT_ID"
+printf 'Server verification passed for %s\n' "$VAULT_ID"

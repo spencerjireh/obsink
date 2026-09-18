@@ -16,9 +16,9 @@ use tauri::{
 
 use obsink_core::{
     build_working_manifest_for_path, complete_sync, derive_key, derive_keys, diff_local_and_remote,
-    hosted_worker_url, normalize_worker_url, prepare_sync, sync_manifest_path, ApiClient,
-    AuthClient, Conflict, ConflictResolution, CreateVaultRequest, KeyBytes, ProgressEvent,
-    ProgressSink, SyncPlan, SyncResult, VaultConfig, VaultSummary,
+    normalize_server_url, prepare_sync, sync_manifest_path, ApiClient, AuthClient, Conflict,
+    ConflictResolution, CreateVaultRequest, KeyBytes, ProgressEvent, ProgressSink, SyncPlan,
+    SyncResult, VaultConfig, VaultSummary,
 };
 use serde::{Deserialize, Serialize};
 
@@ -60,17 +60,15 @@ impl Default for StoredAppConfig {
     }
 }
 
-/// One configured vault. The server bearer (ObSink Cloud session token or a
-/// self-hosted API key) is NOT stored here — it lives in the keychain under
-/// `bearer:<worker_url>`. `api_key` only exists to migrate pre-accounts
-/// configs (`load_app_config` moves it into the keychain and drops it).
+/// One configured vault. The server bearer (session token) is NOT stored
+/// here — it lives in the keychain under `bearer:<server_url>`. The
+/// `server_url` alias reads configs written before the server pivot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredVault {
     id: String,
     name: String,
-    worker_url: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    api_key: Option<String>,
+    #[serde(alias = "server_url")]
+    server_url: String,
     local_path: String,
 }
 
@@ -78,11 +76,9 @@ struct StoredVault {
 struct LocalVaultSummary {
     id: String,
     name: String,
-    worker_url: String,
+    server_url: String,
     local_path: String,
     active: bool,
-    /// True when the vault lives on ObSink Cloud (the hosted Worker).
-    hosted: bool,
 }
 
 impl LocalVaultSummary {
@@ -90,37 +86,21 @@ impl LocalVaultSummary {
         Self {
             id: vault.id.clone(),
             name: vault.name.clone(),
-            worker_url: vault.worker_url.clone(),
+            server_url: vault.server_url.clone(),
             local_path: vault.local_path.clone(),
             active,
-            hosted: is_hosted(&vault.worker_url),
         }
     }
 }
 
-fn is_hosted(worker_url: &str) -> bool {
-    normalize_worker_url(worker_url) == normalize_worker_url(&hosted_worker_url())
+fn bearer_account(server_url: &str) -> String {
+    format!("bearer:{}", normalize_server_url(server_url))
 }
 
-fn bearer_account(worker_url: &str) -> String {
-    format!("bearer:{}", normalize_worker_url(worker_url))
-}
-
-/// The bearer to use for a Worker: a supplied self-hosted API key (which is
-/// then remembered) or the credential already in the keychain.
-fn resolve_bearer(worker_url: &str, api_key: &str) -> Result<String, String> {
-    let account = bearer_account(worker_url);
-    if !api_key.trim().is_empty() {
-        save_secret(&account, api_key.trim()).map_err(err_string)?;
-        return Ok(api_key.trim().to_string());
-    }
-    load_secret(&account).map_err(|_| {
-        if is_hosted(worker_url) {
-            "not signed in to ObSink Cloud — sign in first".to_string()
-        } else {
-            format!("no API key saved for {worker_url} — enter it")
-        }
-    })
+/// The bearer stored for a server, or a "sign in first" error.
+fn load_bearer(server_url: &str) -> Result<String, String> {
+    load_secret(&bearer_account(server_url))
+        .map_err(|_| format!("not signed in to {server_url} — sign in first"))
 }
 
 fn device_name() -> String {
@@ -135,24 +115,21 @@ fn device_name() -> String {
         .unwrap_or_else(|| "ObSink Desktop".to_string())
 }
 
-// --- Accounts (ObSink Cloud) --------------------------------------------------
+// --- Accounts -----------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize)]
 struct AuthCapabilities {
     email: bool,
     apple: bool,
-    api_key: bool,
 }
 
-/// What the UI shows for a Worker's credential state.
+/// What the UI shows for a server's credential state.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum AccountState {
-    /// No credential stored for this Worker.
+    /// No credential stored for this server.
     SignedOut,
-    /// A self-hosted API key is stored (no account behind it).
-    ApiKey,
-    /// An ObSink Cloud session; `devices` lists the account's sessions.
+    /// A signed-in account; `devices` lists the account's sessions.
     Account {
         user_id: String,
         email: Option<String>,
@@ -169,28 +146,22 @@ struct DeviceInfo {
 }
 
 #[tauri::command]
-fn get_hosted_url() -> String {
-    hosted_worker_url()
-}
-
-#[tauri::command]
-async fn get_auth_capabilities(worker_url: String) -> Result<AuthCapabilities, String> {
-    let caps = AuthClient::new(&worker_url)
+async fn get_auth_capabilities(server_url: String) -> Result<AuthCapabilities, String> {
+    let caps = AuthClient::new(&server_url)
         .capabilities()
         .await
         .map_err(err_string)?;
     Ok(AuthCapabilities {
         email: caps.auth.email,
         apple: caps.auth.apple,
-        api_key: caps.auth.api_key,
     })
 }
 
-/// Send a one-time code. Returns the code itself only against a dev Worker
+/// Send a one-time code. Returns the code itself only against a dev server
 /// (`AUTH_DEV_RETURN_CODE=1`) so harnesses can complete the flow.
 #[tauri::command]
-async fn auth_email_start(worker_url: String, email: String) -> Result<Option<String>, String> {
-    let result = AuthClient::new(&worker_url)
+async fn auth_email_start(server_url: String, email: String) -> Result<Option<String>, String> {
+    let result = AuthClient::new(&server_url)
         .email_start(email.trim())
         .await
         .map_err(err_string)?;
@@ -199,27 +170,24 @@ async fn auth_email_start(worker_url: String, email: String) -> Result<Option<St
 
 #[tauri::command]
 async fn auth_email_verify(
-    worker_url: String,
+    server_url: String,
     email: String,
     code: String,
 ) -> Result<AccountState, String> {
-    let session = AuthClient::new(&worker_url)
+    let session = AuthClient::new(&server_url)
         .email_verify(email.trim(), code.trim(), &device_name())
         .await
         .map_err(err_string)?;
-    save_secret(&bearer_account(&worker_url), &session.token).map_err(err_string)?;
-    get_account(worker_url).await
+    save_secret(&bearer_account(&server_url), &session.token).map_err(err_string)?;
+    get_account(server_url).await
 }
 
 #[tauri::command]
-async fn get_account(worker_url: String) -> Result<AccountState, String> {
-    let Ok(bearer) = load_secret(&bearer_account(&worker_url)) else {
+async fn get_account(server_url: String) -> Result<AccountState, String> {
+    let Ok(bearer) = load_secret(&bearer_account(&server_url)) else {
         return Ok(AccountState::SignedOut);
     };
-    if !bearer.starts_with("os_") {
-        return Ok(AccountState::ApiKey);
-    }
-    match AuthClient::new(&worker_url).me(&bearer).await {
+    match AuthClient::new(&server_url).me(&bearer).await {
         Ok(me) => match me.user {
             Some(user) => Ok(AccountState::Account {
                 user_id: user.id,
@@ -235,38 +203,38 @@ async fn get_account(worker_url: String) -> Result<AccountState, String> {
                     })
                     .collect(),
             }),
-            None => Ok(AccountState::ApiKey),
+            // The operator bearer has no account behind it; the desktop only
+            // works with accounts.
+            None => Ok(AccountState::SignedOut),
         },
         Err(obsink_core::AuthError::Server { status, .. }) if status.as_u16() == 401 => {
             // Session revoked/expired elsewhere: forget it locally.
-            delete_secret(&bearer_account(&worker_url));
+            delete_secret(&bearer_account(&server_url));
             Ok(AccountState::SignedOut)
         }
         Err(error) => Err(err_string(error)),
     }
 }
 
-/// Sign out of (or forget the API key for) a Worker. Vault configs stay; sync
-/// will ask for a credential again.
+/// Sign out of a server. Vault configs stay; sync will ask for a credential
+/// again.
 #[tauri::command]
-async fn sign_out(worker_url: String) -> Result<(), String> {
-    let account = bearer_account(&worker_url);
+async fn sign_out(server_url: String) -> Result<(), String> {
+    let account = bearer_account(&server_url);
     if let Ok(bearer) = load_secret(&account) {
-        if bearer.starts_with("os_") {
-            // Best effort: the local credential goes away regardless.
-            let _ = AuthClient::new(&worker_url).logout(&bearer).await;
-        }
+        // Best effort: the local credential goes away regardless.
+        let _ = AuthClient::new(&server_url).logout(&bearer).await;
     }
     delete_secret(&account);
     Ok(())
 }
 
-/// Vaults the current credential can see on a Worker (for the Connect picker).
+/// Vaults the current credential can see on a server (for the Connect picker).
 #[tauri::command]
-async fn list_remote_vaults(worker_url: String, api_key: String) -> Result<Vec<VaultSummary>, String> {
-    let bearer = resolve_bearer(&worker_url, &api_key)?;
+async fn list_remote_vaults(server_url: String) -> Result<Vec<VaultSummary>, String> {
+    let bearer = load_bearer(&server_url)?;
     ApiClient::new(VaultConfig {
-        worker_url: normalize_worker_url(&worker_url),
+        server_url: normalize_server_url(&server_url),
         api_key: bearer,
         vault_id: String::new(),
         local_path: String::new(),
@@ -286,8 +254,7 @@ enum AddVaultMode {
 #[derive(Debug, Clone, Deserialize)]
 struct AddVaultRequest {
     mode: AddVaultMode,
-    worker_url: String,
-    api_key: String,
+    server_url: String,
     local_path: String,
     vault_name: String,
     vault_id: String,
@@ -353,11 +320,11 @@ fn set_active_vault(vault_id: String) -> Result<LocalVaultSummary, String> {
 #[tauri::command]
 async fn add_vault(request: AddVaultRequest) -> Result<LocalVaultSummary, String> {
     validate_request(&request)?;
-    let worker_url = normalize_worker_url(&request.worker_url);
-    let bearer = resolve_bearer(&worker_url, &request.api_key)?;
+    let server_url = normalize_server_url(&request.server_url);
+    let bearer = load_bearer(&server_url)?;
 
     let client = ApiClient::new(VaultConfig {
-        worker_url: worker_url.clone(),
+        server_url: server_url.clone(),
         api_key: bearer,
         vault_id: String::new(),
         local_path: request.local_path.clone(),
@@ -388,8 +355,7 @@ async fn add_vault(request: AddVaultRequest) -> Result<LocalVaultSummary, String
     let stored = StoredVault {
         id: vault_id.clone(),
         name: vault_name.clone(),
-        worker_url,
-        api_key: None,
+        server_url,
         local_path: request.local_path.clone(),
     };
 
@@ -509,9 +475,15 @@ async fn resolve_conflict_inner(
         .ok_or_else(|| format!("no pending conflict set for {}", vault_id))?;
     let key = load_key_from_keychain(&vault.id).map_err(err_string)?;
 
-    complete_sync(&to_vault_config(&vault), &key, &plan, &resolutions, progress)
-        .await
-        .map_err(err_string)
+    complete_sync(
+        &to_vault_config(&vault),
+        &key,
+        &plan,
+        &resolutions,
+        progress,
+    )
+    .await
+    .map_err(err_string)
 }
 
 #[tauri::command]
@@ -587,8 +559,8 @@ async fn get_conflict_preview(
 }
 
 fn validate_request(request: &AddVaultRequest) -> Result<(), String> {
-    if request.worker_url.trim().is_empty() {
-        return Err("worker URL is required".into());
+    if request.server_url.trim().is_empty() {
+        return Err("server URL is required".into());
     }
     if request.local_path.trim().is_empty() {
         return Err("local vault path is required".into());
@@ -639,12 +611,12 @@ fn active_vault(config: &StoredAppConfig) -> Option<&StoredVault> {
 }
 
 /// Bearer comes from the keychain; if it is missing the request goes out
-/// without one and the Worker's 401 surfaces as `ApiError::Unauthorized`
+/// without one and the server's 401 surfaces as `ApiError::Unauthorized`
 /// ("sign in again"), which is the message the user needs.
 fn to_vault_config(vault: &StoredVault) -> VaultConfig {
     VaultConfig {
-        worker_url: vault.worker_url.clone(),
-        api_key: load_secret(&bearer_account(&vault.worker_url)).unwrap_or_default(),
+        server_url: vault.server_url.clone(),
+        api_key: load_secret(&bearer_account(&vault.server_url)).unwrap_or_default(),
         vault_id: vault.id.clone(),
         local_path: vault.local_path.clone(),
     }
@@ -666,18 +638,8 @@ fn load_app_config() -> Result<StoredAppConfig, io::Error> {
     let mut config: StoredAppConfig = serde_json::from_str(&contents)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
 
-    // Pre-accounts configs kept the API key in this file; move it into the
-    // keychain once and rewrite without it.
-    let mut migrated = false;
     for vault in &mut config.vaults {
-        vault.worker_url = normalize_worker_url(&vault.worker_url);
-        if let Some(api_key) = vault.api_key.take() {
-            save_secret(&bearer_account(&vault.worker_url), &api_key)?;
-            migrated = true;
-        }
-    }
-    if migrated {
-        save_app_config(&config)?;
+        vault.server_url = normalize_server_url(&vault.server_url);
     }
     Ok(config)
 }
@@ -727,7 +689,7 @@ fn load_key_from_keychain(vault_id: &str) -> Result<KeyBytes, io::Error> {
 // --- Keychain -----------------------------------------------------------------
 //
 // Service `obsink`; account = vault ID for the derived key (hex) or
-// `bearer:<worker_url>` for the server credential. `OBSINK_KEYRING_DIR`
+// `bearer:<server_url>` for the server credential. `OBSINK_KEYRING_DIR`
 // swaps the macOS keychain for a directory of files so the live integration
 // test runs non-interactively; production builds leave it unset.
 
@@ -902,7 +864,6 @@ fn main() {
             auth_email_verify,
             get_account,
             get_auth_capabilities,
-            get_hosted_url,
             list_remote_vaults,
             sign_out,
             get_conflict_preview,
@@ -934,7 +895,10 @@ fn main() {
 #[cfg(test)]
 mod live_tests {
     use super::*;
-    use obsink_core::{derive_keys, load_manifest_from_disk, sync_manifest_path, ApiClient, ConflictResolutionChoice, VaultConfig};
+    use obsink_core::{
+        derive_keys, load_manifest_from_disk, sync_manifest_path, ApiClient,
+        ConflictResolutionChoice, VaultConfig,
+    };
     use std::{
         fs,
         path::{Path, PathBuf},
@@ -944,18 +908,16 @@ mod live_tests {
     /// `#[ignore]`d live integration test: drives the real desktop command
     /// functions (add_vault / set_active_vault / get_status / sync_vault_inner /
     /// get_conflict_preview_inner / resolve_conflict_inner) end-to-end against a
-    /// deployed Worker. Run with:
-    ///   OBSINK_TEST_WORKER_URL=... OBSINK_TEST_API_KEY=... \
+    /// running server, using the operator bearer. Run with:
+    ///   OBSINK_TEST_SERVER_URL=... OBSINK_TEST_API_KEY=... \
     ///   cargo test -p obsink-desktop live_tests -- --ignored --nocapture
     #[ignore]
     #[tokio::test]
     async fn desktop_flows_live() {
-        let worker_url = env_or_panic("OBSINK_TEST_WORKER_URL");
+        let server_url = normalize_server_url(&env_or_panic("OBSINK_TEST_SERVER_URL"));
         let api_key = env_or_panic("OBSINK_TEST_API_KEY");
-        let passphrase =
-            std::env::var("OBSINK_TEST_PASSPHRASE").unwrap_or_else(|_| {
-                "obsink-test-passphrase-2026".to_string()
-            });
+        let passphrase = std::env::var("OBSINK_TEST_PASSPHRASE")
+            .unwrap_or_else(|_| "obsink-test-passphrase-2026".to_string());
 
         // Sandbox HOME so the desktop's ~/.obsink/app.json is isolated from the
         // user's real config. (Keychain is real and keyed per vault id.)
@@ -972,6 +934,9 @@ mod live_tests {
         let keyring_dir = sandbox.join("keyring");
         fs::create_dir_all(&keyring_dir).unwrap();
         std::env::set_var("OBSINK_KEYRING_DIR", &keyring_dir);
+        // The desktop has no API-key entry any more; seed the operator bearer
+        // the way a sign-in would.
+        save_secret(&bearer_account(&server_url), &api_key).unwrap();
 
         let state = AppState::default();
         let file_rel = "notes/a.md";
@@ -979,8 +944,7 @@ mod live_tests {
         // ===== OBS-3: add (Create) + upload + cross-device download =====
         let summary = add_vault(AddVaultRequest {
             mode: AddVaultMode::Create,
-            worker_url: worker_url.clone(),
-            api_key: api_key.clone(),
+            server_url: server_url.clone(),
             local_path: dir_a.to_string_lossy().into_owned(),
             vault_name: "obsink-desktop-verify".to_string(),
             vault_id: String::new(),
@@ -991,10 +955,15 @@ mod live_tests {
         let vault_id = summary.id.clone();
         println!("OBS-3: created vault {vault_id}");
         load_key_from_keychain(&vault_id).expect("OBS-3: keychain entry present after add");
-        assert!(get_vaults().unwrap().iter().any(|v| v.id == vault_id && v.active));
+        assert!(get_vaults()
+            .unwrap()
+            .iter()
+            .any(|v| v.id == vault_id && v.active));
 
         fs::write(dir_a.join(file_rel), "content-A").unwrap();
-        let resp = sync_vault_inner(Some(vault_id.clone()), &state, &obsink_core::NoProgress).await.unwrap();
+        let resp = sync_vault_inner(Some(vault_id.clone()), &state, &obsink_core::NoProgress)
+            .await
+            .unwrap();
         assert!(resp.pending_conflicts.is_empty());
         assert_eq!(
             resp.completed_result.unwrap().upload.len(),
@@ -1005,8 +974,7 @@ mod live_tests {
         // Connect device B (same passphrase -> same key) and pull.
         add_vault(AddVaultRequest {
             mode: AddVaultMode::Connect,
-            worker_url: worker_url.clone(),
-            api_key: api_key.clone(),
+            server_url: server_url.clone(),
             local_path: dir_b.to_string_lossy().into_owned(),
             vault_name: String::new(),
             vault_id: vault_id.clone(),
@@ -1014,7 +982,9 @@ mod live_tests {
         })
         .await
         .unwrap(); // validate_passphrase decrypts a.md -> proves the key works
-        let resp_b = sync_vault_inner(Some(vault_id.clone()), &state, &obsink_core::NoProgress).await.unwrap();
+        let resp_b = sync_vault_inner(Some(vault_id.clone()), &state, &obsink_core::NoProgress)
+            .await
+            .unwrap();
         assert_eq!(
             resp_b.completed_result.unwrap().download.len(),
             1,
@@ -1029,9 +999,11 @@ mod live_tests {
         // ===== OBS-5: stale-vault detection (server ahead of client) =====
         // B uploads a new file the A-side view doesn't have.
         fs::write(dir_b.join("notes/b.md"), "B-only").unwrap();
-        sync_vault_inner(Some(vault_id.clone()), &state, &obsink_core::NoProgress).await.unwrap();
+        sync_vault_inner(Some(vault_id.clone()), &state, &obsink_core::NoProgress)
+            .await
+            .unwrap();
         // Repoint the active local folder at A (which is now behind the server).
-        connect_local(&worker_url, &api_key, &vault_id, &passphrase, &dir_a).await;
+        connect_local(&server_url, &vault_id, &passphrase, &dir_a).await;
         let status = get_status().await.unwrap();
         assert_eq!(status.active_vault_id.as_deref(), Some(vault_id.as_str()));
         assert!(
@@ -1048,7 +1020,9 @@ mod live_tests {
         for choice in choices {
             // Rebaseline: A's a.md == "REMOTE", then sync so server == local.
             fs::write(dir_a.join(file_rel), "REMOTE").unwrap();
-            let _ = sync_vault_inner(Some(vault_id.clone()), &state, &obsink_core::NoProgress).await.unwrap();
+            let _ = sync_vault_inner(Some(vault_id.clone()), &state, &obsink_core::NoProgress)
+                .await
+                .unwrap();
             let ts = server_modified_for(&dir_a, file_rel);
 
             // Engineer a conflict: different content, same (pinned) mtime.
@@ -1056,7 +1030,9 @@ mod live_tests {
             fs::write(dir_a.join(file_rel), &local_text).unwrap();
             set_mtime(&dir_a.join(file_rel), ts);
 
-            let resp = sync_vault_inner(Some(vault_id.clone()), &state, &obsink_core::NoProgress).await.unwrap();
+            let resp = sync_vault_inner(Some(vault_id.clone()), &state, &obsink_core::NoProgress)
+                .await
+                .unwrap();
             assert_eq!(
                 resp.pending_conflicts.len(),
                 1,
@@ -1065,15 +1041,18 @@ mod live_tests {
             assert!(resp.completed_result.is_none());
 
             // Side-by-side preview decrypts the remote blob via the desktop path.
-            let preview = get_conflict_preview_inner(
-                vault_id.clone(),
-                file_rel.to_string(),
-                &state,
-            )
-            .await
-            .unwrap();
-            assert_eq!(preview.local_text, local_text, "OBS-4 ({choice:?}): local preview");
-            assert_eq!(preview.remote_text, "REMOTE", "OBS-4 ({choice:?}): remote preview");
+            let preview =
+                get_conflict_preview_inner(vault_id.clone(), file_rel.to_string(), &state)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                preview.local_text, local_text,
+                "OBS-4 ({choice:?}): local preview"
+            );
+            assert_eq!(
+                preview.remote_text, "REMOTE",
+                "OBS-4 ({choice:?}): remote preview"
+            );
 
             let result = resolve_conflict_inner(
                 vault_id.clone(),
@@ -1093,7 +1072,7 @@ mod live_tests {
 
             match choice {
                 ConflictResolutionChoice::KeepLocal => {
-                    let remote = remote_text(&worker_url, &api_key, &vault_id, file_rel).await;
+                    let remote = remote_text(&server_url, &api_key, &vault_id, file_rel).await;
                     assert_eq!(
                         remote, local_text,
                         "OBS-4 (KeepLocal): server should hold the local version"
@@ -1113,7 +1092,7 @@ mod live_tests {
                         "OBS-4 (KeepBoth): a.conflict.md should hold the remote version"
                     );
                     assert_eq!(
-                        remote_text(&worker_url, &api_key, &vault_id, file_rel).await,
+                        remote_text(&server_url, &api_key, &vault_id, file_rel).await,
                         local_text,
                         "OBS-4 (KeepBoth): server should hold the local version"
                     );
@@ -1126,8 +1105,7 @@ mod live_tests {
         // ===== OBS-6: multiple-vault switching =====
         let s2 = add_vault(AddVaultRequest {
             mode: AddVaultMode::Create,
-            worker_url: worker_url.clone(),
-            api_key: api_key.clone(),
+            server_url: server_url.clone(),
             local_path: dir_c.to_string_lossy().into_owned(),
             vault_name: "obsink-desktop-verify-2".to_string(),
             vault_id: String::new(),
@@ -1139,7 +1117,11 @@ mod live_tests {
         // Both vaults' keys live in the keyring simultaneously.
         load_key_from_keychain(&vault_id).expect("OBS-6: vault 1 key resolves");
         load_key_from_keychain(&vault_id_2).expect("OBS-6: vault 2 key resolves");
-        assert_eq!(get_vaults().unwrap().len(), 2, "OBS-6: two vaults configured");
+        assert_eq!(
+            get_vaults().unwrap().len(),
+            2,
+            "OBS-6: two vaults configured"
+        );
 
         // Switch active back to vault 1; keychain lookup must follow the active id.
         let active = set_active_vault(vault_id.clone()).unwrap();
@@ -1157,15 +1139,15 @@ mod live_tests {
         let _ = fs::remove_dir_all(&sandbox);
     }
 
-    /// `#[ignore]`d live test for the ObSink Cloud account path: email code
-    /// sign-in, vault creation under the account, `get_account`, sign-out.
-    /// Needs a Worker running with `AUTH_DEV_RETURN_CODE=1` (wrangler dev):
-    ///   OBSINK_TEST_WORKER_URL=http://localhost:8799 \
+    /// `#[ignore]`d live test for the account path: email code sign-in, vault
+    /// creation under the account, `get_account`, sign-out. Needs a server
+    /// running with `AUTH_DEV_RETURN_CODE=1` (the local docker compose):
+    ///   OBSINK_TEST_SERVER_URL=http://localhost:8080 \
     ///   cargo test -p obsink-desktop account_flow_live -- --ignored --nocapture
     #[ignore]
     #[tokio::test]
     async fn account_flow_live() {
-        let worker_url = env_or_panic("OBSINK_TEST_WORKER_URL");
+        let server_url = normalize_server_url(&env_or_panic("OBSINK_TEST_SERVER_URL"));
         let sandbox = PathBuf::from(format!("/tmp/obsink-desktop-acct-{}", std::process::id()));
         let _ = fs::remove_dir_all(&sandbox);
         let dir = sandbox.join("vault");
@@ -1175,18 +1157,15 @@ mod live_tests {
         let keyring_dir = sandbox.join("keyring");
         fs::create_dir_all(&keyring_dir).unwrap();
         std::env::set_var("OBSINK_KEYRING_DIR", &keyring_dir);
-        // Make the Worker under test "ObSink Cloud" for hosted detection.
-        std::env::set_var("OBSINK_HOSTED_URL", &worker_url);
 
         assert!(matches!(
-            get_account(worker_url.clone()).await.unwrap(),
+            get_account(server_url.clone()).await.unwrap(),
             AccountState::SignedOut
         ));
         // Without a credential, adding a vault must fail with a sign-in hint.
         let denied = add_vault(AddVaultRequest {
             mode: AddVaultMode::Create,
-            worker_url: worker_url.clone(),
-            api_key: String::new(),
+            server_url: server_url.clone(),
             local_path: dir.to_string_lossy().into_owned(),
             vault_name: "denied".to_string(),
             vault_id: String::new(),
@@ -1197,29 +1176,35 @@ mod live_tests {
         assert!(denied.contains("sign in"), "{denied}");
 
         let email = format!("desktop-{}@example.com", std::process::id());
-        let code = auth_email_start(worker_url.clone(), email.clone())
+        let code = auth_email_start(server_url.clone(), email.clone())
             .await
             .unwrap()
-            .expect("dev Worker returns the code inline");
-        let state = auth_email_verify(worker_url.clone(), email.clone(), code)
+            .expect("dev server returns the code inline");
+        let state = auth_email_verify(server_url.clone(), email.clone(), code)
             .await
             .unwrap();
         match &state {
-            AccountState::Account { email: got, devices, .. } => {
+            AccountState::Account {
+                email: got,
+                devices,
+                ..
+            } => {
                 assert_eq!(got.as_deref(), Some(email.as_str()));
                 assert_eq!(devices.len(), 1);
                 assert!(devices[0].current);
             }
             other => panic!("expected account, got {other:?}"),
         }
-        assert!(fs::read_to_string(keyring_dir.join(format!("bearer_{}", normalize_worker_url(&worker_url).replace(['/', ':'], "_"))))
-            .unwrap()
-            .starts_with("os_"));
+        assert!(!fs::read_to_string(keyring_dir.join(format!(
+            "bearer_{}",
+            normalize_server_url(&server_url).replace(['/', ':'], "_")
+        )))
+        .unwrap()
+        .is_empty());
 
         let summary = add_vault(AddVaultRequest {
             mode: AddVaultMode::Create,
-            worker_url: worker_url.clone(),
-            api_key: String::new(),
+            server_url: server_url.clone(),
             local_path: dir.to_string_lossy().into_owned(),
             vault_name: "cloud-vault".to_string(),
             vault_id: String::new(),
@@ -1227,13 +1212,12 @@ mod live_tests {
         })
         .await
         .unwrap();
-        assert!(summary.hosted);
         // app.json must not contain the bearer.
         let app_json = fs::read_to_string(sandbox.join(".obsink/app.json")).unwrap();
         assert!(!app_json.contains("os_"), "{app_json}");
         assert!(!app_json.contains("api_key"), "{app_json}");
 
-        let listed = list_remote_vaults(worker_url.clone(), String::new()).await.unwrap();
+        let listed = list_remote_vaults(server_url.clone()).await.unwrap();
         assert_eq!(listed.iter().filter(|v| v.id == summary.id).count(), 1);
 
         let state = AppState::default();
@@ -1242,9 +1226,9 @@ mod live_tests {
             .unwrap();
         assert!(response.completed_result.is_some());
 
-        sign_out(worker_url.clone()).await.unwrap();
+        sign_out(server_url.clone()).await.unwrap();
         assert!(matches!(
-            get_account(worker_url.clone()).await.unwrap(),
+            get_account(server_url.clone()).await.unwrap(),
             AccountState::SignedOut
         ));
         let err = sync_vault_inner(Some(summary.id.clone()), &state, &obsink_core::NoProgress)
@@ -1260,17 +1244,10 @@ mod live_tests {
         std::env::var(key).unwrap_or_else(|_| panic!("set {key}"))
     }
 
-    async fn connect_local(
-        worker_url: &str,
-        api_key: &str,
-        vault_id: &str,
-        passphrase: &str,
-        local_path: &Path,
-    ) {
+    async fn connect_local(server_url: &str, vault_id: &str, passphrase: &str, local_path: &Path) {
         add_vault(AddVaultRequest {
             mode: AddVaultMode::Connect,
-            worker_url: worker_url.to_string(),
-            api_key: api_key.to_string(),
+            server_url: server_url.to_string(),
             local_path: local_path.to_string_lossy().into_owned(),
             vault_name: String::new(),
             vault_id: vault_id.to_string(),
@@ -1291,11 +1268,11 @@ mod live_tests {
             .unwrap();
     }
 
-    async fn remote_text(worker_url: &str, api_key: &str, vault_id: &str, path: &str) -> String {
+    async fn remote_text(server_url: &str, api_key: &str, vault_id: &str, path: &str) -> String {
         let key = load_key_from_keychain(vault_id).unwrap();
         let keys = derive_keys(&key);
         let config = VaultConfig {
-            worker_url: worker_url.to_string(),
+            server_url: server_url.to_string(),
             api_key: api_key.to_string(),
             vault_id: vault_id.to_string(),
             local_path: String::new(),

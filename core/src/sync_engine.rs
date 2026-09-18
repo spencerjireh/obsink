@@ -84,7 +84,8 @@ pub async fn prepare_sync(
     let diff = diff_manifests(&working_manifest, &remote_manifest);
 
     progress.report(ProgressEvent::Phase(SyncPhase::Downloading));
-    let download_failures = apply_downloads(local_root, &keys, &client, &diff.download, progress).await;
+    let download_failures =
+        apply_downloads(local_root, &keys, &client, &diff.download, progress).await;
 
     tracing::info!(
         vault = %config.vault_id,
@@ -199,7 +200,11 @@ pub async fn complete_sync(
                         deleted: false,
                         enc_path: String::new(),
                     });
-                    late_conflicts.push(Conflict { path, local, remote });
+                    late_conflicts.push(Conflict {
+                        path,
+                        local,
+                        remote,
+                    });
                 }
             }
             Err(error) => {
@@ -390,7 +395,9 @@ fn is_fatal_api_error(error: &ApiError) -> bool {
     match error {
         ApiError::Http(_) => true,
         ApiError::Unauthorized => true,
-        ApiError::UnexpectedStatus { status, .. } => matches!(status.as_u16(), 401 | 403 | 500..=599),
+        ApiError::UnexpectedStatus { status, .. } => {
+            matches!(status.as_u16(), 401 | 403 | 500..=599)
+        }
         ApiError::Crypto(_) | ApiError::Conflict { .. } => false,
     }
 }
@@ -676,7 +683,7 @@ mod tests {
 
     fn config(base_url: String, local_path: String) -> VaultConfig {
         VaultConfig {
-            worker_url: base_url,
+            server_url: base_url,
             api_key: "token".to_string(),
             vault_id: "vault_123".to_string(),
             local_path,
@@ -861,19 +868,22 @@ mod tests {
             .await;
         let put_a = server
             .mock_async(move |when, then| {
-                when.method(PUT).path(format!("/vaults/vault_123/files/{token_a}"));
+                when.method(PUT)
+                    .path(format!("/vaults/vault_123/files/{token_a}"));
                 then.status(200);
             })
             .await;
         let _put_b = server
             .mock_async(move |when, then| {
-                when.method(PUT).path(format!("/vaults/vault_123/files/{token_b}"));
+                when.method(PUT)
+                    .path(format!("/vaults/vault_123/files/{token_b}"));
                 then.status(413).body("file too large");
             })
             .await;
         let put_c = server
             .mock_async(move |when, then| {
-                when.method(PUT).path(format!("/vaults/vault_123/files/{token_c}"));
+                when.method(PUT)
+                    .path(format!("/vaults/vault_123/files/{token_c}"));
                 then.status(200);
             })
             .await;
@@ -919,19 +929,22 @@ mod tests {
             .await;
         let put_a = server
             .mock_async(move |when, then| {
-                when.method(PUT).path(format!("/vaults/vault_123/files/{token_a}"));
+                when.method(PUT)
+                    .path(format!("/vaults/vault_123/files/{token_a}"));
                 then.status(200);
             })
             .await;
         let _put_b = server
             .mock_async(move |when, then| {
-                when.method(PUT).path(format!("/vaults/vault_123/files/{token_b}"));
+                when.method(PUT)
+                    .path(format!("/vaults/vault_123/files/{token_b}"));
                 then.status(500).body("server error");
             })
             .await;
         let put_c = server
             .mock_async(move |when, then| {
-                when.method(PUT).path(format!("/vaults/vault_123/files/{token_c}"));
+                when.method(PUT)
+                    .path(format!("/vaults/vault_123/files/{token_c}"));
                 then.status(200);
             })
             .await;
