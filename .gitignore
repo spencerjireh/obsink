@@ -1,21 +1,15 @@
 /target/
-/worker/node_modules/
-/worker/.wrangler/
-/worker/wrangler.toml
 /desktop/node_modules/
 /desktop/dist/
 /desktop/src-tauri/gen/
-/.terraform/
-*.tfstate
-*.tfstate.*
-/infra/terraform/.terraform/
-/infra/terraform/terraform.tfvars
+
+# Server data dir when running the binary outside Docker
+/server/data/
 
 # Secrets / local env (never commit)
 .env
 .env.*
 !.env.example
-/worker/.dev.vars
 
 # macOS
 .DS_Store
