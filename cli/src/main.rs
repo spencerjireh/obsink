@@ -22,6 +22,7 @@ const CONFIG_FILE: &str = ".obsink/config.toml";
 
 #[derive(Debug, Parser)]
 #[command(name = "obsink")]
+#[command(version)]
 #[command(about = "Local-first Obsidian vault sync tooling")]
 struct Cli {
     #[command(subcommand)]
