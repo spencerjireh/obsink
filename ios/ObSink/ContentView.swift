@@ -5,6 +5,8 @@ struct ContentView: View {
     @StateObject private var model = SyncModel()
     @Environment(\.scenePhase) private var scenePhase
     @State private var showingAddVault = false
+    @State private var showingSignIn = false
+    @State private var confirmingDeleteAccount = false
 
     var body: some View {
         NavigationStack {
@@ -23,6 +25,16 @@ struct ContentView: View {
                             }
                         }
                         .accessibilityIdentifier("activeVaultPicker")
+                        if let usage = model.vaultUsageText(for: model.activeVaultID) {
+                            Text(usage).font(.caption.monospaced()).foregroundStyle(.secondary)
+                                .accessibilityIdentifier("vaultUsageText")
+                        }
+                        NavigationLink {
+                            VaultDetailView(model: model, vaultID: model.activeVaultID)
+                        } label: {
+                            Label("Manage vault", systemImage: "externaldrive")
+                        }
+                        .accessibilityIdentifier("manageVaultButton")
                     }
                     Button("Add vault") { showingAddVault = true }
                         .accessibilityIdentifier("addVaultButton")
@@ -87,26 +99,43 @@ struct ContentView: View {
                             Text(usage).font(.caption).foregroundStyle(.secondary)
                                 .accessibilityIdentifier("usageText")
                         }
-                        Button("Invite someone") { model.createInvite() }
-                            .disabled(model.busy)
-                            .accessibilityIdentifier("inviteButton")
-                        if let invite = model.issuedInvite {
-                            HStack {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text("Invite code").font(.caption).foregroundStyle(.secondary)
-                                    Text(invite.code).font(.body.monospaced()).textSelection(.enabled)
-                                        .accessibilityIdentifier("inviteCodeText")
-                                }
-                                Spacer()
-                                Button("Copy") { UIPasteboard.general.string = invite.code }
+                        if model.account != nil {
+                            NavigationLink {
+                                DevicesView(model: model)
+                            } label: {
+                                Label("Devices", systemImage: "iphone")
+                                    .badge(model.account?.devices.count ?? 0)
                             }
+                            .accessibilityIdentifier("devicesLink")
                         }
+                        NavigationLink {
+                            InvitesView(model: model)
+                        } label: {
+                            Label("Invites", systemImage: "envelope")
+                                .badge(model.invites.filter { $0.status == "active" }.count)
+                        }
+                        .accessibilityIdentifier("invitesLink")
                         Button("Sign out", role: .destructive) { model.signOut() }
                             .disabled(model.busy)
                             .accessibilityIdentifier("signOutButton")
+                        if model.account != nil {
+                            Button("Delete account", role: .destructive) { confirmingDeleteAccount = true }
+                                .disabled(model.busy)
+                                .accessibilityIdentifier("deleteAccountButton")
+                        }
                     } else {
-                        Text("Signed out — add the vault again to sign in.")
-                            .font(.caption).foregroundStyle(.orange)
+                        if model.sessionExpired {
+                            Label(MobileError.sessionExpiredMessage, systemImage: "exclamationmark.triangle")
+                                .font(.caption).foregroundStyle(.red)
+                                .accessibilityIdentifier("sessionExpiredText")
+                        } else {
+                            Text("Signed out.").font(.caption).foregroundStyle(.orange)
+                        }
+                        if !model.vaultID.isEmpty {
+                            Button("Sign in") { showingSignIn = true }
+                                .disabled(model.busy)
+                                .accessibilityIdentifier("signInButton")
+                        }
                     }
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Server").font(.caption).foregroundStyle(.secondary)
@@ -188,6 +217,23 @@ struct ContentView: View {
             }
             .sheet(isPresented: $showingAddVault) {
                 AddVaultView { model.addVault($0) }
+            }
+            .sheet(isPresented: $showingSignIn, onDismiss: { model.reloadBearerState() }) {
+                AddVaultView(initialServerURL: model.serverURL, signInOnly: true)
+            }
+            .sheet(isPresented: $confirmingDeleteAccount) {
+                TypedConfirmationSheet(
+                    title: "Delete account",
+                    message: "This deletes your account, every vault it owns on \(model.serverURL), and every signed-in device. The copies on this device are removed too.",
+                    expected: model.accountEmail ?? "delete",
+                    caseInsensitive: true,
+                    confirmLabel: "Delete account"
+                ) {
+                    model.deleteAccount()
+                }
+            }
+            .alert(item: $model.alert) { alert in
+                Alert(title: Text(alert.title), message: Text(alert.message), dismissButton: .default(Text("OK")))
             }
         }
     }
@@ -321,15 +367,31 @@ private struct ConflictDetailView: View {
 /// (spec §12.1/§12.2). The bearer goes to the Keychain under the server URL;
 /// the derived vault key under the vault ID.
 struct AddVaultView: View {
-    var onAdd: (VaultEntry) -> Void
+    var onAdd: (VaultEntry) -> Void = { _ in }
+    /// Sign-in only: no vault sections, a `Done` button once signed in. Used
+    /// after a session expired.
+    var signInOnly = false
     @Environment(\.dismiss) private var dismiss
 
     private static let lastServerKey = "lastServerURL"
 
+    init(initialServerURL: String? = nil, signInOnly: Bool = false, onAdd: @escaping (VaultEntry) -> Void = { _ in }) {
+        self.onAdd = onAdd
+        self.signInOnly = signInOnly
+        let remembered = (UserDefaults(suiteName: SyncModel.appGroup) ?? .standard)
+            .string(forKey: AddVaultView.lastServerKey)
+        _serverURL = State(initialValue: initialServerURL ?? remembered ?? "https://")
+    }
+
     @State private var mode: Mode = .create
-    @State private var serverURL: String = {
-        (UserDefaults(suiteName: SyncModel.appGroup) ?? .standard).string(forKey: AddVaultView.lastServerKey) ?? "https://"
-    }()
+    @State private var serverURL: String = "https://"
+    /// `GET /` for the typed server; nil until fetched (then everything shows).
+    @State private var capabilities: MobileCapabilities?
+    @State private var capabilitiesTask: Task<Void, Never>?
+    /// The server refused a sign-up without an invite: show the field even if
+    /// capabilities said none was needed.
+    @State private var inviteForced = false
+    @FocusState private var inviteFocused: Bool
     @State private var name = ""
     @State private var passphrase = ""
     @State private var available: [MobileVaultSummary] = []
@@ -381,10 +443,14 @@ struct AddVaultView: View {
                         .keyboardType(.URL)
                         .onChange(of: serverURL) { _, _ in
                             available = []; pickedVaultID = nil; status = ""
+                            inviteForced = false
                             refreshSignInState()
+                            scheduleCapabilities()
                         }
+                        .onSubmit { fetchCapabilities() }
                     signInSection
                 }
+                if !signInOnly {
                 Section {
                     Picker("", selection: $mode) {
                         ForEach(Mode.allCases) { Text($0.rawValue).tag($0) }
@@ -393,7 +459,10 @@ struct AddVaultView: View {
                     .labelsHidden()
                     .accessibilityIdentifier("modePicker")
                 }
-                if mode == .create {
+                }
+                if signInOnly {
+                    // Nothing else: the vault sections belong to Add vault.
+                } else if mode == .create {
                     Section("New vault") {
                         LabeledField("Vault name", text: $name, identifier: "addVaultName")
                     }
@@ -416,25 +485,68 @@ struct AddVaultView: View {
                         }
                     }
                 }
-                Section {
-                    SecureField("Passphrase", text: $passphrase)
-                        .accessibilityIdentifier("addVaultPassphraseField")
+                if !signInOnly {
+                    Section {
+                        SecureField("Passphrase", text: $passphrase)
+                            .accessibilityIdentifier("addVaultPassphraseField")
+                    }
                 }
                 if !status.isEmpty {
                     Text(status).font(.caption).foregroundStyle(.red)
                         .accessibilityIdentifier("addVaultStatusText")
                 }
-                Section {
-                    Button(mode == .create ? "Create vault" : "Connect vault") { submit() }
-                        .disabled(!canSubmit)
-                        .accessibilityIdentifier("addVaultSubmitButton")
+                if !signInOnly {
+                    Section {
+                        Button(mode == .create ? "Create vault" : "Connect vault") { submit() }
+                            .disabled(!canSubmit)
+                            .accessibilityIdentifier("addVaultSubmitButton")
+                    }
                 }
             }
-            .navigationTitle("Add vault")
-            .toolbar { Button("Cancel") { dismiss() } }
-            .onAppear { refreshSignInState() }
+            .navigationTitle(signInOnly ? "Sign in" : "Add vault")
+            .toolbar {
+                if signInOnly {
+                    Button("Done") { dismiss() }
+                        .disabled(!signedIn)
+                        .accessibilityIdentifier("addVaultDoneButton")
+                } else {
+                    Button("Cancel") { dismiss() }
+                }
+            }
+            .onAppear {
+                refreshSignInState()
+                fetchCapabilities()
+            }
         }
     }
+
+    // MARK: Capabilities (`GET /`)
+
+    /// Refetch 400 ms after the last keystroke; a stale answer for an old URL
+    /// is dropped.
+    private func scheduleCapabilities() {
+        capabilitiesTask?.cancel()
+        capabilities = nil
+        guard hasServer else { return }
+        capabilitiesTask = Task {
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            guard !Task.isCancelled else { return }
+            fetchCapabilities()
+        }
+    }
+
+    private func fetchCapabilities() {
+        guard hasServer else { capabilities = nil; return }
+        let url = canonicalURL
+        Task.detached {
+            let caps = try? authCapabilities(serverUrl: url)
+            await MainActor.run { if canonicalURL == url { capabilities = caps } }
+        }
+    }
+
+    private var offersApple: Bool { capabilities?.apple ?? true }
+    private var offersEmail: Bool { capabilities?.email ?? true }
+    private var showInviteField: Bool { (capabilities?.inviteRequired ?? true) || inviteForced }
 
     // MARK: Sign-in
 
@@ -450,23 +562,35 @@ struct AddVaultView: View {
                 Spacer()
                 Button("Sign out") { signOut() }.disabled(busy)
             }
+        } else if !offersApple && !offersEmail {
+            Text("This server has no sign-in method this app supports.")
+                .font(.caption).foregroundStyle(.secondary)
         } else {
-            SignInWithAppleButton(.signIn) { request in
-                request.requestedScopes = [.email]
-            } onCompletion: { result in
-                handleApple(result)
+            if offersApple {
+                SignInWithAppleButton(.signIn) { request in
+                    request.requestedScopes = [.email]
+                } onCompletion: { result in
+                    handleApple(result)
+                }
+                .signInWithAppleButtonStyle(.black)
+                .frame(height: 44)
+                .accessibilityIdentifier("signInWithAppleButton")
             }
-            .signInWithAppleButtonStyle(.black)
-            .frame(height: 44)
-            .accessibilityIdentifier("signInWithAppleButton")
-            Text("or use your email").font(.caption).foregroundStyle(.secondary)
-            LabeledField("Email", text: $authEmail, identifier: "addVaultEmail")
-                .keyboardType(.emailAddress)
-                .disabled(codeSent)
-            LabeledField("Invite code (new accounts only)", text: $inviteCode, identifier: "addVaultInviteCode")
-                .textInputAutocapitalization(.characters)
-                .autocorrectionDisabled()
-            if codeSent {
+            if offersApple && offersEmail {
+                Text("or use your email").font(.caption).foregroundStyle(.secondary)
+            }
+            if offersEmail {
+                LabeledField("Email", text: $authEmail, identifier: "addVaultEmail")
+                    .keyboardType(.emailAddress)
+                    .disabled(codeSent)
+            }
+            if showInviteField {
+                LabeledField("Invite code", text: $inviteCode, identifier: "addVaultInviteCode")
+                    .textInputAutocapitalization(.characters)
+                    .autocorrectionDisabled()
+                    .focused($inviteFocused)
+            }
+            if offersEmail && codeSent {
                 if pendingAppleToken != nil {
                     Text("Enter the code sent to \(authEmail) to link it to your Apple ID.")
                         .font(.caption).foregroundStyle(.secondary)
@@ -477,7 +601,7 @@ struct AddVaultView: View {
                     .disabled(busy || authCode.trimmingCharacters(in: .whitespaces).count != 6)
                     .accessibilityIdentifier("verifyCodeButton")
                 Button("Change email") { codeSent = false; authCode = ""; pendingAppleToken = nil }.disabled(busy)
-            } else {
+            } else if offersEmail {
                 Button("Send sign-in code") { sendCode() }
                     .disabled(busy || !authEmail.contains("@"))
                     .accessibilityIdentifier("sendCodeButton")
@@ -494,8 +618,50 @@ struct AddVaultView: View {
         signedIn = true
         let url = canonicalURL
         Task.detached {
-            let email = (try? authMe(serverUrl: url, token: token))?.email
-            await MainActor.run { if canonicalURL == url { accountEmail = email } }
+            // The operator bearer has no account and answers with `Sync`; only
+            // a 401 means the stored bearer is dead.
+            let result = Result { try authMe(serverUrl: url, token: token) }
+            await MainActor.run {
+                guard canonicalURL == url else { return }
+                switch result {
+                case .success(let account):
+                    accountEmail = account.email
+                case .failure(let error) where error.isUnauthorized:
+                    KeychainStore.deleteBearer(serverURL: url)
+                    signedIn = false
+                    accountEmail = nil
+                    status = MobileError.sessionExpiredMessage
+                case .failure:
+                    break
+                }
+            }
+        }
+    }
+
+    /// Every sign-in failure lands here: an invite refusal reveals and
+    /// focuses the field; everything else shows its message.
+    private func signInFailed(_ error: Error) {
+        busy = false
+        if let mobile = error as? MobileError, mobile.isInviteRequired {
+            inviteForced = true
+            inviteFocused = true
+            status = "Enter the invite code you were given."
+        } else {
+            status = error.obsinkMessage
+        }
+    }
+
+    /// A vault call failed after sign-in: a 401 drops the bearer and shows
+    /// the sign-in controls again.
+    private func vaultCallFailed(_ error: Error) {
+        busy = false
+        if error.isUnauthorized {
+            KeychainStore.deleteBearer(serverURL: canonicalURL)
+            signedIn = false
+            accountEmail = nil
+            status = MobileError.sessionExpiredMessage
+        } else {
+            status = error.obsinkMessage
         }
     }
 
@@ -519,7 +685,7 @@ struct AddVaultView: View {
                     if let devCode { authCode = devCode }
                 }
             } catch {
-                await MainActor.run { status = error.localizedDescription; busy = false }
+                await MainActor.run { signInFailed(error) }
             }
         }
     }
@@ -548,7 +714,7 @@ struct AddVaultView: View {
                     rememberServer()
                 }
             } catch {
-                await MainActor.run { status = error.localizedDescription; busy = false }
+                await MainActor.run { signInFailed(error) }
             }
         }
     }
@@ -583,7 +749,7 @@ struct AddVaultView: View {
                 } catch {
                     // The token had no email claim: the server links the hint
                     // only once a one-time code for that address checks out.
-                    if let email, error.localizedDescription.contains("email verification required") {
+                    if let email, (error as? MobileError)?.needsEmailVerification == true {
                         do {
                             let devCode = try authEmailStart(serverUrl: url, email: email)
                             await MainActor.run {
@@ -595,11 +761,11 @@ struct AddVaultView: View {
                             }
                             return
                         } catch {
-                            await MainActor.run { status = error.localizedDescription; busy = false }
+                            await MainActor.run { signInFailed(error) }
                             return
                         }
                     }
-                    await MainActor.run { status = error.localizedDescription; busy = false }
+                    await MainActor.run { signInFailed(error) }
                 }
             }
         }
@@ -634,7 +800,7 @@ struct AddVaultView: View {
                     if vaults.isEmpty { status = "No vaults found at this server." }
                 }
             } catch {
-                await MainActor.run { status = error.localizedDescription; busy = false }
+                await MainActor.run { vaultCallFailed(error) }
             }
         }
     }
@@ -680,7 +846,7 @@ struct AddVaultView: View {
                     }
                 }
             } catch {
-                await MainActor.run { status = error.localizedDescription; busy = false }
+                await MainActor.run { vaultCallFailed(error) }
             }
         }
     }
