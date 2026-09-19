@@ -180,16 +180,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 Some(email) => email,
                 None => prompt_line("Email: ")?,
             };
-            let start = auth.email_start(&email).await?;
-            let code = match (code, start.code) {
-                (Some(code), _) => code,
-                (None, Some(dev_code)) => {
-                    eprintln!("(dev server returned the code inline)");
-                    dev_code
-                }
-                (None, None) => {
-                    println!("Sent a 6-digit code to {email}.");
-                    prompt_line("Code: ")?
+            // A supplied --code belongs to a code already sent; requesting
+            // another would replace it server-side.
+            let code = match code {
+                Some(code) => code,
+                None => {
+                    let start = auth.email_start(&email).await?;
+                    match start.code {
+                        Some(dev_code) => {
+                            eprintln!("(dev server returned the code inline)");
+                            dev_code
+                        }
+                        None => {
+                            println!("Sent a 6-digit code to {email}.");
+                            prompt_line("Code: ")?
+                        }
+                    }
                 }
             };
             let device = device_name.unwrap_or_else(default_device_name);
