@@ -1,6 +1,8 @@
-import type { AccountState, InviteInfo } from '../types'
+import { useEffect, useRef } from 'react'
+import type { AccountState, AuthCapabilities, InviteInfo } from '../types'
 import { formatUnix, usageLine } from '../lib/format'
 import { DEFAULT_SERVER_URL } from '../lib/server-url'
+import { EmptyState } from './EmptyState'
 
 type Props = {
   serverUrl: string
@@ -11,6 +13,12 @@ type Props = {
   codeSent: boolean
   issuedInvite: InviteInfo | null
   busy: boolean
+  capabilities: AuthCapabilities | null
+  // Show the invite field: the server needs one for new accounts, or it
+  // just refused a sign-up without one.
+  inviteRequired: boolean
+  // Bumped when the field should take focus (after that refusal).
+  inviteFocusAt: number
   onServerUrlChange: (value: string) => void
   onServerUrlBlur: () => void
   onAuthEmailChange: (value: string) => void
@@ -33,6 +41,9 @@ export function AccountSection({
   codeSent,
   issuedInvite,
   busy,
+  capabilities,
+  inviteRequired,
+  inviteFocusAt,
   onServerUrlChange,
   onServerUrlBlur,
   onAuthEmailChange,
@@ -46,6 +57,13 @@ export function AccountSection({
   onSignOut,
 }: Props) {
   const noServer = serverUrl.trim() === DEFAULT_SERVER_URL
+  const inviteRef = useRef<HTMLInputElement>(null)
+
+  useEffect(() => {
+    if (inviteFocusAt > 0) {
+      inviteRef.current?.focus()
+    }
+  }, [inviteFocusAt])
 
   return (
     <section className="section" id="setup-account" aria-labelledby="account-heading">
@@ -107,6 +125,8 @@ export function AccountSection({
             </div>
           ) : null}
         </>
+      ) : capabilities && !capabilities.email ? (
+        <EmptyState>This server has no email sign-in.</EmptyState>
       ) : (
         <div className="form-grid">
           <label>
@@ -118,16 +138,19 @@ export function AccountSection({
               onChange={(event) => onAuthEmailChange(event.target.value)}
             />
           </label>
-          <label>
-            <span>Invite code (new accounts only)</span>
-            <input
-              className="mono"
-              autoCapitalize="characters"
-              placeholder="optional"
-              value={inviteCode}
-              onChange={(event) => onInviteCodeChange(event.target.value)}
-            />
-          </label>
+          {inviteRequired ? (
+            <label>
+              <span>Invite code</span>
+              <input
+                ref={inviteRef}
+                className="mono"
+                autoCapitalize="characters"
+                placeholder="new accounts only"
+                value={inviteCode}
+                onChange={(event) => onInviteCodeChange(event.target.value)}
+              />
+            </label>
+          ) : null}
           {codeSent ? (
             <label>
               <span>6-digit code</span>

@@ -146,6 +146,8 @@ fn device_name() -> String {
 struct AuthCapabilities {
     email: bool,
     apple: bool,
+    /// New accounts need an invite code once the server has any user.
+    invite_required: bool,
 }
 
 /// What the UI shows for a server's credential state.
@@ -197,6 +199,7 @@ async fn get_auth_capabilities(server_url: String) -> Result<AuthCapabilities, C
     Ok(AuthCapabilities {
         email: caps.auth.email,
         apple: caps.auth.apple,
+        invite_required: caps.invite_required,
     })
 }
 

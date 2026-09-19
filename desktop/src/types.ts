@@ -108,6 +108,10 @@ export type AccountState =
 
 export type InviteInfo = { code: string; expires: number }
 
+// `GET /` on the server: which sign-in methods exist and whether a new
+// account needs an invite code.
+export type AuthCapabilities = { email: boolean; apple: boolean; invite_required: boolean }
+
 export type RemoteVault = { id: string; name: string; created: number }
 
 // Which pane the main area shows. Setup replaces the vault pane; the sidebar
