@@ -79,7 +79,7 @@ struct ContentView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .tint(Color("Amber"))
-                    .disabled(model.busy || model.vaultID.isEmpty || (model.passphrase.isEmpty && !model.hasStoredKey))
+                    .disabled(model.busy || model.vaultID.isEmpty || model.sessionExpired || (model.passphrase.isEmpty && !model.hasStoredKey))
                     .accessibilityIdentifier("syncButton")
 
                     if model.busy, let p = model.progress {

@@ -445,30 +445,36 @@ final class SyncModel: ObservableObject {
     func vaultUsageText(for vaultID: String) -> String? {
         guard !vaultID.isEmpty, let usage = accountUsage else { return nil }
         let bytes = usage.vaults.first { $0.id == vaultID }?.bytes ?? 0
-        let used = Self.binaryFormatter.string(fromByteCount: Int64(bytes))
+        let used = Self.formatBytes(bytes)
         guard let cap = usage.maxVaultBytes else { return used }
-        return "\(used) of \(Self.binaryFormatter.string(fromByteCount: Int64(cap)))"
+        return "\(used) of \(Self.formatBytes(cap))"
     }
 
-    /// Binary units (`MiB`), as DESIGN.md §5 requires.
-    static let binaryFormatter: ByteCountFormatter = {
-        let formatter = ByteCountFormatter()
-        formatter.countStyle = .binary
-        return formatter
-    }()
+    /// Binary units (`1.2 MiB`), as DESIGN.md §5 requires and the desktop
+    /// prints; `ByteCountFormatter` would say "Zero KB" and "1 GB".
+    nonisolated static func formatBytes(_ value: UInt64) -> String {
+        if value < 1024 { return "\(value) B" }
+        let units = ["KiB", "MiB", "GiB", "TiB"]
+        var size = Double(value) / 1024
+        var unit = 0
+        while size >= 1024 && unit < units.count - 1 {
+            size /= 1024
+            unit += 1
+        }
+        return String(format: size < 10 ? "%.1f %@" : "%.0f %@", size, units[unit])
+    }
 
-    /// "12 MiB used · 2 of 10 vaults · 1 GiB per vault", or nil when unknown.
+    /// "12 MiB used · 2 of 10 vaults · 1.0 GiB per vault", or nil when unknown.
     var usageText: String? {
         guard let usage = accountUsage else { return nil }
-        let formatter = Self.binaryFormatter
-        var parts = [formatter.string(fromByteCount: Int64(usage.totalBytes)) + " used"]
+        var parts = [Self.formatBytes(usage.totalBytes) + " used"]
         if let maxVaults = usage.maxVaults {
             parts.append("\(usage.vaults.count) of \(maxVaults) vaults")
         } else {
             parts.append("\(usage.vaults.count) vaults")
         }
         if let perVault = usage.maxVaultBytes {
-            parts.append(formatter.string(fromByteCount: Int64(perVault)) + " per vault")
+            parts.append(Self.formatBytes(perVault) + " per vault")
         }
         return parts.joined(separator: " · ")
     }

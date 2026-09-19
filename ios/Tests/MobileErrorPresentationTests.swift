@@ -36,3 +36,13 @@ final class MobileErrorPresentationTests: XCTestCase {
         XCTAssertFalse(error.isUnauthorized)
     }
 }
+
+final class ByteFormattingTests: XCTestCase {
+    func testBinaryUnitsMatchTheDesktop() {
+        XCTAssertEqual(SyncModel.formatBytes(0), "0 B")
+        XCTAssertEqual(SyncModel.formatBytes(36), "36 B")
+        XCTAssertEqual(SyncModel.formatBytes(1536), "1.5 KiB")
+        XCTAssertEqual(SyncModel.formatBytes(412 * 1024 * 1024), "412 MiB")
+        XCTAssertEqual(SyncModel.formatBytes(1024 * 1024 * 1024), "1.0 GiB")
+    }
+}
