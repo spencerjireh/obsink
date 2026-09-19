@@ -1,0 +1,57 @@
+# Production stack for Coolify (or any compose host behind a TLS proxy).
+# The server speaks plain HTTP on 8080; Coolify's Traefik terminates TLS and
+# routes the domain to it. Set these in the Coolify environment:
+#   OBSINK_SERVER_KEY   `obsink-server keygen` output; back it up
+#   OBSINK_API_KEY      operator bearer for the admin CLI and verify scripts
+#   POSTGRES_PASSWORD   database password
+#   SMTP_HOST/PORT/USERNAME/PASSWORD/FROM/TLS   for email sign-in
+#   APPLE_CLIENT_IDS    default com.obsink.ios
+# See docs/self-hosting.md.
+
+services:
+  server:
+    image: ghcr.io/spencerjireh/obsink-server:latest
+    environment:
+      DATABASE_URL: postgres://obsink:${POSTGRES_PASSWORD}@postgres:5432/obsink
+      OBSINK_SERVER_KEY: ${OBSINK_SERVER_KEY}
+      OBSINK_API_KEY: ${OBSINK_API_KEY}
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USERNAME: ${SMTP_USERNAME}
+      SMTP_PASSWORD: ${SMTP_PASSWORD}
+      SMTP_FROM: ${SMTP_FROM}
+      SMTP_TLS: ${SMTP_TLS:-starttls}
+      APPLE_CLIENT_IDS: ${APPLE_CLIENT_IDS:-com.obsink.ios}
+      MAX_VAULTS_PER_USER: ${MAX_VAULTS_PER_USER:-10}
+      MAX_VAULT_BYTES: ${MAX_VAULT_BYTES:-1073741824}
+      RUST_LOG: ${RUST_LOG:-obsink_server=info}
+    volumes:
+      - obsink-data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "obsink-server", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: obsink
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: obsink
+    volumes:
+      - obsink-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U obsink -d obsink"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  obsink-data:
+  obsink-pg:

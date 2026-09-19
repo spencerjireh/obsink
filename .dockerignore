@@ -1,0 +1,10 @@
+target/
+**/node_modules/
+desktop/dist/
+desktop/src-tauri/gen/
+ios/
+.git/
+.env
+.env.*
+!.env.example
+server/data/

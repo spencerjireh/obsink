@@ -19,6 +19,33 @@ jobs:
       - name: Test core, CLI, and mobile facade
         run: cargo test -p obsink-core -p obsink -p obsink-mobile
 
+  server:
+    name: server (postgres)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      OBSINK_TEST_REQUIRE_DB: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test server against Postgres
+        run: cargo test -p obsink-server
+      - name: Build server image
+        run: docker build -f server/Dockerfile .
+
   desktop:
     name: desktop (macOS)
     runs-on: macos-latest
