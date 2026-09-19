@@ -1,0 +1,24 @@
+# Git hooks (https://lefthook.dev). Once per clone: `brew install lefthook && lefthook install`.
+# CI runs the same checks (cargo fmt --check, prettier --check, scripts/check-commit-msg.sh),
+# so a bypassed hook is caught on the PR.
+
+pre-commit:
+  skip:
+    - merge
+    - rebase
+  jobs:
+    - name: rustfmt
+      glob: "*.rs"
+      run: rustfmt --edition 2021 {staged_files}
+      stage_fixed: true
+    - name: prettier
+      root: "desktop/"
+      glob: "*.{ts,tsx,css,json}"
+      # --no: fail loudly if desktop/node_modules is missing instead of downloading prettier
+      run: npx --no prettier --write {staged_files}
+      stage_fixed: true
+
+commit-msg:
+  jobs:
+    - name: commit-message
+      run: scripts/check-commit-msg.sh --file {1}

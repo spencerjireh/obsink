@@ -21,3 +21,6 @@
 /ios/build/
 /ios/DerivedData/
 /ios/headers/
+
+# lefthook per-clone overrides
+lefthook-local.yml
