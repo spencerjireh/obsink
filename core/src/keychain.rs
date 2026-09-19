@@ -32,9 +32,7 @@ fn write_private(path: &Path, value: &str) -> io::Result<()> {
         .mode(0o600)
         .open(path)?;
     // An existing file keeps its old mode through `open`; make it private too.
-    file.set_permissions(fs::Permissions::from(
-        <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
-    ))?;
+    file.set_permissions(<fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600))?;
     file.write_all(value.as_bytes())
 }
 
