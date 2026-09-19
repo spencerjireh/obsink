@@ -8,3 +8,6 @@ ios/
 .env.*
 !.env.example
 server/data/
+# Docker builds use the image's own toolchain (rust:1.97-bookworm); without this rustup
+# would install the pinned toolchain + components inside every build.
+rust-toolchain.toml

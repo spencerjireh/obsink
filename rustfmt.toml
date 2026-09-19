@@ -1,0 +1,3 @@
+# Explicit defaults so editors and `rustfmt <file>` (pre-commit hook) agree with `cargo fmt`.
+edition = "2021"
+newline_style = "Unix"

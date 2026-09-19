@@ -1,0 +1,10 @@
+# Single source of truth for the Rust version. rustup reads it locally, in CI
+# (`rustup toolchain install` with no arguments), and inside the cargo-deny container.
+# Keep server/Dockerfile's `rust:1.97-bookworm` tag on the same minor when bumping
+# (the file is .dockerignore'd so Docker builds use the image's own toolchain).
+# iOS targets are installed by scripts/build-ios.sh (`rustup target add`), not here,
+# so the Linux CI jobs and the CLI release build do not download unused std libs.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
