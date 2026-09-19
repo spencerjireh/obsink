@@ -8,8 +8,18 @@
 #
 # These outputs are build artifacts (git-ignored); run this after cloning or
 # whenever the FFI surface changes. Requires: rustup + the iOS targets, Xcode, xcodegen.
+#
+#   --simulator-only   skip the device slice (CI: xcodebuild test on a simulator)
 
 set -euo pipefail
+
+SIMULATOR_ONLY=0
+for arg in "$@"; do
+    case "$arg" in
+        --simulator-only) SIMULATOR_ONLY=1 ;;
+        *) echo "unknown argument: $arg" >&2; exit 2 ;;
+    esac
+done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -26,12 +36,16 @@ fi
 
 cd "$REPO_ROOT"
 
-echo "==> Ensuring iOS Rust targets are installed"
-rustup target add aarch64-apple-ios aarch64-apple-ios-sim >/dev/null
+TARGETS=(aarch64-apple-ios-sim)
+[ "$SIMULATOR_ONLY" = 1 ] || TARGETS+=(aarch64-apple-ios)
 
-echo "==> Building obsink-mobile staticlib (device + simulator)"
-cargo build --release -p obsink-mobile --target aarch64-apple-ios
-cargo build --release -p obsink-mobile --target aarch64-apple-ios-sim
+echo "==> Ensuring iOS Rust targets are installed (${TARGETS[*]})"
+rustup target add "${TARGETS[@]}" >/dev/null
+
+echo "==> Building obsink-mobile staticlib (${TARGETS[*]})"
+for t in "${TARGETS[@]}"; do
+    cargo build --release -p obsink-mobile --target "$t"
+done
 
 echo "==> Generating Swift bindings"
 rm -rf "$IOS_DIR/Generated"
@@ -47,9 +61,11 @@ cp "$IOS_DIR/Generated/obsink_mobileFFI.h" "$HEADERS/"
 cp "$IOS_DIR/Generated/obsink_mobileFFI.modulemap" "$HEADERS/module.modulemap"
 rm -rf "$IOS_DIR/Frameworks/ObSinkMobile.xcframework"
 mkdir -p "$IOS_DIR/Frameworks"
-xcodebuild -create-xcframework \
-  -library "$TARGET_DIR/aarch64-apple-ios/release/libobsink_mobile.a" -headers "$HEADERS" \
-  -library "$TARGET_DIR/aarch64-apple-ios-sim/release/libobsink_mobile.a" -headers "$HEADERS" \
+XCFRAMEWORK_ARGS=()
+for t in "${TARGETS[@]}"; do
+    XCFRAMEWORK_ARGS+=(-library "$TARGET_DIR/$t/release/libobsink_mobile.a" -headers "$HEADERS")
+done
+xcodebuild -create-xcframework "${XCFRAMEWORK_ARGS[@]}" \
   -output "$IOS_DIR/Frameworks/ObSinkMobile.xcframework"
 rm -rf "$HEADERS"
 
