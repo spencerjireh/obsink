@@ -455,6 +455,33 @@ fn set_active_vault(vault_id: String) -> Result<LocalVaultSummary, CommandError>
     Ok(LocalVaultSummary::from_stored(&vault, true))
 }
 
+/// Forget a vault on this device only. Refused while a sync on it runs.
+#[tauri::command]
+fn remove_vault(vault_id: String, state: tauri::State<'_, AppState>) -> Result<(), CommandError> {
+    let _guard = InFlightGuard::acquire(&state, &vault_id)?;
+    forget_vault(&vault_id)?;
+    set_pending_plan(&state, &vault_id, None)
+}
+
+/// Delete a vault and all its files on the server, then forget it here. A
+/// 404 (already gone) is reported as-is; "Remove from this device" is the
+/// way out in that case.
+#[tauri::command]
+async fn delete_remote_vault(
+    vault_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), CommandError> {
+    let vault = selected_vault(Some(vault_id.clone()))?;
+    let _guard = InFlightGuard::acquire(&state, &vault.id)?;
+    bearer_call(
+        &vault.server_url,
+        ApiClient::new(to_vault_config(&vault)).delete_vault(),
+    )
+    .await?;
+    forget_vault(&vault.id)?;
+    set_pending_plan(&state, &vault.id, None)
+}
+
 #[tauri::command]
 async fn add_vault(request: AddVaultRequest) -> Result<LocalVaultSummary, CommandError> {
     validate_request(&request)?;
@@ -1142,6 +1169,8 @@ fn main() {
             get_status,
             get_vaults,
             resolve_conflict,
+            remove_vault,
+            delete_remote_vault,
             set_active_vault,
             sync_vault,
         ])

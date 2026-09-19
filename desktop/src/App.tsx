@@ -17,13 +17,19 @@ import type {
   SyncResponse,
   SyncResult,
   SyncStatus,
+  VaultUsage,
   View,
 } from './types'
 import { call } from './lib/tauri'
 import { isInviteRequired, isUnauthorized, SESSION_EXPIRED, toCommandError } from './lib/errors'
 import { emptyForm } from './lib/conflicts'
 import { countRemoteChanges, plural } from './lib/format'
-import { DEFAULT_SERVER_URL, rememberServerUrl, rememberedServerUrl } from './lib/server-url'
+import {
+  DEFAULT_SERVER_URL,
+  normalizeServerUrl,
+  rememberServerUrl,
+  rememberedServerUrl,
+} from './lib/server-url'
 import { MainPane } from './components/MainPane'
 import { SetupView } from './components/SetupView'
 import { Sidebar } from './components/Sidebar'
@@ -291,6 +297,15 @@ function App() {
 
   const activeVault = useMemo(() => vaults.find((vault) => vault.active) ?? null, [vaults])
 
+  // Usage is known for the setup server's account only; a vault on another
+  // server shows none.
+  const activeVaultUsage = useMemo<VaultUsage | null>(() => {
+    if (!activeVault || account?.kind !== 'account' || !account.usage) return null
+    if (normalizeServerUrl(currentServerUrl) !== activeVault.server_url) return null
+    const entry = account.usage.vaults.find((vault) => vault.id === activeVault.id)
+    return { bytes: entry?.bytes ?? 0, max: account.usage.max_vault_bytes }
+  }, [activeVault, account, currentServerUrl])
+
   async function refresh() {
     const [nextVaults, nextStatus] = await Promise.all([
       call<LocalVault[]>('get_vaults'),
@@ -511,14 +526,36 @@ function App() {
 
     try {
       await call<LocalVault>('set_active_vault', { vaultId })
-      setSyncResult(null)
-      setConflicts([])
-      setChoices({})
-      setSelectedConflictPath(null)
-      setConflictPreview(null)
+      clearVaultState()
       await refresh()
     } catch (error) {
       fail(error)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  function clearVaultState() {
+    setSyncResult(null)
+    setConflicts([])
+    setChoices({})
+    setSelectedConflictPath(null)
+    setConflictPreview(null)
+  }
+
+  async function runVaultRemoval(command: string, vaultId: string, done: string): Promise<boolean> {
+    setBusy(true)
+    setMessage('')
+    try {
+      await call(command, { vaultId })
+      clearVaultState()
+      await refresh()
+      await refreshAccount(currentServerUrl)
+      setMessage(done)
+      return true
+    } catch (error) {
+      fail(error)
+      return false
     } finally {
       setBusy(false)
     }
@@ -606,8 +643,27 @@ function App() {
           onResolve={() => void handleResolveConflicts()}
           onSelectConflict={setSelectedConflictPath}
           onChoose={(path, choice) => setChoices((current) => ({ ...current, [path]: choice }))}
+          vaultUsage={activeVaultUsage}
           onAddVault={() => openSetup('add-vault')}
           onSignIn={() => openSetup('account')}
+          onRemoveVault={() =>
+            activeVault
+              ? runVaultRemoval(
+                  'remove_vault',
+                  activeVault.id,
+                  `Removed ${activeVault.name} from this device.`,
+                )
+              : Promise.resolve(false)
+          }
+          onDeleteRemoteVault={() =>
+            activeVault
+              ? runVaultRemoval(
+                  'delete_remote_vault',
+                  activeVault.id,
+                  `Deleted ${activeVault.name} on the server.`,
+                )
+              : Promise.resolve(false)
+          }
         />
       )}
     </div>
