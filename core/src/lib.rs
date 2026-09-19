@@ -3,6 +3,8 @@ pub mod auth;
 pub mod crypto;
 pub mod fs_util;
 pub mod hasher;
+#[cfg(feature = "keychain")]
+pub mod keychain;
 pub mod manifest;
 pub mod progress;
 pub mod sync_engine;

@@ -46,6 +46,11 @@ AUTH=(-allowProvisioningUpdates
       -authenticationKeyIssuerID "$ASC_ISSUER_ID")
 ARCHIVE="$IOS_DIR/build/ObSink-$VERSION-$BUILD.xcarchive"
 EXPORT_DIR="$IOS_DIR/build/export"
+# xcodebuild output is filtered for the terminal, but its exit status decides
+# the script's, and the full logs stay on disk for a failed run.
+mkdir -p "$IOS_DIR/build"
+ARCHIVE_LOG="$IOS_DIR/build/archive-$VERSION-$BUILD.log"
+EXPORT_LOG="$IOS_DIR/build/export-$VERSION-$BUILD.log"
 
 if [ ! -d "$IOS_DIR/Frameworks/ObSinkMobile.xcframework" ]; then
     echo "==> No xcframework yet; running scripts/build-ios.sh"
@@ -61,7 +66,8 @@ xcodebuild archive \
     -destination 'generic/platform=iOS' \
     -archivePath "$ARCHIVE" \
     MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD" \
-    "${AUTH[@]}" | grep -E "error|warning: .*(entitle|sign)|ARCHIVE" || true
+    "${AUTH[@]}" > "$ARCHIVE_LOG" 2>&1 || { grep -E "error" "$ARCHIVE_LOG"; echo "archive failed (full log: $ARCHIVE_LOG)"; exit 1; }
+grep -E "error|warning: .*(entitle|sign)|ARCHIVE" "$ARCHIVE_LOG" || true
 [ -d "$ARCHIVE" ] || { echo "archive failed"; exit 1; }
 
 # Inject the team ID; the checked-in ExportOptions.plist stays team-agnostic.
@@ -74,16 +80,23 @@ fi
 
 echo "==> Exporting$([ "$UPLOAD" = 1 ] && echo ' + uploading to App Store Connect')"
 rm -rf "$EXPORT_DIR"
-xcodebuild -exportArchive \
+if ! xcodebuild -exportArchive \
     -archivePath "$ARCHIVE" \
     -exportOptionsPlist "$OPTS" \
     -exportPath "$EXPORT_DIR" \
-    "${AUTH[@]}" | grep -E "error|EXPORT|Upload|upload" || true
+    "${AUTH[@]}" > "$EXPORT_LOG" 2>&1; then
+    rm -f "$OPTS"
+    grep -E "error" "$EXPORT_LOG"
+    echo "export/upload failed (full log: $EXPORT_LOG)"
+    exit 1
+fi
+grep -E "error|EXPORT|Upload|upload" "$EXPORT_LOG" || true
 rm -f "$OPTS"
 
 if [ "$UPLOAD" = 1 ]; then
     echo "Uploaded ObSink $VERSION ($BUILD). App Store Connect processes it in ~5-15 min;"
     echo "then add it to a TestFlight group (scripts/testflight.py) or in the ASC UI."
 else
+    ls "$EXPORT_DIR"/*.ipa >/dev/null 2>&1 || { echo "export produced no .ipa in $EXPORT_DIR"; exit 1; }
     echo "Exported to $EXPORT_DIR"
 fi

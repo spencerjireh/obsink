@@ -9,6 +9,7 @@ use clap::{Parser, Subcommand};
 use dirs::home_dir;
 use obsink_core::{
     complete_sync, derive_key, derive_keys, diff_local_and_remote, fetch_remote_manifest,
+    keychain::{delete_secret, load_secret, save_secret},
     load_local_state, normalize_server_url, prepare_sync, sync_manifest_path, write_atomic,
     ApiClient, AuthClient, Conflict, ConflictResolution, ConflictResolutionChoice,
     CreateVaultRequest, KeyBytes, ProgressEvent, ProgressSink, SyncActionKind, SyncPhase, SyncPlan,
@@ -18,7 +19,6 @@ use rpassword::prompt_password;
 use serde::{Deserialize, Serialize};
 
 const CONFIG_FILE: &str = ".obsink/config.toml";
-const KEYCHAIN_SERVICE: &str = "obsink";
 
 #[derive(Debug, Parser)]
 #[command(name = "obsink")]
@@ -669,106 +669,6 @@ fn load_config() -> Result<CliConfig, Box<dyn std::error::Error>> {
     let mut config: CliConfig = toml::from_str(&contents)?;
     config.server_url = normalize_server_url(&config.server_url);
     Ok(config)
-}
-
-// --- Keychain -----------------------------------------------------------------
-//
-// Two kinds of secret share the `obsink` service: the derived vault key
-// (account = vault ID, hex) and the server bearer (account = `bearer:<url>`).
-// `OBSINK_KEYRING_DIR` swaps the macOS keychain for a directory of files
-// (CI, harnesses).
-
-fn keyring_dir() -> Option<PathBuf> {
-    std::env::var_os("OBSINK_KEYRING_DIR").map(PathBuf::from)
-}
-
-fn keyring_file(dir: &std::path::Path, account: &str) -> PathBuf {
-    // Accounts contain `:` and `/` (bearer URLs); keep filenames flat.
-    dir.join(account.replace(['/', ':'], "_"))
-}
-
-fn save_secret(account: &str, value: &str) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(dir) = keyring_dir() {
-        fs::create_dir_all(&dir)?;
-        fs::write(keyring_file(&dir, account), value)?;
-        return Ok(());
-    }
-
-    let _ = Command::new("security")
-        .args([
-            "delete-generic-password",
-            "-s",
-            KEYCHAIN_SERVICE,
-            "-a",
-            account,
-        ])
-        .output();
-
-    let output = Command::new("security")
-        .args([
-            "add-generic-password",
-            "-U",
-            "-s",
-            KEYCHAIN_SERVICE,
-            "-a",
-            account,
-            "-w",
-            value,
-        ])
-        .output()?;
-
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr)
-            .trim()
-            .to_string()
-            .into());
-    }
-
-    Ok(())
-}
-
-fn load_secret(account: &str) -> Result<String, Box<dyn std::error::Error>> {
-    if let Some(dir) = keyring_dir() {
-        return Ok(fs::read_to_string(keyring_file(&dir, account))?
-            .trim()
-            .to_string());
-    }
-
-    let output = Command::new("security")
-        .args([
-            "find-generic-password",
-            "-w",
-            "-s",
-            KEYCHAIN_SERVICE,
-            "-a",
-            account,
-        ])
-        .output()?;
-
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr)
-            .trim()
-            .to_string()
-            .into());
-    }
-
-    Ok(String::from_utf8(output.stdout)?.trim().to_string())
-}
-
-fn delete_secret(account: &str) {
-    if let Some(dir) = keyring_dir() {
-        let _ = fs::remove_file(keyring_file(&dir, account));
-        return;
-    }
-    let _ = Command::new("security")
-        .args([
-            "delete-generic-password",
-            "-s",
-            KEYCHAIN_SERVICE,
-            "-a",
-            account,
-        ])
-        .output();
 }
 
 fn load_key_from_keychain(vault_id: &str) -> Result<KeyBytes, Box<dyn std::error::Error>> {

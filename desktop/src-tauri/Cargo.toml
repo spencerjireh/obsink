@@ -10,7 +10,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 dirs = "6"
 hex = "0.4"
-obsink-core = { path = "../../core" }
+obsink-core = { path = "../../core", features = ["keychain"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = ["tray-icon"] }

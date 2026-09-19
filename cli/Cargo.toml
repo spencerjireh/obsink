@@ -8,7 +8,7 @@ license.workspace = true
 clap = { version = "4.5", features = ["derive", "env"] }
 dirs = "6"
 hex = "0.4"
-obsink-core = { path = "../core" }
+obsink-core = { path = "../core", features = ["keychain"] }
 rpassword = "7"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

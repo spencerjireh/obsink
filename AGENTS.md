@@ -19,7 +19,8 @@ deployment in `docs/self-hosting.md`.
 - **Rust** — stable, edition 2021 (Cargo workspace: `core`, `cli`,
   `desktop/src-tauri`, `mobile`). Core deps: `aes-gcm` 0.10, `argon2` 0.5,
   `hkdf` 0.12, `hmac` 0.12, `sha2` 0.10, `reqwest` 0.12 (rustls-tls),
-  `tokio` 1, `tracing` 0.1.
+  `tokio` 1, `tracing` 0.1; `security-framework` 3 behind the `keychain`
+  feature (CLI + desktop keychain access without a `security` argv).
 - **Server** — `server/` crate (`obsink-server`): `axum` 0.8 (HTTP +
   multipart), `tokio`, `tower-http` (tracing), `sqlx` 0.8 (Postgres, runtime
   queries, embedded migrations), `lettre` 0.11 (SMTP one-time codes),
