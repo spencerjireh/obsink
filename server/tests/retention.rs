@@ -5,7 +5,7 @@ use std::fs;
 use common::{TestEnv, API_KEY};
 use obsink_server::{
     blobs::Tier,
-    retention::{self, TRASH_RETENTION_SECS, VERSION_RETENTION_SECS},
+    retention::{self, ORPHAN_GRACE_SECS, TRASH_RETENTION_SECS, VERSION_RETENTION_SECS},
 };
 
 const VAULT: &str = "vault_00000000-0000-4000-8000-000000000000";
@@ -130,6 +130,13 @@ async fn prunes_expired_sessions_and_codes() {
     env.finish().await;
 }
 
+/// Backdate a vault directory past the orphan grace period.
+fn age_vault_dir(env: &TestEnv, tier: Tier, vault: &str) {
+    let dir = env.state.blobs.tier_root(tier).join(vault);
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(ORPHAN_GRACE_SECS + 60);
+    fs::File::open(&dir).unwrap().set_modified(old).unwrap();
+}
+
 #[tokio::test]
 async fn removes_orphaned_vault_directories() {
     let Some(env) = TestEnv::try_new().await else {
@@ -137,8 +144,18 @@ async fn removes_orphaned_vault_directories() {
     };
     let real = env.create_vault(API_KEY, "real").await;
     env.state.blobs.put_live(&real, "tok", b"x").unwrap();
-    env.state.blobs.put_live(VAULT, "tok", b"x").unwrap();
     seed(&env, Tier::Trash, VAULT, "tok", &[1]);
+    env.state.blobs.put_live(VAULT, "tok", b"x").unwrap();
+
+    // A directory younger than the grace period may belong to a vault whose
+    // row is still being written; it survives this pass.
+    let report = retention::run_once(&env.state, 10).await.unwrap();
+    assert_eq!(report.orphan_dirs_removed, 0);
+    assert!(env.state.blobs.live_exists(VAULT, "tok"));
+
+    age_vault_dir(&env, Tier::Live, VAULT);
+    age_vault_dir(&env, Tier::Trash, VAULT);
+    age_vault_dir(&env, Tier::Live, &real);
     let report = retention::run_once(&env.state, 10).await.unwrap();
     assert_eq!(report.orphan_dirs_removed, 2);
     assert!(env.state.blobs.live_exists(&real, "tok"));

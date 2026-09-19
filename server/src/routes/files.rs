@@ -194,35 +194,44 @@ pub async fn apply_put(
         .or_else(|| current.as_ref().map(|entry| entry.enc_path.clone()))
         .unwrap_or_default();
     let sealed = state.keys.seal_blob(params.vault_id, params.path, body);
-    {
+    // The blob changes under the vault row lock so concurrent writers to the
+    // same path serialise; if the metadata then fails to commit, the blob is
+    // put back so the row and the file never disagree.
+    let undo = {
         let blobs = state.blobs.clone();
         let vault_id = params.vault_id.to_string();
         let path = params.path.to_string();
         let archive = current.as_ref().is_some_and(|entry| !entry.deleted);
-        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-            if archive {
-                blobs.archive_version(&vault_id, &path, now)?;
-            }
-            blobs.put_live(&vault_id, &path, &sealed)
+        tokio::task::spawn_blocking(move || {
+            blobs.replace_live(&vault_id, &path, &sealed, archive, now)
         })
         .await
-        .map_err(ApiError::internal)??;
+        .map_err(ApiError::internal)??
+    };
+    let committed = async {
+        upsert_entry(
+            &mut tx,
+            params.vault_id,
+            params.path,
+            &FileEntry {
+                hash: content_hash.to_string(),
+                modified: now,
+                size,
+                deleted: false,
+                enc_path,
+            },
+        )
+        .await?;
+        bump_revision(&mut tx, params.vault_id).await?;
+        tx.commit().await?;
+        Ok::<(), ApiError>(())
     }
-    upsert_entry(
-        &mut tx,
-        params.vault_id,
-        params.path,
-        &FileEntry {
-            hash: content_hash.to_string(),
-            modified: now,
-            size,
-            deleted: false,
-            enc_path,
-        },
-    )
-    .await?;
-    bump_revision(&mut tx, params.vault_id).await?;
-    tx.commit().await?;
+    .await;
+    if let Err(error) = committed {
+        let blobs = state.blobs.clone();
+        let _ = tokio::task::spawn_blocking(move || blobs.undo(undo)).await;
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -249,14 +258,14 @@ pub async fn apply_delete(
             });
         }
     }
-    {
+    let undo = {
         let blobs = state.blobs.clone();
         let vault_id = vault_id.to_string();
         let path = path.to_string();
-        tokio::task::spawn_blocking(move || blobs.move_to_trash(&vault_id, &path, now))
+        tokio::task::spawn_blocking(move || blobs.trash_live(&vault_id, &path, now))
             .await
-            .map_err(ApiError::internal)??;
-    }
+            .map_err(ApiError::internal)??
+    };
     // Deleting a never-uploaded path still leaves a tombstone, as the Worker did.
     let tombstone = FileEntry {
         hash: current
@@ -271,9 +280,18 @@ pub async fn apply_delete(
             .map(|entry| entry.enc_path.clone())
             .unwrap_or_default(),
     };
-    upsert_entry(&mut tx, vault_id, path, &tombstone).await?;
-    bump_revision(&mut tx, vault_id).await?;
-    tx.commit().await?;
+    let committed = async {
+        upsert_entry(&mut tx, vault_id, path, &tombstone).await?;
+        bump_revision(&mut tx, vault_id).await?;
+        tx.commit().await?;
+        Ok::<(), ApiError>(())
+    }
+    .await;
+    if let Err(error) = committed {
+        let blobs = state.blobs.clone();
+        let _ = tokio::task::spawn_blocking(move || blobs.undo(undo)).await;
+        return Err(error);
+    }
     Ok(())
 }
 

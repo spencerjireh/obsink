@@ -13,7 +13,7 @@ use lettre::{
     AsyncTransport, Message, Tokio1Executor,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::Row;
+use sqlx::{PgConnection, Row};
 
 use crate::{
     auth::{account, account::Identity, sessions, sessions::SessionResponse},
@@ -204,14 +204,16 @@ pub async fn start(
     }))
 }
 
-pub async fn verify(
-    State(state): State<AppState>,
-    AppJson(body): AppJson<VerifyBody>,
-) -> Result<Json<SessionResponse>, ApiError> {
-    let email = normalize_email(body.email.as_deref())?;
-    let code: String = body
-        .code
-        .as_deref()
+/// Outcome of checking a one-time code. A rejection carries the response to
+/// send; the attempt counter update it made must still be committed.
+pub enum CodeCheck {
+    Valid,
+    Rejected(ApiError),
+}
+
+/// Normalise a submitted code: whitespace stripped, exactly six digits.
+pub fn parse_code(raw: Option<&str>) -> Result<String, ApiError> {
+    let code: String = raw
         .unwrap_or("")
         .chars()
         .filter(|c| !c.is_whitespace())
@@ -219,15 +221,27 @@ pub async fn verify(
     if code.len() != 6 || !code.chars().all(|c| c.is_ascii_digit()) {
         return Err(ApiError::bad_request("code must be 6 digits"));
     }
-    let email_hmac = state.keys.index("email", &email);
-    let now = db::now();
+    Ok(code)
+}
 
-    let mut tx = state.pool.begin().await?;
+/// Compare `code` against the outstanding one for `email`, locking the row.
+/// A wrong code increments `attempts` (and the fifth strike voids the code);
+/// the caller commits the transaction before returning the rejection so the
+/// counter sticks. The code is not consumed here: `consume_code` runs after
+/// the sign-in succeeds so a refused invite does not burn it.
+pub async fn check_code(
+    state: &AppState,
+    conn: &mut PgConnection,
+    email: &str,
+    code: &str,
+    now: u64,
+) -> Result<CodeCheck, ApiError> {
+    let email_hmac = state.keys.index("email", email);
     let row = sqlx::query(
         "SELECT code_hmac, expires, attempts FROM email_codes WHERE email_hmac = $1 FOR UPDATE",
     )
     .bind(&email_hmac)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut *conn)
     .await?;
     let (code_hmac, expires, attempts) = match row {
         Some(row) => (
@@ -235,20 +249,25 @@ pub async fn verify(
             db::to_u64(row.get("expires")),
             row.get::<i32, _>("attempts"),
         ),
-        None => return Err(ApiError::unauthorized("code expired; request a new one")),
+        None => {
+            return Ok(CodeCheck::Rejected(ApiError::unauthorized(
+                "code expired; request a new one",
+            )))
+        }
     };
     let Some(code_hmac) = code_hmac.filter(|_| expires > now) else {
-        return Err(ApiError::unauthorized("code expired; request a new one"));
+        return Ok(CodeCheck::Rejected(ApiError::unauthorized(
+            "code expired; request a new one",
+        )));
     };
     if attempts >= OTP_MAX_ATTEMPTS {
         sqlx::query("UPDATE email_codes SET code_hmac = NULL WHERE email_hmac = $1")
             .bind(&email_hmac)
-            .execute(&mut *tx)
+            .execute(&mut *conn)
             .await?;
-        tx.commit().await?;
-        return Err(ApiError::unauthorized(
+        return Ok(CodeCheck::Rejected(ApiError::unauthorized(
             "too many attempts; request a new code",
-        ));
+        )));
     }
     let expected = state.keys.index("otp", &format!("{email}:{code}"));
     if !bool::from(subtle::ConstantTimeEq::ct_eq(
@@ -257,27 +276,54 @@ pub async fn verify(
     )) {
         sqlx::query("UPDATE email_codes SET attempts = attempts + 1 WHERE email_hmac = $1")
             .bind(&email_hmac)
-            .execute(&mut *tx)
+            .execute(&mut *conn)
             .await?;
+        return Ok(CodeCheck::Rejected(ApiError::unauthorized(
+            "incorrect code",
+        )));
+    }
+    Ok(CodeCheck::Valid)
+}
+
+/// Void the outstanding code for `email` (single use), keeping `last_sent`
+/// so the resend cooldown survives.
+pub async fn consume_code(
+    state: &AppState,
+    conn: &mut PgConnection,
+    email: &str,
+) -> Result<(), ApiError> {
+    sqlx::query("UPDATE email_codes SET code_hmac = NULL WHERE email_hmac = $1")
+        .bind(state.keys.index("email", email))
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+pub async fn verify(
+    State(state): State<AppState>,
+    AppJson(body): AppJson<VerifyBody>,
+) -> Result<Json<SessionResponse>, ApiError> {
+    let email = normalize_email(body.email.as_deref())?;
+    let code = parse_code(body.code.as_deref())?;
+    let now = db::now();
+
+    let mut tx = state.pool.begin().await?;
+    if let CodeCheck::Rejected(error) = check_code(&state, &mut tx, &email, &code, now).await? {
         tx.commit().await?;
-        return Err(ApiError::unauthorized("incorrect code"));
+        return Err(error);
     }
 
     let device = sessions::clean_device_name(body.device_name.as_deref());
     let session = account::sign_in(
         &state,
         &mut tx,
-        Identity::Email(email),
+        Identity::Email(email.clone()),
         body.invite_code.as_deref(),
         &device,
         now,
     )
     .await?;
-    // Single use, but keep `last_sent` so the cooldown survives.
-    sqlx::query("UPDATE email_codes SET code_hmac = NULL WHERE email_hmac = $1")
-        .bind(&email_hmac)
-        .execute(&mut *tx)
-        .await?;
+    consume_code(&state, &mut tx, &email).await?;
     tx.commit().await?;
     Ok(Json(session))
 }

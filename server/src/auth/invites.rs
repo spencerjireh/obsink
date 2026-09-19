@@ -99,13 +99,17 @@ pub async fn authorize_signup(
         limiter.record_failure();
         return Err(ApiError::forbidden(INVALID_MESSAGE));
     }
-    let row = sqlx::query("SELECT expires, used_by FROM invites WHERE code = $1 FOR UPDATE")
-        .bind(&code)
-        .fetch_optional(conn)
-        .await?;
+    let row =
+        sqlx::query("SELECT expires, used_by, used_at FROM invites WHERE code = $1 FOR UPDATE")
+            .bind(&code)
+            .fetch_optional(conn)
+            .await?;
+    // `used_by` is nulled when the redeemer deletes their account (FK ON
+    // DELETE SET NULL); `used_at` survives, so it is what makes a code spent.
     let usable = match row {
         Some(row) => {
             row.get::<Option<String>, _>("used_by").is_none()
+                && row.get::<Option<i64>, _>("used_at").is_none()
                 && db::to_u64(row.get("expires")) > now
         }
         None => false,

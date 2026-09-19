@@ -106,7 +106,18 @@ pub async fn batch(
         .collect::<Result<_, _>>()?;
 
     for (index, op) in ops.iter().enumerate() {
-        let is_put = op.action.as_deref() == Some("put");
+        // Only the two documented actions; anything else must not fall
+        // through to the delete branch.
+        let is_put = match op.action.as_deref() {
+            Some("put") => true,
+            Some("delete") => false,
+            other => {
+                return Err(ApiError::bad_request(format!(
+                    "operation {index}: unknown action {:?}",
+                    other.unwrap_or("")
+                )))
+            }
+        };
         if is_put && !contents.contains_key(&index) {
             return Err(ApiError::bad_request(format!(
                 "missing content part for operation {index}"

@@ -60,6 +60,14 @@ fn path_name(path: &str) -> String {
     hex::encode(sha256(path.as_bytes()))
 }
 
+/// What `BlobStore::undo` needs to reverse a live-blob change.
+#[derive(Debug)]
+pub struct BlobUndo {
+    vault_id: String,
+    path: String,
+    restore_from: Option<(Tier, String)>,
+}
+
 impl BlobStore {
     pub fn new(data_dir: &Path) -> Self {
         Self {
@@ -135,19 +143,83 @@ impl BlobStore {
     }
 
     fn move_live(&self, tier: Tier, vault_id: &str, path: &str, now: u64) -> io::Result<()> {
+        self.move_live_returning(tier, vault_id, path, now)
+            .map(|_| ())
+    }
+
+    /// Like `move_live`, returning the history entry name written (if any).
+    fn move_live_returning(
+        &self,
+        tier: Tier,
+        vault_id: &str,
+        path: &str,
+        now: u64,
+    ) -> io::Result<Option<String>> {
         let source = self.live_path(vault_id, path);
         if !source.is_file() {
-            return Ok(());
+            return Ok(None);
         }
         let dir = self.history_dir(tier, vault_id, path);
         fs::create_dir_all(&dir)?;
-        let mut target = dir.join(now.to_string());
+        let mut name = now.to_string();
         let mut seq = 1;
-        while target.exists() {
-            target = dir.join(format!("{now}-{seq}"));
+        while dir.join(&name).exists() {
+            name = format!("{now}-{seq}");
             seq += 1;
         }
-        fs::rename(source, target)
+        fs::rename(source, dir.join(&name))?;
+        Ok(Some(name))
+    }
+
+    /// Replace the live blob under the row lock: archive the current one to
+    /// `_versions` and write `sealed`. The returned undo token restores the
+    /// previous state if the metadata transaction then fails to commit.
+    pub fn replace_live(
+        &self,
+        vault_id: &str,
+        path: &str,
+        sealed: &[u8],
+        archive: bool,
+        now: u64,
+    ) -> io::Result<BlobUndo> {
+        let archived = if archive {
+            self.move_live_returning(Tier::Versions, vault_id, path, now)?
+        } else {
+            None
+        };
+        self.put_live(vault_id, path, sealed)?;
+        Ok(BlobUndo {
+            vault_id: vault_id.to_string(),
+            path: path.to_string(),
+            restore_from: archived.map(|name| (Tier::Versions, name)),
+        })
+    }
+
+    /// Move the live blob to `_trash` under the row lock, with an undo token.
+    pub fn trash_live(&self, vault_id: &str, path: &str, now: u64) -> io::Result<BlobUndo> {
+        let trashed = self.move_live_returning(Tier::Trash, vault_id, path, now)?;
+        Ok(BlobUndo {
+            vault_id: vault_id.to_string(),
+            path: path.to_string(),
+            restore_from: trashed.map(|name| (Tier::Trash, name)),
+        })
+    }
+
+    /// Put the live blob back the way it was before `replace_live` or
+    /// `trash_live`: drop the new live blob (if any) and move the archived
+    /// entry back. Best effort; the caller is already reporting an error.
+    pub fn undo(&self, undo: BlobUndo) {
+        let live = self.live_path(&undo.vault_id, &undo.path);
+        let _ = fs::remove_file(&live);
+        if let Some((tier, name)) = undo.restore_from {
+            let source = self
+                .history_dir(tier, &undo.vault_id, &undo.path)
+                .join(name);
+            if let Some(parent) = live.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let _ = fs::rename(source, live);
+        }
     }
 
     pub fn delete_vault(&self, vault_id: &str) -> io::Result<()> {
@@ -235,6 +307,41 @@ mod tests {
                 .unwrap();
             assert!(history.starts_with(root.canonicalize().unwrap()), "{path}");
         }
+    }
+
+    #[test]
+    fn undo_restores_the_previous_live_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::new(dir.path());
+
+        // A replace over an existing blob: undo brings v1 back and drops the
+        // version entry it had archived.
+        store.put_live(VAULT, "note", b"v1").unwrap();
+        let undo = store.replace_live(VAULT, "note", b"v2", true, 100).unwrap();
+        assert_eq!(store.get_live(VAULT, "note").unwrap().unwrap(), b"v2");
+        store.undo(undo);
+        assert_eq!(store.get_live(VAULT, "note").unwrap().unwrap(), b"v1");
+        assert!(store
+            .list_history(Tier::Versions, VAULT, "note")
+            .unwrap()
+            .is_empty());
+
+        // A replace of a new path: undo leaves no live blob.
+        let undo = store
+            .replace_live(VAULT, "fresh", b"x", false, 100)
+            .unwrap();
+        store.undo(undo);
+        assert!(store.get_live(VAULT, "fresh").unwrap().is_none());
+
+        // A trash: undo moves the blob back out of `_trash`.
+        let undo = store.trash_live(VAULT, "note", 200).unwrap();
+        assert!(store.get_live(VAULT, "note").unwrap().is_none());
+        store.undo(undo);
+        assert_eq!(store.get_live(VAULT, "note").unwrap().unwrap(), b"v1");
+        assert!(store
+            .list_history(Tier::Trash, VAULT, "note")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

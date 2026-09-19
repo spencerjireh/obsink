@@ -217,18 +217,23 @@ impl AuthClient {
 
     /// Exchange an Apple identity token (JWT from `ASAuthorizationAppleIDCredential`)
     /// for a session. `email` is the credential's email, which Apple delivers
-    /// only on the first authorization.
+    /// only on the first authorization; when the token itself carries no
+    /// email claim the server only honours the hint together with `code`, a
+    /// one-time code from `email_start` for that address (otherwise it answers
+    /// 403 `email verification required`).
     pub async fn apple_sign_in(
         &self,
         identity_token: &str,
         device_name: &str,
         email: Option<&str>,
+        code: Option<&str>,
         invite_code: Option<&str>,
     ) -> Result<Session, AuthError> {
         let body = serde_json::json!({
             "identity_token": identity_token,
             "device_name": device_name,
             "email": email,
+            "code": code,
             "invite_code": invite_code,
         });
         parse(

@@ -138,6 +138,45 @@ async fn batch_handles_delete_operations() {
 }
 
 #[tokio::test]
+async fn batch_rejects_unknown_actions_without_touching_files() {
+    let Some(env) = TestEnv::try_new().await else {
+        return;
+    };
+    let id = env.create_vault(API_KEY, "notes").await;
+    let seed = env
+        .operator(Method::PUT, &format!("/vaults/{id}/files/note.md"))
+        .header("X-Content-Hash", "hash-1")
+        .header("X-Enc-Path", "enc-note")
+        .body("v1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(seed.status(), 200);
+
+    // A missing, uppercased, or misspelled action must not fall through to
+    // the delete branch, even with the right parent hash.
+    for op in [
+        serde_json::json!({ "path": "note.md", "parentHash": "hash-1" }),
+        serde_json::json!({ "action": "PUT", "path": "note.md", "parentHash": "hash-1" }),
+        serde_json::json!({ "action": "remove", "path": "note.md", "parentHash": "hash-1" }),
+    ] {
+        let response = send(&env, &id, form(serde_json::json!([op]), &[])).await;
+        assert_eq!(response.status(), 400);
+    }
+    let manifest: serde_json::Value = env
+        .operator(Method::GET, &format!("/vaults/{id}/manifest"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(manifest["note.md"]["deleted"], false);
+    assert_eq!(manifest["note.md"]["hash"], "hash-1");
+    env.finish().await;
+}
+
+#[tokio::test]
 async fn batch_rejects_non_multipart_with_415() {
     let Some(env) = TestEnv::try_new().await else {
         return;

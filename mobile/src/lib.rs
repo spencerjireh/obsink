@@ -358,12 +358,14 @@ pub fn auth_apple(
     identity_token: String,
     device_name: String,
     email: Option<String>,
+    code: Option<String>,
     invite_code: Option<String>,
 ) -> Result<MobileSession, MobileError> {
     let session = block_on(AuthClient::new(&server_url).apple_sign_in(
         &identity_token,
         &device_name,
         email.as_deref(),
+        code.as_deref().map(str::trim).filter(|code| !code.is_empty()),
         clean_invite(invite_code.as_deref()),
     ))
     .map_err(sync_err)?;

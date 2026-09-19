@@ -2,9 +2,11 @@
 //! sessions and stale one-time codes, and sweep blob directories whose vault
 //! row is gone. Runs at startup and then on an interval.
 
-use std::{fs, io, path::Path, time::Duration};
-
-use sqlx::Row;
+use std::{
+    fs, io,
+    path::Path,
+    time::{Duration, SystemTime},
+};
 
 use crate::{
     blobs::{extract_timestamp, remove_dir_if_present, BlobStore, Tier},
@@ -17,6 +19,9 @@ pub const MAX_VERSIONS_PER_FILE: usize = 10;
 pub const VERSION_RETENTION_SECS: u64 = 14 * 24 * 60 * 60;
 pub const TRASH_RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
 pub const EMAIL_CODE_RETENTION_SECS: u64 = 24 * 60 * 60;
+/// A blob directory younger than this is never swept: its vault row may be
+/// in a transaction that has not committed yet.
+pub const ORPHAN_GRACE_SECS: u64 = 60 * 60;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Report {
@@ -67,7 +72,7 @@ fn entries_newest_first(dir: &Path) -> io::Result<Vec<(u64, std::path::PathBuf)>
             )
         })
         .collect();
-    entries.sort_by(|a, b| b.0.cmp(&a.0));
+    entries.sort_by_key(|(ts, _)| std::cmp::Reverse(*ts));
     Ok(entries)
 }
 
@@ -112,17 +117,51 @@ pub fn prune_trash(store: &BlobStore, now: u64) -> io::Result<usize> {
     Ok(removed)
 }
 
-/// Blob directories for vault ids with no row (crash between a vault delete
-/// commit and the directory removal).
-pub fn sweep_orphans(store: &BlobStore, live_ids: &[String]) -> io::Result<usize> {
-    let mut removed = 0;
+/// Blob directories old enough to be orphan candidates: a directory created
+/// within the grace period may belong to a vault whose row is still being
+/// inserted, so it is left alone until the next pass.
+pub fn orphan_candidates(
+    store: &BlobStore,
+    wall_now: SystemTime,
+) -> io::Result<Vec<(Tier, String)>> {
+    let mut candidates = Vec::new();
     for tier in [Tier::Live, Tier::Versions, Tier::Trash] {
         for vault in store.vault_dirs(tier)? {
-            if !live_ids.iter().any(|id| *id == vault) {
-                remove_dir_if_present(&store.tier_root(tier).join(&vault))?;
-                removed += 1;
+            let dir = store.tier_root(tier).join(&vault);
+            let created = fs::metadata(&dir)?.modified()?;
+            let age = wall_now.duration_since(created).unwrap_or(Duration::ZERO);
+            if age >= Duration::from_secs(ORPHAN_GRACE_SECS) {
+                candidates.push((tier, vault));
             }
         }
+    }
+    Ok(candidates)
+}
+
+/// Remove blob directories for vault ids with no row (crash between a vault
+/// delete commit and the directory removal). Each candidate is checked
+/// against the database individually, after the directory listing, so a
+/// vault created during the walk is not mistaken for an orphan.
+async fn sweep_orphans(state: &AppState, wall_now: SystemTime) -> Result<usize, ApiError> {
+    let store = state.blobs.clone();
+    let candidates = tokio::task::spawn_blocking(move || orphan_candidates(&store, wall_now))
+        .await
+        .map_err(ApiError::internal)??;
+    let mut removed = 0;
+    for (tier, vault) in candidates {
+        let exists = sqlx::query("SELECT 1 FROM vaults WHERE id = $1")
+            .bind(&vault)
+            .fetch_optional(&state.pool)
+            .await?
+            .is_some();
+        if exists {
+            continue;
+        }
+        let dir = state.blobs.tier_root(tier).join(&vault);
+        tokio::task::spawn_blocking(move || remove_dir_if_present(&dir))
+            .await
+            .map_err(ApiError::internal)??;
+        removed += 1;
     }
     Ok(removed)
 }
@@ -149,16 +188,7 @@ pub async fn run_once(state: &AppState, now: u64) -> Result<Report, ApiError> {
         .await?
         .rows_affected();
 
-    let ids: Vec<String> = sqlx::query("SELECT id FROM vaults")
-        .fetch_all(&state.pool)
-        .await?
-        .into_iter()
-        .map(|row| row.get("id"))
-        .collect();
-    let store = state.blobs.clone();
-    report.orphan_dirs_removed = tokio::task::spawn_blocking(move || sweep_orphans(&store, &ids))
-        .await
-        .map_err(ApiError::internal)??;
+    report.orphan_dirs_removed = sweep_orphans(state, SystemTime::now()).await?;
     Ok(report)
 }
 

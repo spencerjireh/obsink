@@ -15,7 +15,8 @@ use serde::Deserialize;
 
 use crate::{
     auth::{
-        account, account::Identity, email::normalize_email, sessions, sessions::SessionResponse,
+        account, account::Identity, email, email::normalize_email, sessions,
+        sessions::SessionResponse,
     },
     db,
     error::{ApiError, AppJson},
@@ -24,6 +25,10 @@ use crate::{
 
 pub const APPLE_ISSUER: &str = "https://appleid.apple.com";
 const JWKS_CACHE_SECS: u64 = 3600;
+/// Minimum gap between forced JWKS refreshes for an unknown `kid`. Apple
+/// rotates keys rarely; without this, anyone could make every unauthenticated
+/// request cost the server an outbound fetch.
+const JWKS_FORCED_REFRESH_MIN_SECS: u64 = 60;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Jwk {
@@ -58,6 +63,7 @@ pub struct AppleVerifier {
     audiences: Vec<String>,
     http: reqwest::Client,
     cache: RwLock<Option<(Vec<Jwk>, Instant)>>,
+    last_forced_refresh: RwLock<Option<Instant>>,
 }
 
 pub struct VerifiedIdentity {
@@ -75,6 +81,7 @@ impl AppleVerifier {
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             cache: RwLock::new(None),
+            last_forced_refresh: RwLock::new(None),
         }
     }
 
@@ -123,7 +130,23 @@ impl AppleVerifier {
         if let Some(key) = keys.iter().find(|key| key.kid == kid) {
             return Ok(key.clone());
         }
-        // Apple rotates keys; one forced refresh before giving up.
+        // Apple rotates keys; one forced refresh before giving up, at most
+        // once a minute across all requests.
+        let allowed = {
+            let mut last = self
+                .last_forced_refresh
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            let due = last
+                .is_none_or(|at| at.elapsed() >= Duration::from_secs(JWKS_FORCED_REFRESH_MIN_SECS));
+            if due {
+                *last = Some(Instant::now());
+            }
+            due
+        };
+        if !allowed {
+            return Err(ApiError::unauthorized("unknown Apple signing key"));
+        }
         self.fetch_jwks()
             .await?
             .into_iter()
@@ -190,13 +213,22 @@ impl AppleVerifier {
     }
 }
 
+/// Sent when the identity token carries no email claim and the body offers
+/// one without a code. Clients branch on this text to prompt for a code.
+pub const EMAIL_VERIFICATION_REQUIRED: &str =
+    "email verification required: request a code for this address and retry with `code`";
+
 #[derive(Deserialize)]
 pub struct AppleBody {
     pub identity_token: Option<String>,
     pub device_name: Option<String>,
     /// Apple only includes the email in the first-ever token for an app; the
-    /// client forwards the credential's email so linking still works.
+    /// client can forward the credential's email so linking still works. It
+    /// is unverified, so it is only honoured together with a one-time `code`
+    /// from `/auth/email/start` for that address.
     pub email: Option<String>,
+    /// The one-time code that proves ownership of `email`.
+    pub code: Option<String>,
     pub invite_code: Option<String>,
 }
 
@@ -218,14 +250,36 @@ pub async fn sign_in(
     }
     let now = db::now();
     let identity = state.apple.verify(token, now).await?;
-    let email = identity.email.or_else(|| {
-        body.email
-            .as_deref()
-            .and_then(|hint| normalize_email(Some(hint)).ok())
-    });
     let device = sessions::clean_device_name(body.device_name.as_deref());
+    let hint = body
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|hint| !hint.is_empty());
 
     let mut tx = state.pool.begin().await?;
+    // The token's email claim is Apple-verified. A body hint is not: anyone
+    // with an Apple ID could name a victim's address and get linked to their
+    // account, so the hint counts only once a one-time code proves it.
+    let (email, verified_hint) = match (identity.email, hint) {
+        (Some(email), _) => (Some(email), None),
+        (None, Some(hint)) => {
+            let email = normalize_email(Some(hint))?;
+            let Some(code) = body.code.as_deref() else {
+                return Err(ApiError::forbidden(EMAIL_VERIFICATION_REQUIRED));
+            };
+            let code = email::parse_code(Some(code))?;
+            if let email::CodeCheck::Rejected(error) =
+                email::check_code(&state, &mut tx, &email, &code, now).await?
+            {
+                tx.commit().await?;
+                return Err(error);
+            }
+            (Some(email.clone()), Some(email))
+        }
+        (None, None) => (None, None),
+    };
+
     let session = account::sign_in(
         &state,
         &mut tx,
@@ -238,6 +292,9 @@ pub async fn sign_in(
         now,
     )
     .await?;
+    if let Some(email) = verified_hint {
+        email::consume_code(&state, &mut tx, &email).await?;
+    }
     tx.commit().await?;
     Ok(Json(session))
 }

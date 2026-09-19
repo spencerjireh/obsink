@@ -123,7 +123,20 @@ async fn invite_is_single_use_and_expired_or_bogus_codes_are_rejected() {
 
     // Existing accounts never need an invite.
     env.clear_email_cooldown("second@example.com").await;
-    env.email_token("second@example.com", "b2", None).await;
+    let second = env.email_token("second@example.com", "b2", None).await;
+
+    // Deleting the redeemer's account nulls `used_by` (FK) but the code stays
+    // spent: it must not become redeemable again.
+    let deleted = env
+        .with_token(&second, Method::DELETE, "/auth/account")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), 204);
+    let again = env
+        .email_sign_in("seventh@example.com", "g", Some(&code))
+        .await;
+    assert_eq!(again.status(), 403);
 
     let list: serde_json::Value = env
         .with_token(&first, Method::GET, "/auth/invites")

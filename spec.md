@@ -99,7 +99,7 @@ Every vault request carries `Authorization: Bearer <token>`. The server resolves
 
 Clients offer one setup flow: enter the server URL, then sign in with an emailed 6-digit one-time code (all platforms) or Sign in with Apple (iOS). The operator bearer has no UI; it exists for scripts. Apple sign-in needs no per-server Apple configuration because the identity token's audience is the ObSink app's bundle id (`APPLE_CLIENT_IDS`, default `com.obsink.ios`).
 
-**Invite-only signup.** The first account on a fresh server signs up without an invite. After that, creating a new account requires an unused, unexpired invite code; existing accounts sign in freely. Any signed-in user (and the operator) can mint codes: 8 characters from `ABCDEFGHJKLMNPQRSTUVWXYZ23456789`, single-use, valid 7 days. Redemption failures are rate-limited process-wide (20 per minute).
+**Invite-only signup.** The first account on a fresh server signs up without an invite. After that, creating a new account requires an unused, unexpired invite code; existing accounts sign in freely. A code stays spent after the account that redeemed it is deleted. Any signed-in user (and the operator) can mint codes: 8 characters from `ABCDEFGHJKLMNPQRSTUVWXYZ23456789`, single-use, valid 7 days. Redemption failures are rate-limited process-wide (20 per minute).
 
 Per-account quotas: `MAX_VAULTS_PER_USER` (default 10) and `MAX_VAULT_BYTES` per vault (default 1 GiB). The operator has no quotas.
 
@@ -110,7 +110,7 @@ Auth endpoints (no bearer unless noted):
 - `GET /` → `{ service, auth: { email, apple, api_key }, invite_required }` — which sign-in methods are configured and whether new sign-ups need an invite.
 - `POST /auth/email/start { email }` → sends the code over SMTP. One per email per 60 s; code valid 10 min, 5 attempts. A failed send does not consume the cooldown. `AUTH_DEV_RETURN_CODE=1` (dev only) returns the code in the response.
 - `POST /auth/email/verify { email, code, device_name?, invite_code? }` → `{ token, session, user }`.
-- `POST /auth/apple { identity_token, device_name?, email?, invite_code? }` → same; verifies the RS256 JWT against Apple's JWKS (`iss`, `aud ∈ APPLE_CLIENT_IDS`, `exp`) and links to an existing email account when the emails match.
+- `POST /auth/apple { identity_token, device_name?, email?, code?, invite_code? }` → same; verifies the RS256 JWT against Apple's JWKS (`iss`, `aud ∈ APPLE_CLIENT_IDS`, `exp`) and links to an existing email account when the token's `email` claim matches. Apple includes that claim only in the first token it issues for an app, so a client may forward the credential's email as `email`; because the hint is unverified, the server honours it only together with `code`, a one-time code from `/auth/email/start` for that address (consumed on success). A hint without a code is `403 { "error": "email verification required: …" }` and the client prompts for the code; a token with no claim and no hint signs in by Apple subject alone (a new account then has no email).
 - `GET /auth/me` (bearer) → `{ kind, user, sessions[], usage: { vaults: [{ id, bytes }], total_bytes, max_vault_bytes, max_vaults } }` (limits are `null` for the operator).
 - `DELETE /auth/session` (bearer) → sign out this device; `DELETE /auth/sessions/:id` → sign out another device.
 - `DELETE /auth/account` (bearer) → delete the account, its sessions, its invites, and every vault it owns (blobs, versions, trash, manifests). Required by App Store guideline 5.1.1(v).
@@ -194,7 +194,7 @@ Batch operations as `multipart/form-data`:
 - one `operations` part (`application/json`): `{ "operations": [ { "action": "put", "path", "parentHash"?, "contentHash", "encPath"? }, { "action": "delete", "path", "parentHash"? } ] }`
 - one `content` part per put with `filename="<operation index>"` carrying the raw encrypted bytes
 
-Operations run in order, each with the same transaction as the single-file routes. The response is `200 { "results": [ { path, status, conflict } ] }`; `409` entries carry the conflicting `current` entry, so a batch can partly succeed. A non-multipart body is `415`; a body over `MAX_BATCH_BYTES` (default 128 MiB) is `413`.
+`action` must be exactly `put` or `delete`; any other value (or none) rejects the whole batch with `400` before anything runs. Operations run in order, each with the same transaction as the single-file routes. The response is `200 { "results": [ { path, status, conflict } ] }`; `409` entries carry the conflicting `current` entry, so a batch can partly succeed. A non-multipart body is `415`; a body over `MAX_BATCH_BYTES` (default 128 MiB) is `413`.
 
 ### 4.4 Attachment Size Limit
 
