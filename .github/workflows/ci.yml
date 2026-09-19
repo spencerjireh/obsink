@@ -3,21 +3,56 @@ name: CI
 on:
   pull_request:
   push:
-    branches-ignore:
-      - main
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
 
 jobs:
+  commits:
+    name: commits
+    # Only meaningful on a PR; a job skipped by `if:` still satisfies the ruleset.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Check every commit message in the PR range
+        run: scripts/check-commit-msg.sh --range "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+
   core:
     name: core + CLI + mobile
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Check formatting
         run: cargo fmt --all --check
+      - name: Clippy (all crates except the Tauri shell, which is linted on macOS)
+        run: cargo clippy -p obsink-core -p obsink -p obsink-mobile -p obsink-server --all-targets -- -D warnings
       - name: Test core, CLI, and mobile facade
         run: cargo test -p obsink-core -p obsink -p obsink-mobile
+
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories licenses bans sources
 
   server:
     name: server (postgres)
@@ -38,9 +73,10 @@ jobs:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       OBSINK_TEST_REQUIRE_DB: "1"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Test server against Postgres
         run: cargo test -p obsink-server
       - name: Build server image
@@ -50,19 +86,86 @@ jobs:
     name: desktop (macOS)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           cache-dependency-path: desktop/package-lock.json
       - name: Install frontend dependencies
         working-directory: desktop
         run: npm ci
+      - name: Lint
+        working-directory: desktop
+        run: npm run lint
+      - name: Check formatting
+        working-directory: desktop
+        run: npm run format:check
       - name: Build desktop frontend
         working-directory: desktop
         run: npm run build
-      - name: Check desktop Rust shell
-        run: cargo check -p obsink-desktop
+      - name: Clippy the Tauri shell and the CLI (macOS keychain path)
+        run: cargo clippy -p obsink-desktop -p obsink --all-targets -- -D warnings
+
+  ios:
+    name: ios (simulator)
+    runs-on: macos-latest
+    permissions:
+      contents: read
+      pull-requests: read # dorny/paths-filter lists PR files through the API
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        with:
+          filters: |
+            ios:
+              - 'ios/**'
+              - 'mobile/**'
+              - 'core/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - 'scripts/build-ios.sh'
+              - '.github/workflows/ci.yml'
+      - name: Nothing iOS-related changed
+        if: steps.filter.outputs.ios != 'true'
+        run: echo "No changes under ios/, mobile/, core/, Cargo.lock; skipping the simulator build."
+      - name: Install the pinned Rust toolchain + simulator target
+        if: steps.filter.outputs.ios == 'true'
+        run: |
+          rustup toolchain install
+          rustup target add aarch64-apple-ios-sim
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: steps.filter.outputs.ios == 'true'
+      - name: Install XcodeGen
+        if: steps.filter.outputs.ios == 'true'
+        run: brew install xcodegen
+      - name: Build the simulator xcframework, Swift bindings, and Xcode project
+        if: steps.filter.outputs.ios == 'true'
+        run: scripts/build-ios.sh --simulator-only
+      - name: Pick and boot a simulator
+        if: steps.filter.outputs.ios == 'true'
+        id: sim
+        run: |
+          udid=$(xcrun simctl list -j devices available \
+            | jq -r '[.devices[][] | select(.isAvailable and (.name | test("^iPhone [0-9]+( Pro)?$")))] | sort_by(.name) | last | .udid')
+          if [ -z "$udid" ] || [ "$udid" = "null" ]; then
+            echo "::error::no iPhone simulator found"; xcrun simctl list devices available; exit 1
+          fi
+          xcrun simctl list devices available | grep "$udid"
+          xcrun simctl boot "$udid" || true
+          xcrun simctl bootstatus "$udid" -b
+          echo "udid=$udid" >> "$GITHUB_OUTPUT"
+      - name: Run ObSinkTests (ObSinkUITests need a live server and are excluded)
+        if: steps.filter.outputs.ios == 'true'
+        run: |
+          xcodebuild test \
+            -project ios/ObSink.xcodeproj -scheme ObSink \
+            -destination "platform=iOS Simulator,id=${{ steps.sim.outputs.udid }}" \
+            -only-testing:ObSinkTests \
+            -derivedDataPath ios/DerivedData \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO COMPILER_INDEX_STORE_ENABLE=NO
