@@ -834,7 +834,7 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     let quit = MenuItem::with_id(app, "quit", "Quit ObSink", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&sync_now, &show, &separator, &quit])?;
 
-    let mut builder = TrayIconBuilder::with_id("obsink-tray")
+    let builder = TrayIconBuilder::with_id("obsink-tray")
         .tooltip("ObSink")
         .menu(&menu)
         // Left click toggles the window; the menu stays on right click.
@@ -861,12 +861,13 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
             }
         });
 
-    if let Some(icon) = app.default_window_icon() {
-        // Template rendering makes the icon adopt the macOS menu-bar tint.
-        builder = builder.icon(icon.clone()).icon_as_template(true);
-    }
-
-    builder.build(app)?;
+    // The menu bar renders template images as a silhouette tinted to the bar
+    // colour, so the tray gets its own monochrome mark (design/tray.svg via
+    // scripts/gen-icons.sh) instead of the full-colour app icon.
+    builder
+        .icon(tauri::include_image!("icons/tray.png"))
+        .icon_as_template(true)
+        .build(app)?;
     Ok(())
 }
 

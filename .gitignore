@@ -24,3 +24,7 @@
 
 # lefthook per-clone overrides
 lefthook-local.yml
+
+# `tauri icon` mobile output; scripts/gen-icons.sh keeps only the macOS set
+/desktop/src-tauri/icons/android/
+/desktop/src-tauri/icons/ios/
