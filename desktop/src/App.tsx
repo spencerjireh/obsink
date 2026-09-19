@@ -304,7 +304,8 @@ function App() {
     )
 
     if (response.pending_conflicts.length > 0) {
-      setMessage(`${plural(response.pending_conflicts.length, 'conflict')} need attention.`)
+      const count = response.pending_conflicts.length
+      setMessage(count === 1 ? '1 conflict needs attention.' : `${count} conflicts need attention.`)
       return
     }
     const failures = response.completed_result?.failures.length ?? 0

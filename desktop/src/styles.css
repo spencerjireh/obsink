@@ -246,6 +246,11 @@ select {
   gap: var(--space-1);
 }
 
+.pane-header > .button {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
 .pane-header__meta {
   color: var(--color-text-muted);
   overflow-wrap: anywhere;
