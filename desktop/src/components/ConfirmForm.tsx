@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 
 type Props = {
@@ -29,6 +29,12 @@ export function ConfirmForm({
   onCancel,
 }: Props) {
   const [typed, setTyped] = useState('')
+  const formRef = useRef<HTMLFormElement>(null)
+
+  // The form opens below the button that asked for it, often past the fold.
+  useEffect(() => {
+    formRef.current?.scrollIntoView({ block: 'nearest' })
+  }, [])
   const matches =
     expected === undefined ||
     (caseInsensitive
@@ -44,7 +50,7 @@ export function ConfirmForm({
   }
 
   return (
-    <form className="confirm" onSubmit={(event) => void handleSubmit(event)}>
+    <form ref={formRef} className="confirm" onSubmit={(event) => void handleSubmit(event)}>
       <h3>{title}</h3>
       <p>{description}</p>
       {expected !== undefined ? (
