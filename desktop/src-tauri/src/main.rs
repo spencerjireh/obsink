@@ -353,6 +353,22 @@ async fn sign_out(server_url: String) -> Result<(), CommandError> {
     Ok(())
 }
 
+/// Delete the account and everything it owns on the server, then forget the
+/// bearer and every vault configured for that server. Vault folders on disk
+/// stay: the files are the user's, and nothing here can recover a key.
+#[tauri::command]
+async fn delete_account(server_url: String) -> Result<(), CommandError> {
+    let bearer = load_bearer(&server_url)?;
+    bearer_call(
+        &server_url,
+        AuthClient::new(&server_url).delete_account(&bearer),
+    )
+    .await?;
+    delete_secret(&bearer_account(&server_url));
+    forget_vaults_for_server(&server_url)?;
+    Ok(())
+}
+
 /// Vaults the current credential can see on a server (for the Connect picker).
 #[tauri::command]
 async fn list_remote_vaults(server_url: String) -> Result<Vec<VaultSummary>, CommandError> {
@@ -838,6 +854,35 @@ fn upsert_vault(vault: StoredVault) -> Result<(), io::Error> {
     save_app_config(&config)
 }
 
+/// Drop a vault from this device: config entry and keychain key. The local
+/// folder (including `.obsink/`) is left alone; reconnecting later needs the
+/// passphrase again and resumes from that checkpoint.
+fn forget_vault(vault_id: &str) -> Result<(), io::Error> {
+    let mut config = load_app_config()?;
+    config.vaults.retain(|vault| vault.id != vault_id);
+    if config.active_vault_id.as_deref() == Some(vault_id) {
+        config.active_vault_id = config.vaults.first().map(|vault| vault.id.clone());
+    }
+    save_app_config(&config)?;
+    delete_secret(vault_id);
+    Ok(())
+}
+
+/// `forget_vault` for every vault on one server (account deletion).
+fn forget_vaults_for_server(server_url: &str) -> Result<(), io::Error> {
+    let server_url = normalize_server_url(server_url);
+    let ids: Vec<String> = load_app_config()?
+        .vaults
+        .iter()
+        .filter(|vault| vault.server_url == server_url)
+        .map(|vault| vault.id.clone())
+        .collect();
+    for id in ids {
+        forget_vault(&id)?;
+    }
+    Ok(())
+}
+
 fn save_key_to_keychain(vault_id: &str, key: &KeyBytes) -> Result<(), io::Error> {
     save_secret(vault_id, &hex::encode(key))
 }
@@ -1087,6 +1132,7 @@ fn main() {
             create_invite,
             list_invites,
             revoke_session,
+            delete_account,
             get_account,
             get_auth_capabilities,
             list_remote_vaults,
