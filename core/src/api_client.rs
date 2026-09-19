@@ -572,7 +572,7 @@ mod tests {
                     .header_exists("content-type")
                     .body_contains("name=\"operations\"")
                     .body_contains("name=\"content\"; filename=\"0\"")
-                    .body_contains(&format!("\"path\":\"{token}\""))
+                    .body_contains(format!("\"path\":\"{token}\""))
                     .body_contains("\"contentHash\":\"h1\"")
                     .body_contains("\"action\":\"delete\"")
                     .body_contains("payload-bytes");
