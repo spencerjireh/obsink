@@ -60,7 +60,9 @@ audience is the ObSink app's bundle id, which the server verifies against Apple'
 1. In Coolify, add a resource of type **Docker Compose** pointing at this repository (branch
    `main`) with the compose file `docker-compose.coolify.yml`. It pulls
    `ghcr.io/spencerjireh/obsink-server:latest` (built by the `Server image` workflow) and runs
-   Postgres alongside it.
+   Postgres alongside it. The GHCR package must be **public** for an anonymous pull (GitHub →
+   Packages → `obsink-server` → Package settings → Change visibility; new packages start
+   private and the API cannot change that), or the Coolify host needs `docker login ghcr.io`.
 2. Set the environment variables in Coolify:
    - `OBSINK_SERVER_KEY` — run `docker run --rm ghcr.io/spencerjireh/obsink-server keygen` and
      paste the output. Store it somewhere safe.
