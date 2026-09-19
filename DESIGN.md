@@ -158,7 +158,7 @@ Shared labels. Every platform uses exactly these strings:
 | server without email | `This server has no email sign-in.` |
 | after actions | `Invite code created.`, `Invite code copied.`, `Device signed out.`, `Account deleted.`, `Removed <vault> from this device.`, `Deleted <vault> on the server.` |
 | confirmation prompt | `Type <value> to confirm.` |
-| confirmation copy | delete account: `This deletes your account, every vault it owns on <server>, and every signed-in device. Vault folders on this device stay.`; delete vault: `This deletes <vault> and all of its files on <server>. The folder on this device stays.`; remove: `The vault stays on the server. The key is removed from the keychain, so connecting again needs the passphrase.` |
+| confirmation copy | delete account: `This deletes your account, every vault it owns on <server>, and every signed-in device.` then, desktop: `Vault folders on this device stay.`, iOS: `The copies on this device are removed too.`; delete vault: `This deletes <vault> and all of its files on <server>` then, desktop: `The folder on this device stays.`, iOS: `for every device.`; remove: `The vault stays on the server.` then, desktop: `The key is removed from the keychain, so connecting again needs the passphrase.`, iOS: `The copy on this device, its Files location, and the key are removed, so connecting again needs the passphrase.` |
 | modes | `Create`, `Connect` |
 | conflict sides | `This device`, `Other device` |
 | conflict choices | `Keep local`, `Keep remote`, `Keep both`, `Delete on server`, `Delete here` |
@@ -223,7 +223,12 @@ not shown.
   the last result.
 - `Devices`, `Invites`, and `Manage vault` are pushed screens
   (`NavigationLink`) from the root form; typed confirmations are a sheet
-  with a medium detent.
+  with a medium detent (`TypedConfirmationSheet`); `Remove from this device`
+  is a confirmation dialog. Errors reach Swift typed (`MobileError`) and
+  `MobileErrorPresentation.swift` maps each variant to its copy.
+- The vault cache on iOS lives inside the app group, so `Remove from this
+  device` and `Delete account` remove it (the copy says so); on desktop the
+  vault folder is the user's and stays.
 - Icon: `ios/ObSink/Assets.xcassets/AppIcon.appiconset/AppIcon.png`, a
   1024x1024 opaque RGB PNG (App Store Connect rejects alpha), full bleed;
   the OS applies the mask.
