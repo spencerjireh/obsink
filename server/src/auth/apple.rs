@@ -1,0 +1,243 @@
+//! Sign in with Apple: verify the native identity token (an RS256 JWT) against
+//! Apple's JWKS, then find/link/create the account. Works on any self-hosted
+//! server because the audience is the ObSink app's bundle id, not a
+//! per-server Services ID.
+
+use std::{
+    collections::HashSet,
+    sync::RwLock,
+    time::{Duration, Instant},
+};
+
+use axum::{extract::State, http::StatusCode, Json};
+use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
+use serde::Deserialize;
+
+use crate::{
+    auth::{
+        account, account::Identity, email::normalize_email, sessions, sessions::SessionResponse,
+    },
+    db,
+    error::{ApiError, AppJson},
+    AppState,
+};
+
+pub const APPLE_ISSUER: &str = "https://appleid.apple.com";
+const JWKS_CACHE_SECS: u64 = 3600;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Jwk {
+    pub kid: String,
+    pub n: String,
+    pub e: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct Jwks {
+    keys: Vec<Jwk>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum Audience {
+    One(String),
+    Many(Vec<String>),
+}
+
+#[derive(Debug, Deserialize)]
+struct Claims {
+    iss: Option<String>,
+    aud: Option<Audience>,
+    exp: Option<u64>,
+    sub: Option<String>,
+    email: Option<String>,
+}
+
+pub struct AppleVerifier {
+    jwks_url: String,
+    audiences: Vec<String>,
+    http: reqwest::Client,
+    cache: RwLock<Option<(Vec<Jwk>, Instant)>>,
+}
+
+pub struct VerifiedIdentity {
+    pub sub: String,
+    pub email: Option<String>,
+}
+
+impl AppleVerifier {
+    pub fn new(jwks_url: String, audiences: Vec<String>) -> Self {
+        Self {
+            jwks_url,
+            audiences,
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
+            cache: RwLock::new(None),
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        !self.audiences.is_empty()
+    }
+
+    async fn fetch_jwks(&self) -> Result<Vec<Jwk>, ApiError> {
+        let jwks: Jwks = self
+            .http
+            .get(&self.jwks_url)
+            .send()
+            .await
+            .and_then(|response| response.error_for_status())
+            .map_err(|_| {
+                ApiError::status(
+                    StatusCode::BAD_GATEWAY,
+                    "could not fetch Apple signing keys",
+                )
+            })?
+            .json()
+            .await
+            .map_err(|_| {
+                ApiError::status(
+                    StatusCode::BAD_GATEWAY,
+                    "could not fetch Apple signing keys",
+                )
+            })?;
+        *self.cache.write().unwrap_or_else(|e| e.into_inner()) =
+            Some((jwks.keys.clone(), Instant::now()));
+        Ok(jwks.keys)
+    }
+
+    async fn key_for(&self, kid: &str) -> Result<Jwk, ApiError> {
+        let cached = {
+            let guard = self.cache.read().unwrap_or_else(|e| e.into_inner());
+            guard
+                .as_ref()
+                .filter(|(_, fetched)| fetched.elapsed() < Duration::from_secs(JWKS_CACHE_SECS))
+                .map(|(keys, _)| keys.clone())
+        };
+        let keys = match cached {
+            Some(keys) => keys,
+            None => self.fetch_jwks().await?,
+        };
+        if let Some(key) = keys.iter().find(|key| key.kid == kid) {
+            return Ok(key.clone());
+        }
+        // Apple rotates keys; one forced refresh before giving up.
+        self.fetch_jwks()
+            .await?
+            .into_iter()
+            .find(|key| key.kid == kid)
+            .ok_or_else(|| ApiError::unauthorized("unknown Apple signing key"))
+    }
+
+    pub async fn verify(&self, token: &str, now: u64) -> Result<VerifiedIdentity, ApiError> {
+        if token.split('.').count() != 3 {
+            return Err(ApiError::unauthorized("malformed identity token"));
+        }
+        let header =
+            decode_header(token).map_err(|_| ApiError::unauthorized("malformed identity token"))?;
+        if header.alg != Algorithm::RS256 {
+            return Err(ApiError::unauthorized("unsupported identity token"));
+        }
+        let kid = header
+            .kid
+            .ok_or_else(|| ApiError::unauthorized("unsupported identity token"))?;
+        let jwk = self.key_for(&kid).await?;
+        let key = DecodingKey::from_rsa_components(&jwk.n, &jwk.e)
+            .map_err(|_| ApiError::unauthorized("unknown Apple signing key"))?;
+
+        // Claims are checked by hand below so each failure keeps its own message.
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.validate_exp = false;
+        validation.validate_nbf = false;
+        validation.validate_aud = false;
+        validation.required_spec_claims = HashSet::new();
+        let data = decode::<Claims>(token, &key, &validation).map_err(|error| {
+            use jsonwebtoken::errors::ErrorKind;
+            match error.kind() {
+                ErrorKind::InvalidSignature => {
+                    ApiError::unauthorized("identity token signature is invalid")
+                }
+                _ => ApiError::unauthorized("malformed identity token"),
+            }
+        })?;
+        let claims = data.claims;
+        if claims.iss.as_deref() != Some(APPLE_ISSUER) {
+            return Err(ApiError::unauthorized("identity token issuer mismatch"));
+        }
+        let audience_ok = match &claims.aud {
+            Some(Audience::One(aud)) => self.audiences.iter().any(|a| a == aud),
+            Some(Audience::Many(auds)) => auds.iter().any(|aud| self.audiences.contains(aud)),
+            None => false,
+        };
+        if !audience_ok {
+            return Err(ApiError::unauthorized("identity token audience mismatch"));
+        }
+        if !claims.exp.is_some_and(|exp| exp > now) {
+            return Err(ApiError::unauthorized("identity token expired"));
+        }
+        let sub = claims
+            .sub
+            .filter(|sub| !sub.is_empty())
+            .ok_or_else(|| ApiError::unauthorized("identity token has no subject"))?;
+        Ok(VerifiedIdentity {
+            sub,
+            email: claims
+                .email
+                .and_then(|email| normalize_email(Some(&email)).ok()),
+        })
+    }
+}
+
+#[derive(Deserialize)]
+pub struct AppleBody {
+    pub identity_token: Option<String>,
+    pub device_name: Option<String>,
+    /// Apple only includes the email in the first-ever token for an app; the
+    /// client forwards the credential's email so linking still works.
+    pub email: Option<String>,
+    pub invite_code: Option<String>,
+}
+
+pub async fn sign_in(
+    State(state): State<AppState>,
+    AppJson(body): AppJson<AppleBody>,
+) -> Result<Json<SessionResponse>, ApiError> {
+    let token = body
+        .identity_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| ApiError::bad_request("identity_token is required"))?;
+    if !state.apple.enabled() {
+        return Err(ApiError::status(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Sign in with Apple is not configured on this server",
+        ));
+    }
+    let now = db::now();
+    let identity = state.apple.verify(token, now).await?;
+    let email = identity.email.or_else(|| {
+        body.email
+            .as_deref()
+            .and_then(|hint| normalize_email(Some(hint)).ok())
+    });
+    let device = sessions::clean_device_name(body.device_name.as_deref());
+
+    let mut tx = state.pool.begin().await?;
+    let session = account::sign_in(
+        &state,
+        &mut tx,
+        Identity::Apple {
+            sub: identity.sub,
+            email,
+        },
+        body.invite_code.as_deref(),
+        &device,
+        now,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Json(session))
+}

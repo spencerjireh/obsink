@@ -1,0 +1,151 @@
+mod common;
+
+use std::fs;
+
+use common::{TestEnv, API_KEY};
+use obsink_server::{
+    blobs::Tier,
+    retention::{self, TRASH_RETENTION_SECS, VERSION_RETENTION_SECS},
+};
+
+const VAULT: &str = "vault_00000000-0000-4000-8000-000000000000";
+
+fn seed(env: &TestEnv, tier: Tier, vault: &str, path: &str, timestamps: &[u64]) {
+    for ts in timestamps {
+        env.state.blobs.put_live(vault, path, b"x").unwrap();
+        match tier {
+            Tier::Versions => env.state.blobs.archive_version(vault, path, *ts).unwrap(),
+            Tier::Trash => env.state.blobs.move_to_trash(vault, path, *ts).unwrap(),
+            Tier::Live => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn prunes_versions_beyond_the_newest_ten_per_file() {
+    let Some(env) = TestEnv::try_new().await else {
+        return;
+    };
+    let vault = env.create_vault(API_KEY, "v").await;
+    let timestamps: Vec<u64> = (1..=12).map(|i| 1_000_000 + i).collect();
+    seed(&env, Tier::Versions, &vault, "note", &timestamps);
+    let report = retention::run_once(&env.state, 1_000_100).await.unwrap();
+    assert_eq!(report.versions_removed, 2);
+    let remaining = env
+        .state
+        .blobs
+        .list_history(Tier::Versions, &vault, "note")
+        .unwrap();
+    assert_eq!(remaining.len(), 10);
+    assert!(!remaining.contains(&"1000001".to_string()));
+    assert!(!remaining.contains(&"1000002".to_string()));
+    assert!(remaining.contains(&"1000012".to_string()));
+    env.finish().await;
+}
+
+#[tokio::test]
+async fn prunes_versions_older_than_the_retention_window() {
+    let Some(env) = TestEnv::try_new().await else {
+        return;
+    };
+    let vault = env.create_vault(API_KEY, "v").await;
+    let now = VERSION_RETENTION_SECS + 5;
+    seed(
+        &env,
+        Tier::Versions,
+        &vault,
+        "note",
+        &[1, VERSION_RETENTION_SECS + 1],
+    );
+    let report = retention::run_once(&env.state, now).await.unwrap();
+    assert_eq!(report.versions_removed, 1);
+    assert_eq!(
+        env.state
+            .blobs
+            .list_history(Tier::Versions, &vault, "note")
+            .unwrap(),
+        vec![(VERSION_RETENTION_SECS + 1).to_string()]
+    );
+    env.finish().await;
+}
+
+#[tokio::test]
+async fn prunes_trash_entries_older_than_the_retention_window() {
+    let Some(env) = TestEnv::try_new().await else {
+        return;
+    };
+    let vault = env.create_vault(API_KEY, "v").await;
+    let now = TRASH_RETENTION_SECS + 5;
+    seed(
+        &env,
+        Tier::Trash,
+        &vault,
+        "note",
+        &[1, TRASH_RETENTION_SECS + 1],
+    );
+    let report = retention::run_once(&env.state, now).await.unwrap();
+    assert_eq!(report.trash_removed, 1);
+    assert_eq!(
+        env.state
+            .blobs
+            .list_history(Tier::Trash, &vault, "note")
+            .unwrap(),
+        vec![(TRASH_RETENTION_SECS + 1).to_string()]
+    );
+    // Fully pruned history directories disappear.
+    seed(&env, Tier::Trash, &vault, "gone", &[1]);
+    retention::run_once(&env.state, now).await.unwrap();
+    assert!(
+        !env.state.blobs.tier_root(Tier::Trash).join(&vault).exists()
+            || fs::read_dir(env.state.blobs.tier_root(Tier::Trash).join(&vault))
+                .unwrap()
+                .count()
+                == 1
+    );
+    env.finish().await;
+}
+
+#[tokio::test]
+async fn prunes_expired_sessions_and_codes() {
+    let Some(env) = TestEnv::try_new().await else {
+        return;
+    };
+    let token = env.email_token("r@example.com", "d", None).await;
+    sqlx::query("UPDATE sessions SET expires = 1")
+        .execute(&env.state.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE email_codes SET last_sent = 1")
+        .execute(&env.state.pool)
+        .await
+        .unwrap();
+    let report = retention::run_once(&env.state, obsink_server::db::now())
+        .await
+        .unwrap();
+    assert_eq!(report.sessions_removed, 1);
+    assert_eq!(report.codes_removed, 1);
+    assert_eq!(env.table_count("sessions").await, 0);
+    assert_eq!(env.table_count("email_codes").await, 0);
+    let _ = token;
+    env.finish().await;
+}
+
+#[tokio::test]
+async fn removes_orphaned_vault_directories() {
+    let Some(env) = TestEnv::try_new().await else {
+        return;
+    };
+    let real = env.create_vault(API_KEY, "real").await;
+    env.state.blobs.put_live(&real, "tok", b"x").unwrap();
+    env.state.blobs.put_live(VAULT, "tok", b"x").unwrap();
+    seed(&env, Tier::Trash, VAULT, "tok", &[1]);
+    let report = retention::run_once(&env.state, 10).await.unwrap();
+    assert_eq!(report.orphan_dirs_removed, 2);
+    assert!(env.state.blobs.live_exists(&real, "tok"));
+    assert!(!env.state.blobs.live_exists(VAULT, "tok"));
+    assert_eq!(
+        env.state.blobs.vault_dirs(Tier::Trash).unwrap(),
+        Vec::<String>::new()
+    );
+    env.finish().await;
+}

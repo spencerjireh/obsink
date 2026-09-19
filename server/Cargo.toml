@@ -1,0 +1,54 @@
+[package]
+name = "obsink-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+default-run = "obsink-server"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "obsink-server"
+path = "src/main.rs"
+
+[dependencies]
+obsink-core = { path = "../core" }
+
+# HTTP
+axum = { version = "0.8", features = ["multipart", "macros"] }
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["trace"] }
+
+# Storage
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "migrate", "macros"] }
+walkdir = "2"
+
+# Crypto (same stack as core)
+aes-gcm = "0.10"
+hkdf = "0.12"
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2"
+rand = "0.8"
+base64 = "0.22"
+hex = "0.4"
+uuid = { version = "1", features = ["v4"] }
+
+# Auth
+jsonwebtoken = "9"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+lettre = { version = "0.11", default-features = false, features = ["tokio1", "tokio1-rustls-tls", "smtp-transport", "builder"] }
+
+# Plumbing
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
+rsa = { version = "0.9", features = ["sha2"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart"] }

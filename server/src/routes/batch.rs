@@ -1,0 +1,175 @@
+//! `POST /vaults/{id}/batch` as `multipart/form-data`.
+//!
+//! Parts: one `operations` part holding `{"operations":[...]}` (the Worker's
+//! JSON minus the base64 `content`), then one `content` part per put with
+//! `filename="<operation index>"`. Operations run sequentially, each in its own
+//! transaction, and the response lists a status per operation (409s carry the
+//! conflicting entry), so a batch can partly succeed.
+
+use std::collections::HashMap;
+
+use axum::{
+    body::Bytes,
+    extract::{
+        multipart::{MultipartError, MultipartRejection},
+        Multipart, Path, State,
+    },
+    http::StatusCode,
+    Json,
+};
+use obsink_core::{BatchOperationResult, BatchResponse, ServerConflict};
+use serde::Deserialize;
+
+use crate::{
+    auth::Principal,
+    error::ApiError,
+    routes::files::{apply_delete, apply_put, PutParams},
+    AppState,
+};
+
+#[derive(Deserialize)]
+struct WireOp {
+    action: Option<String>,
+    path: Option<String>,
+    #[serde(rename = "parentHash")]
+    parent_hash: Option<String>,
+    #[serde(rename = "contentHash")]
+    content_hash: Option<String>,
+    #[serde(rename = "encPath")]
+    enc_path: Option<String>,
+}
+
+fn multipart_error(error: MultipartError) -> ApiError {
+    if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        ApiError::status(StatusCode::PAYLOAD_TOO_LARGE, "batch too large")
+    } else {
+        ApiError::bad_request("malformed multipart body")
+    }
+}
+
+pub async fn batch(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(vault_id): Path<String>,
+    multipart: Result<Multipart, MultipartRejection>,
+) -> Result<Json<BatchResponse>, ApiError> {
+    let mut multipart = multipart.map_err(|rejection| match rejection {
+        MultipartRejection::InvalidBoundary(_) => ApiError::status(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "batch requires multipart/form-data",
+        ),
+        _ => ApiError::bad_request("malformed multipart body"),
+    })?;
+
+    let mut operations: Option<String> = None;
+    let mut contents: HashMap<usize, Bytes> = HashMap::new();
+    while let Some(field) = multipart.next_field().await.map_err(multipart_error)? {
+        match field.name() {
+            Some("operations") => {
+                if operations.is_some() {
+                    return Err(ApiError::bad_request("duplicate operations part"));
+                }
+                operations = Some(field.text().await.map_err(multipart_error)?);
+            }
+            Some("content") => {
+                let index: usize = field
+                    .file_name()
+                    .and_then(|name| name.parse().ok())
+                    .ok_or_else(|| {
+                        ApiError::bad_request("content part filename must be the operation index")
+                    })?;
+                let bytes = field.bytes().await.map_err(multipart_error)?;
+                if contents.insert(index, bytes).is_some() {
+                    return Err(ApiError::bad_request(format!(
+                        "duplicate content part for operation {index}"
+                    )));
+                }
+            }
+            _ => return Err(ApiError::bad_request("unknown multipart part")),
+        }
+    }
+
+    let operations =
+        operations.ok_or_else(|| ApiError::bad_request("operations must be an array"))?;
+    let parsed: serde_json::Value = serde_json::from_str(&operations)
+        .map_err(|_| ApiError::bad_request("body must be JSON"))?;
+    let ops = parsed
+        .get("operations")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| ApiError::bad_request("operations must be an array"))?;
+    let ops: Vec<WireOp> = ops
+        .iter()
+        .map(|op| {
+            serde_json::from_value(op.clone())
+                .map_err(|_| ApiError::bad_request("operations must be an array"))
+        })
+        .collect::<Result<_, _>>()?;
+
+    for (index, op) in ops.iter().enumerate() {
+        let is_put = op.action.as_deref() == Some("put");
+        if is_put && !contents.contains_key(&index) {
+            return Err(ApiError::bad_request(format!(
+                "missing content part for operation {index}"
+            )));
+        }
+        if !is_put && contents.contains_key(&index) {
+            return Err(ApiError::bad_request(format!(
+                "operation {index} is not a put but has a content part"
+            )));
+        }
+    }
+    if let Some(stray) = contents.keys().find(|index| **index >= ops.len()) {
+        return Err(ApiError::bad_request(format!(
+            "content part {stray} has no operation"
+        )));
+    }
+
+    let mut results = Vec::with_capacity(ops.len());
+    for (index, op) in ops.iter().enumerate() {
+        let path = op.path.clone().unwrap_or_default();
+        let outcome = if op.action.as_deref() == Some("put") {
+            apply_put(
+                &state,
+                &principal,
+                PutParams {
+                    vault_id: &vault_id,
+                    path: &path,
+                    parent_hash: Some(op.parent_hash.as_deref().unwrap_or("")),
+                    content_hash: op.content_hash.as_deref(),
+                    enc_path: op.enc_path.as_deref(),
+                },
+                &contents[&index],
+            )
+            .await
+        } else {
+            apply_delete(
+                &state,
+                &principal,
+                &vault_id,
+                &path,
+                Some(op.parent_hash.as_deref().unwrap_or("")),
+            )
+            .await
+        };
+        let result = match outcome {
+            Ok(()) => BatchOperationResult {
+                path,
+                status: 200,
+                conflict: None,
+            },
+            Err(ApiError::Conflict { path, current }) => BatchOperationResult {
+                path: path.clone(),
+                status: 409,
+                conflict: Some(ServerConflict { path, current }),
+            },
+            Err(ApiError::Status(code, _)) => BatchOperationResult {
+                path,
+                status: code.as_u16(),
+                conflict: None,
+            },
+            Err(error @ ApiError::Internal(_)) => return Err(error),
+        };
+        results.push(result);
+    }
+    Ok(Json(BatchResponse { results }))
+}
