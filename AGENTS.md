@@ -46,6 +46,8 @@ obsink/
   AGENTS.md              # this file (canonical — CLAUDE.md points here)
   CLAUDE.md              # one-line pointer to AGENTS.md
   spec.md                # spec source of truth
+  DESIGN.md              # UI rules: principles, brand, tokens, components, copy, platform mapping
+  design/                # icon.svg + tray.svg (icon sources; rasters come from scripts/gen-icons.sh)
   core/                  # Rust sync engine: crypto, hasher, manifest, api_client, auth, sync_engine
   cli/                   # `obsink` CLI (reference client)
   server/                # obsink-server (axum): accounts, vaults, files, batch, retention; Dockerfile
@@ -53,7 +55,7 @@ obsink/
   mobile/                # UniFFI facade over core (staticlib/cdylib for iOS)
   ios/                   # Xcode project: ObSink app + FileProvider ext + Tests (XcodeGen)
   docker-compose.yml     # local stack; docker-compose.coolify.yml for production
-  scripts/               # build-ios, release-ios, verify-* harnesses, check-commit-msg
+  scripts/               # build-ios, release-ios, gen-icons, verify-* harnesses, check-commit-msg
   docs/                  # self-hosting, architecture, platforms, troubleshooting
   .github/               # ci.yml, release.yml, rulesets/main.json, PR template
   lefthook.yml           # git hooks: rustfmt, prettier, commit message
@@ -156,6 +158,9 @@ P8 pivot are decommissioned; nothing in the repo references them.
 
 ## Workflow expectations
 
+- UI, copy, or icon changes follow `DESIGN.md` (shared labels, tokens, the
+  XCUITest identifiers it lists as API). Regenerate rasters with
+  `scripts/gen-icons.sh`; never hand-edit a PNG or `.icns`.
 - Rules questions: check `spec.md` first; if the spec is ambiguous, say so and
   propose a clarification instead of guessing. Log the outcome on the decision
   log (see below).
