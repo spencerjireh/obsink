@@ -85,13 +85,11 @@ struct StoredAppConfig {
 }
 
 /// One configured vault. The server bearer (session token) is NOT stored
-/// here — it lives in the keychain under `bearer:<server_url>`. The
-/// `server_url` alias reads configs written before the server pivot.
+/// here — it lives in the keychain under `bearer:<server_url>`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredVault {
     id: String,
     name: String,
-    #[serde(alias = "server_url")]
     server_url: String,
     local_path: String,
 }
@@ -1176,7 +1174,7 @@ mod live_tests {
         let _ = fs::remove_dir_all(&sandbox);
         let dir = sandbox.join("vault");
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("note.md"), "# cloud\n").unwrap();
+        fs::write(dir.join("note.md"), "# note\n").unwrap();
         std::env::set_var("HOME", &sandbox);
         let keyring_dir = sandbox.join("keyring");
         fs::create_dir_all(&keyring_dir).unwrap();
@@ -1244,7 +1242,7 @@ mod live_tests {
             mode: AddVaultMode::Create,
             server_url: server_url.clone(),
             local_path: dir.to_string_lossy().into_owned(),
-            vault_name: "cloud-vault".to_string(),
+            vault_name: "desktop-account-vault".to_string(),
             vault_id: String::new(),
             passphrase: "pw".to_string(),
         })
