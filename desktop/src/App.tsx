@@ -123,8 +123,12 @@ function formatBytes(value: number): string {
 
 function usageLine(usage: UsageInfo | null): string {
   if (!usage) return ''
-  const vaults = usage.max_vaults === null ? `${usage.vaults.length} vaults` : `${usage.vaults.length}/${usage.max_vaults} vaults`
-  const cap = usage.max_vault_bytes === null ? '' : ` · ${formatBytes(usage.max_vault_bytes)} per vault`
+  const vaults =
+    usage.max_vaults === null
+      ? `${usage.vaults.length} vaults`
+      : `${usage.vaults.length}/${usage.max_vaults} vaults`
+  const cap =
+    usage.max_vault_bytes === null ? '' : ` · ${formatBytes(usage.max_vault_bytes)} per vault`
   return ` · ${formatBytes(usage.total_bytes)} used · ${vaults}${cap}`
 }
 
@@ -244,7 +248,10 @@ function App() {
     setBusy(true)
     setMessage('')
     try {
-      const devCode = await call<string | null>('auth_email_start', { serverUrl: currentServerUrl, email: authEmail })
+      const devCode = await call<string | null>('auth_email_start', {
+        serverUrl: currentServerUrl,
+        email: authEmail,
+      })
       setCodeSent(true)
       if (devCode) {
         setAuthCode(devCode)
@@ -274,7 +281,9 @@ function App() {
       setAuthCode('')
       setInviteCode('')
       rememberServerUrl(currentServerUrl)
-      setMessage(next.kind === 'account' ? `Signed in as ${next.email ?? next.user_id}.` : 'Signed in.')
+      setMessage(
+        next.kind === 'account' ? `Signed in as ${next.email ?? next.user_id}.` : 'Signed in.',
+      )
     } catch (error) {
       setMessage(String(error))
     } finally {
@@ -339,10 +348,7 @@ function App() {
     }
   }
 
-  const activeVault = useMemo(
-    () => vaults.find((vault) => vault.active) ?? null,
-    [vaults],
-  )
+  const activeVault = useMemo(() => vaults.find((vault) => vault.active) ?? null, [vaults])
 
   async function refresh() {
     const [nextVaults, nextStatus] = await Promise.all([
@@ -373,7 +379,10 @@ function App() {
       return
     }
 
-    if (!selectedConflictPath || !conflicts.some((conflict) => conflict.path === selectedConflictPath)) {
+    if (
+      !selectedConflictPath ||
+      !conflicts.some((conflict) => conflict.path === selectedConflictPath)
+    ) {
       setSelectedConflictPath(conflicts[0].path)
     }
   }, [conflicts, selectedConflictPath])
@@ -575,8 +584,8 @@ function App() {
         <div className="hero__headline">
           <h1>ObSink</h1>
           <p>
-            A desktop control room for vault sync, conflict triage, and setup without
-            leaving your notes flow.
+            A desktop control room for vault sync, conflict triage, and setup without leaving your
+            notes flow.
           </p>
         </div>
         <div className="hero__meta">
@@ -596,8 +605,8 @@ function App() {
 
         {staleRemoteChanges > 0 ? (
           <div className="notice notice--warning">
-            {staleRemoteChanges} file{staleRemoteChanges === 1 ? '' : 's'} changed on another device.
-            Sync before editing.
+            {staleRemoteChanges} file{staleRemoteChanges === 1 ? '' : 's'} changed on another
+            device. Sync before editing.
           </div>
         ) : null}
       </section>
@@ -606,7 +615,11 @@ function App() {
         <div className="panel status-panel">
           <div className="section-heading">
             <h2>Sync Deck</h2>
-            <button className="button button--primary" disabled={busy || !activeVault} onClick={handleSync}>
+            <button
+              className="button button--primary"
+              disabled={busy || !activeVault}
+              onClick={handleSync}
+            >
               {busy ? 'Working...' : 'Sync Now'}
             </button>
           </div>
@@ -656,7 +669,10 @@ function App() {
           <div className="vault-list">
             {vaults.length === 0 ? <p>No vaults configured yet.</p> : null}
             {vaults.map((vault) => (
-              <article key={vault.id} className={`vault-card${vault.active ? ' vault-card--active' : ''}`}>
+              <article
+                key={vault.id}
+                className={`vault-card${vault.active ? ' vault-card--active' : ''}`}
+              >
                 <header>
                   <h3>{vault.name}</h3>
                   <span>{vault.active ? 'Active' : vault.id}</span>
@@ -681,7 +697,11 @@ function App() {
         <div className="panel setup-panel">
           <div className="section-heading">
             <h2>Vault Setup</h2>
-            <span>{form.mode === 'create' ? 'Create a new remote vault' : 'Connect to an existing vault'}</span>
+            <span>
+              {form.mode === 'create'
+                ? 'Create a new remote vault'
+                : 'Connect to an existing vault'}
+            </span>
           </div>
 
           <div className="form-grid">
@@ -704,10 +724,20 @@ function App() {
                   {usageLine(account.usage)}
                 </span>
                 <span className="choice-row">
-                  <button className="button button--ghost" disabled={busy} onClick={handleCreateInvite} type="button">
+                  <button
+                    className="button button--ghost"
+                    disabled={busy}
+                    onClick={handleCreateInvite}
+                    type="button"
+                  >
                     Invite someone
                   </button>
-                  <button className="button button--ghost" disabled={busy} onClick={handleSignOut} type="button">
+                  <button
+                    className="button button--ghost"
+                    disabled={busy}
+                    onClick={handleSignOut}
+                    type="button"
+                  >
                     Sign out
                   </button>
                 </span>
@@ -715,7 +745,8 @@ function App() {
               {issuedInvite ? (
                 <div className="invite-box">
                   <span>
-                    Invite code <code>{issuedInvite.code}</code> · expires {formatUnix(issuedInvite.expires)}
+                    Invite code <code>{issuedInvite.code}</code> · expires{' '}
+                    {formatUnix(issuedInvite.expires)}
                   </span>
                   <button className="button button--ghost" onClick={handleCopyInvite} type="button">
                     Copy
@@ -746,16 +777,30 @@ function App() {
               {codeSent ? (
                 <label>
                   <span>6-digit code</span>
-                  <input inputMode="numeric" value={authCode} onChange={(event) => setAuthCode(event.target.value)} />
+                  <input
+                    inputMode="numeric"
+                    value={authCode}
+                    onChange={(event) => setAuthCode(event.target.value)}
+                  />
                 </label>
               ) : null}
               <div className="choice-row">
                 {codeSent ? (
                   <>
-                    <button className="button" disabled={busy || authCode.trim().length !== 6} onClick={handleVerifyCode} type="button">
+                    <button
+                      className="button"
+                      disabled={busy || authCode.trim().length !== 6}
+                      onClick={handleVerifyCode}
+                      type="button"
+                    >
                       Verify and sign in
                     </button>
-                    <button className="button button--ghost" disabled={busy} onClick={() => setCodeSent(false)} type="button">
+                    <button
+                      className="button button--ghost"
+                      disabled={busy}
+                      onClick={() => setCodeSent(false)}
+                      type="button"
+                    >
                       Change email
                     </button>
                   </>
@@ -793,18 +838,33 @@ function App() {
           <div className="form-grid">
             <label>
               <span>Local vault path</span>
-              <input value={form.local_path} onChange={(event) => setForm((current) => ({ ...current, local_path: event.target.value }))} />
+              <input
+                value={form.local_path}
+                onChange={(event) =>
+                  setForm((current) => ({ ...current, local_path: event.target.value }))
+                }
+              />
             </label>
             {form.mode === 'create' ? (
               <label>
                 <span>Vault name</span>
-                <input value={form.vault_name} onChange={(event) => setForm((current) => ({ ...current, vault_name: event.target.value }))} />
+                <input
+                  value={form.vault_name}
+                  onChange={(event) =>
+                    setForm((current) => ({ ...current, vault_name: event.target.value }))
+                  }
+                />
               </label>
             ) : (
               <label>
                 <span>Vault</span>
                 {remoteVaults ? (
-                  <select value={form.vault_id} onChange={(event) => setForm((current) => ({ ...current, vault_id: event.target.value }))}>
+                  <select
+                    value={form.vault_id}
+                    onChange={(event) =>
+                      setForm((current) => ({ ...current, vault_id: event.target.value }))
+                    }
+                  >
                     {remoteVaults.map((vault) => (
                       <option key={vault.id} value={vault.id}>
                         {vault.name}
@@ -812,7 +872,12 @@ function App() {
                     ))}
                   </select>
                 ) : (
-                  <button className="button button--ghost" disabled={busy} onClick={handleLoadRemoteVaults} type="button">
+                  <button
+                    className="button button--ghost"
+                    disabled={busy}
+                    onClick={handleLoadRemoteVaults}
+                    type="button"
+                  >
                     Load vaults
                   </button>
                 )}
@@ -820,7 +885,13 @@ function App() {
             )}
             <label>
               <span>Passphrase</span>
-              <input type="password" value={form.passphrase} onChange={(event) => setForm((current) => ({ ...current, passphrase: event.target.value }))} />
+              <input
+                type="password"
+                value={form.passphrase}
+                onChange={(event) =>
+                  setForm((current) => ({ ...current, passphrase: event.target.value }))
+                }
+              />
             </label>
           </div>
 
@@ -849,7 +920,11 @@ function App() {
         <div className="panel conflicts-panel">
           <div className="section-heading">
             <h2>Conflict Resolver</h2>
-            <button className="button button--primary" disabled={busy || conflicts.length === 0} onClick={handleResolveConflicts}>
+            <button
+              className="button button--primary"
+              disabled={busy || conflicts.length === 0}
+              onClick={handleResolveConflicts}
+            >
               Apply Decisions
             </button>
           </div>
@@ -885,7 +960,8 @@ function App() {
                 <header>
                   <h3>{conflict.path}</h3>
                   <span>
-                    local {formatUnix(conflict.local.modified)} / remote {formatUnix(conflict.remote.modified)}
+                    local {formatUnix(conflict.local.modified)} / remote{' '}
+                    {formatUnix(conflict.remote.modified)}
                   </span>
                 </header>
                 <div className="conflict-meta">
@@ -897,7 +973,9 @@ function App() {
                     <button
                       key={choice}
                       className={choices[conflict.path] === choice ? 'is-selected' : ''}
-                      onClick={() => setChoices((current) => ({ ...current, [conflict.path]: choice }))}
+                      onClick={() =>
+                        setChoices((current) => ({ ...current, [conflict.path]: choice }))
+                      }
                       type="button"
                     >
                       {label}
@@ -928,11 +1006,23 @@ function ResultColumn({ title, items }: { title: string; items: SyncAction[] }) 
   )
 }
 
-function PreviewColumn({ title, deleted, content }: { title: string; deleted: boolean; content: string }) {
+function PreviewColumn({
+  title,
+  deleted,
+  content,
+}: {
+  title: string
+  deleted: boolean
+  content: string
+}) {
   return (
     <div className="preview-column">
       <h3>{title}</h3>
-      {deleted ? <p className="empty-state">Deleted in this version.</p> : <pre>{content || 'Empty file.'}</pre>}
+      {deleted ? (
+        <p className="empty-state">Deleted in this version.</p>
+      ) : (
+        <pre>{content || 'Empty file.'}</pre>
+      )}
     </div>
   )
 }
