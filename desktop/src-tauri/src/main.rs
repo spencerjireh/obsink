@@ -18,8 +18,9 @@ use obsink_core::{
     complete_sync, derive_key, derive_keys, diff_local_and_remote, fetch_remote_manifest,
     keychain::{delete_secret, load_secret, save_secret},
     load_local_state, normalize_server_url, prepare_sync, sync_manifest_path, write_atomic,
-    ApiClient, AuthClient, Conflict, ConflictResolution, CreateVaultRequest, KeyBytes,
-    ProgressEvent, ProgressSink, SyncPlan, SyncResult, VaultConfig, VaultSummary,
+    ApiClient, ApiError, AuthClient, AuthError, Conflict, ConflictResolution, CreateVaultRequest,
+    KeyBytes, ProgressEvent, ProgressSink, SyncEngineError, SyncPlan, SyncResult, VaultConfig,
+    VaultSummary,
 };
 use serde::{Deserialize, Serialize};
 
@@ -40,13 +41,15 @@ struct InFlightGuard<'a> {
 }
 
 impl<'a> InFlightGuard<'a> {
-    fn acquire(state: &'a AppState, vault_id: &str) -> Result<Self, String> {
+    fn acquire(state: &'a AppState, vault_id: &str) -> Result<Self, CommandError> {
         let mut in_flight = state
             .in_flight
             .lock()
             .map_err(|_| "in-flight lock poisoned".to_string())?;
         if !in_flight.insert(vault_id.to_string()) {
-            return Err(format!("sync already running for vault {vault_id}"));
+            return Err(CommandError::other(format!(
+                "sync already running for vault {vault_id}"
+            )));
         }
         Ok(Self {
             state,
@@ -120,9 +123,9 @@ fn bearer_account(server_url: &str) -> String {
 }
 
 /// The bearer stored for a server, or a "sign in first" error.
-fn load_bearer(server_url: &str) -> Result<String, String> {
+fn load_bearer(server_url: &str) -> Result<String, CommandError> {
     load_secret(&bearer_account(server_url))
-        .map_err(|_| format!("not signed in to {server_url} — sign in first"))
+        .map_err(|_| CommandError::other(format!("not signed in to {server_url} — sign in first")))
 }
 
 fn device_name() -> String {
@@ -189,11 +192,8 @@ struct DeviceInfo {
 }
 
 #[tauri::command]
-async fn get_auth_capabilities(server_url: String) -> Result<AuthCapabilities, String> {
-    let caps = AuthClient::new(&server_url)
-        .capabilities()
-        .await
-        .map_err(err_string)?;
+async fn get_auth_capabilities(server_url: String) -> Result<AuthCapabilities, CommandError> {
+    let caps = AuthClient::new(&server_url).capabilities().await?;
     Ok(AuthCapabilities {
         email: caps.auth.email,
         apple: caps.auth.apple,
@@ -203,11 +203,13 @@ async fn get_auth_capabilities(server_url: String) -> Result<AuthCapabilities, S
 /// Send a one-time code. Returns the code itself only against a dev server
 /// (`AUTH_DEV_RETURN_CODE=1`) so harnesses can complete the flow.
 #[tauri::command]
-async fn auth_email_start(server_url: String, email: String) -> Result<Option<String>, String> {
+async fn auth_email_start(
+    server_url: String,
+    email: String,
+) -> Result<Option<String>, CommandError> {
     let result = AuthClient::new(&server_url)
         .email_start(email.trim())
-        .await
-        .map_err(err_string)?;
+        .await?;
     Ok(result.code)
 }
 
@@ -217,21 +219,20 @@ async fn auth_email_verify(
     email: String,
     code: String,
     invite_code: Option<String>,
-) -> Result<AccountState, String> {
+) -> Result<AccountState, CommandError> {
     let invite = invite_code
         .as_deref()
         .map(str::trim)
         .filter(|code| !code.is_empty());
     let session = AuthClient::new(&server_url)
         .email_verify(email.trim(), code.trim(), &device_name(), invite)
-        .await
-        .map_err(err_string)?;
-    save_secret(&bearer_account(&server_url), &session.token).map_err(err_string)?;
+        .await?;
+    save_secret(&bearer_account(&server_url), &session.token)?;
     get_account(server_url).await
 }
 
 #[tauri::command]
-async fn get_account(server_url: String) -> Result<AccountState, String> {
+async fn get_account(server_url: String) -> Result<AccountState, CommandError> {
     let Ok(bearer) = load_secret(&bearer_account(&server_url)) else {
         return Ok(AccountState::SignedOut);
     };
@@ -268,23 +269,27 @@ async fn get_account(server_url: String) -> Result<AccountState, String> {
             // works with accounts.
             None => Ok(AccountState::SignedOut),
         },
-        Err(obsink_core::AuthError::Server { status, .. }) if status.as_u16() == 401 => {
-            // Session revoked/expired elsewhere: forget it locally.
-            delete_secret(&bearer_account(&server_url));
-            Ok(AccountState::SignedOut)
+        Err(error) => {
+            let error = forget_bearer_on_401(&server_url, Err::<(), _>(error.into())).unwrap_err();
+            if error.kind == ErrorKind::Unauthorized {
+                // Session revoked/expired elsewhere: signed out is the state.
+                Ok(AccountState::SignedOut)
+            } else {
+                Err(error)
+            }
         }
-        Err(error) => Err(err_string(error)),
     }
 }
 
 /// Mint an invite code for someone else to create an account on this server.
 #[tauri::command]
-async fn create_invite(server_url: String) -> Result<InviteInfo, String> {
+async fn create_invite(server_url: String) -> Result<InviteInfo, CommandError> {
     let bearer = load_bearer(&server_url)?;
-    let invite = AuthClient::new(&server_url)
-        .create_invite(&bearer)
-        .await
-        .map_err(err_string)?;
+    let invite = bearer_call(
+        &server_url,
+        AuthClient::new(&server_url).create_invite(&bearer),
+    )
+    .await?;
     Ok(InviteInfo {
         code: invite.code,
         expires: invite.expires,
@@ -294,7 +299,7 @@ async fn create_invite(server_url: String) -> Result<InviteInfo, String> {
 /// Sign out of a server. Vault configs stay; sync will ask for a credential
 /// again.
 #[tauri::command]
-async fn sign_out(server_url: String) -> Result<(), String> {
+async fn sign_out(server_url: String) -> Result<(), CommandError> {
     let account = bearer_account(&server_url);
     if let Ok(bearer) = load_secret(&account) {
         // Best effort: the local credential goes away regardless.
@@ -306,17 +311,15 @@ async fn sign_out(server_url: String) -> Result<(), String> {
 
 /// Vaults the current credential can see on a server (for the Connect picker).
 #[tauri::command]
-async fn list_remote_vaults(server_url: String) -> Result<Vec<VaultSummary>, String> {
+async fn list_remote_vaults(server_url: String) -> Result<Vec<VaultSummary>, CommandError> {
     let bearer = load_bearer(&server_url)?;
-    ApiClient::new(VaultConfig {
+    let client = ApiClient::new(VaultConfig {
         server_url: normalize_server_url(&server_url),
         api_key: bearer,
         vault_id: String::new(),
         local_path: String::new(),
-    })
-    .list_vaults()
-    .await
-    .map_err(err_string)
+    });
+    bearer_call(&server_url, client.list_vaults()).await
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -362,8 +365,8 @@ struct ConflictPreview {
 }
 
 #[tauri::command]
-fn get_vaults() -> Result<Vec<LocalVaultSummary>, String> {
-    let config = load_app_config().map_err(err_string)?;
+fn get_vaults() -> Result<Vec<LocalVaultSummary>, CommandError> {
+    let config = load_app_config()?;
     Ok(config
         .vaults
         .iter()
@@ -377,8 +380,8 @@ fn get_vaults() -> Result<Vec<LocalVaultSummary>, String> {
 }
 
 #[tauri::command]
-fn set_active_vault(vault_id: String) -> Result<LocalVaultSummary, String> {
-    let mut config = load_app_config().map_err(err_string)?;
+fn set_active_vault(vault_id: String) -> Result<LocalVaultSummary, CommandError> {
+    let mut config = load_app_config()?;
     let vault = config
         .vaults
         .iter()
@@ -387,13 +390,13 @@ fn set_active_vault(vault_id: String) -> Result<LocalVaultSummary, String> {
         .ok_or_else(|| format!("vault {} not configured locally", vault_id))?;
 
     config.active_vault_id = Some(vault.id.clone());
-    save_app_config(&config).map_err(err_string)?;
+    save_app_config(&config)?;
 
     Ok(LocalVaultSummary::from_stored(&vault, true))
 }
 
 #[tauri::command]
-async fn add_vault(request: AddVaultRequest) -> Result<LocalVaultSummary, String> {
+async fn add_vault(request: AddVaultRequest) -> Result<LocalVaultSummary, CommandError> {
     validate_request(&request)?;
     let server_url = normalize_server_url(&request.server_url);
     let bearer = load_bearer(&server_url)?;
@@ -407,17 +410,18 @@ async fn add_vault(request: AddVaultRequest) -> Result<LocalVaultSummary, String
 
     let (vault_id, vault_name) = match request.mode {
         AddVaultMode::Create => {
-            let response = client
-                .create_vault(&CreateVaultRequest {
+            let response = bearer_call(
+                &server_url,
+                client.create_vault(&CreateVaultRequest {
                     name: request.vault_name.clone(),
                     max_file_size: 50 * 1024 * 1024,
-                })
-                .await
-                .map_err(err_string)?;
+                }),
+            )
+            .await?;
             (response.vault.id, response.vault.name)
         }
         AddVaultMode::Connect => {
-            let vaults = client.list_vaults().await.map_err(err_string)?;
+            let vaults = bearer_call(&server_url, client.list_vaults()).await?;
             let vault = vaults
                 .into_iter()
                 .find(|vault| vault.id == request.vault_id)
@@ -426,7 +430,7 @@ async fn add_vault(request: AddVaultRequest) -> Result<LocalVaultSummary, String
         }
     };
 
-    let key = derive_key(&request.passphrase, vault_id.as_bytes()).map_err(err_string)?;
+    let key = derive_key(&request.passphrase, vault_id.as_bytes())?;
     let stored = StoredVault {
         id: vault_id.clone(),
         name: vault_name.clone(),
@@ -435,15 +439,15 @@ async fn add_vault(request: AddVaultRequest) -> Result<LocalVaultSummary, String
     };
 
     validate_passphrase(&stored, &key).await?;
-    save_key_to_keychain(&vault_id, &key).map_err(err_string)?;
-    upsert_vault(stored.clone()).map_err(err_string)?;
+    save_key_to_keychain(&vault_id, &key)?;
+    upsert_vault(stored.clone())?;
 
     Ok(LocalVaultSummary::from_stored(&stored, true))
 }
 
 #[tauri::command]
-async fn get_status() -> Result<SyncStatus, String> {
-    let config = load_app_config().map_err(err_string)?;
+async fn get_status() -> Result<SyncStatus, CommandError> {
+    let config = load_app_config()?;
     let Some(vault) = active_vault(&config) else {
         return Ok(SyncStatus {
             active_vault_id: None,
@@ -457,12 +461,14 @@ async fn get_status() -> Result<SyncStatus, String> {
 
     let local_root = PathBuf::from(&vault.local_path);
     let manifest_path = sync_manifest_path(&local_root);
-    let keys = derive_keys(&load_key_from_keychain(&vault.id).map_err(err_string)?);
+    let keys = derive_keys(&load_key_from_keychain(&vault.id)?);
     let vault_config = to_vault_config(vault);
-    let remote_manifest = fetch_remote_manifest(&ApiClient::new(vault_config), &local_root, &keys)
-        .await
-        .map_err(err_string)?;
-    let local = load_local_state(&local_root, &keys).map_err(err_string)?;
+    let remote_manifest = bearer_call(
+        &vault.server_url,
+        fetch_remote_manifest(&ApiClient::new(vault_config), &local_root, &keys),
+    )
+    .await?;
+    let local = load_local_state(&local_root, &keys)?;
     let diff = diff_local_and_remote(&local.base, &local.working, &remote_manifest);
 
     Ok(SyncStatus {
@@ -478,17 +484,19 @@ async fn get_status() -> Result<SyncStatus, String> {
 }
 
 #[tauri::command]
-async fn get_manifest_diff(vault_id: Option<String>) -> Result<SyncResult, String> {
-    let vault = selected_vault(vault_id).map_err(err_string)?;
-    let keys = derive_keys(&load_key_from_keychain(&vault.id).map_err(err_string)?);
-    let local = load_local_state(Path::new(&vault.local_path), &keys).map_err(err_string)?;
-    let remote_manifest = fetch_remote_manifest(
-        &ApiClient::new(to_vault_config(&vault)),
-        Path::new(&vault.local_path),
-        &keys,
+async fn get_manifest_diff(vault_id: Option<String>) -> Result<SyncResult, CommandError> {
+    let vault = selected_vault(vault_id)?;
+    let keys = derive_keys(&load_key_from_keychain(&vault.id)?);
+    let local = load_local_state(Path::new(&vault.local_path), &keys)?;
+    let remote_manifest = bearer_call(
+        &vault.server_url,
+        fetch_remote_manifest(
+            &ApiClient::new(to_vault_config(&vault)),
+            Path::new(&vault.local_path),
+            &keys,
+        ),
     )
-    .await
-    .map_err(err_string)?;
+    .await?;
     Ok(diff_local_and_remote(
         &local.base,
         &local.working,
@@ -500,20 +508,24 @@ async fn sync_vault_inner(
     vault_id: Option<String>,
     state: &AppState,
     progress: &dyn ProgressSink,
-) -> Result<SyncCommandResponse, String> {
-    let vault = selected_vault(vault_id).map_err(err_string)?;
+) -> Result<SyncCommandResponse, CommandError> {
+    let vault = selected_vault(vault_id)?;
     let _guard = InFlightGuard::acquire(state, &vault.id)?;
-    let key = load_key_from_keychain(&vault.id).map_err(err_string)?;
+    let key = load_key_from_keychain(&vault.id)?;
     // A fresh cycle supersedes any plan left over from an earlier one.
     set_pending_plan(state, &vault.id, None)?;
-    let plan = prepare_sync(&to_vault_config(&vault), &key, progress)
-        .await
-        .map_err(err_string)?;
+    let plan = bearer_call(
+        &vault.server_url,
+        prepare_sync(&to_vault_config(&vault), &key, progress),
+    )
+    .await?;
 
     if plan.conflicts.is_empty() {
-        let result = complete_sync(&to_vault_config(&vault), &key, &plan, &[], progress)
-            .await
-            .map_err(err_string)?;
+        let result = bearer_call(
+            &vault.server_url,
+            complete_sync(&to_vault_config(&vault), &key, &plan, &[], progress),
+        )
+        .await?;
         return finish_cycle(state, &vault.id, result);
     }
 
@@ -530,7 +542,7 @@ fn set_pending_plan(
     state: &AppState,
     vault_id: &str,
     plan: Option<SyncPlan>,
-) -> Result<(), String> {
+) -> Result<(), CommandError> {
     let mut plans = state
         .pending_plans
         .lock()
@@ -552,7 +564,7 @@ fn finish_cycle(
     state: &AppState,
     vault_id: &str,
     result: SyncResult,
-) -> Result<SyncCommandResponse, String> {
+) -> Result<SyncCommandResponse, CommandError> {
     let late_plan = SyncPlan::from_late_conflicts(&result);
     let pending_conflicts = result.conflicts.clone();
     set_pending_plan(state, vault_id, late_plan)?;
@@ -567,7 +579,7 @@ async fn sync_vault(
     vault_id: Option<String>,
     state: tauri::State<'_, AppState>,
     app: AppHandle,
-) -> Result<SyncCommandResponse, String> {
+) -> Result<SyncCommandResponse, CommandError> {
     let sink = TauriProgressSink { app };
     sync_vault_inner(vault_id, &state, &sink).await
 }
@@ -577,8 +589,8 @@ async fn resolve_conflict_inner(
     resolutions: Vec<ConflictResolution>,
     state: &AppState,
     progress: &dyn ProgressSink,
-) -> Result<SyncCommandResponse, String> {
-    let vault = selected_vault(Some(vault_id.clone())).map_err(err_string)?;
+) -> Result<SyncCommandResponse, CommandError> {
+    let vault = selected_vault(Some(vault_id.clone()))?;
     let _guard = InFlightGuard::acquire(state, &vault.id)?;
     // The plan stays in place until the round succeeds, so a failed attempt
     // (network, keychain) can be retried without a fresh sync.
@@ -589,17 +601,19 @@ async fn resolve_conflict_inner(
         .get(&vault_id)
         .cloned()
         .ok_or_else(|| format!("no pending conflict set for {}", vault_id))?;
-    let key = load_key_from_keychain(&vault.id).map_err(err_string)?;
+    let key = load_key_from_keychain(&vault.id)?;
 
-    let result = complete_sync(
-        &to_vault_config(&vault),
-        &key,
-        &plan,
-        &resolutions,
-        progress,
+    let result = bearer_call(
+        &vault.server_url,
+        complete_sync(
+            &to_vault_config(&vault),
+            &key,
+            &plan,
+            &resolutions,
+            progress,
+        ),
     )
-    .await
-    .map_err(err_string)?;
+    .await?;
     finish_cycle(state, &vault.id, result)
 }
 
@@ -609,7 +623,7 @@ async fn resolve_conflict(
     resolutions: Vec<ConflictResolution>,
     state: tauri::State<'_, AppState>,
     app: AppHandle,
-) -> Result<SyncCommandResponse, String> {
+) -> Result<SyncCommandResponse, CommandError> {
     let sink = TauriProgressSink { app };
     resolve_conflict_inner(vault_id, resolutions, &state, &sink).await
 }
@@ -618,8 +632,8 @@ async fn get_conflict_preview_inner(
     vault_id: String,
     path: String,
     state: &AppState,
-) -> Result<ConflictPreview, String> {
-    let vault = selected_vault(Some(vault_id.clone())).map_err(err_string)?;
+) -> Result<ConflictPreview, CommandError> {
+    let vault = selected_vault(Some(vault_id.clone()))?;
     let conflict = {
         let pending_plans = state
             .pending_plans
@@ -635,25 +649,21 @@ async fn get_conflict_preview_inner(
             .ok_or_else(|| format!("no pending conflict preview for {}", path))?
     };
 
-    let keys = derive_keys(&load_key_from_keychain(&vault.id).map_err(err_string)?);
+    let keys = derive_keys(&load_key_from_keychain(&vault.id)?);
     let client = ApiClient::new(to_vault_config(&vault));
 
     let local_text = if conflict.local.deleted {
         String::new()
     } else {
-        let bytes =
-            fs::read(Path::new(&vault.local_path).join(&conflict.path)).map_err(err_string)?;
+        let bytes = fs::read(Path::new(&vault.local_path).join(&conflict.path))?;
         String::from_utf8_lossy(&bytes).into_owned()
     };
 
     let remote_text = if conflict.remote.deleted {
         String::new()
     } else {
-        let blob = client
-            .get_file(&conflict.path, &keys)
-            .await
-            .map_err(err_string)?;
-        let bytes = obsink_core::decrypt(&keys.content_enc, &blob).map_err(err_string)?;
+        let blob = bearer_call(&vault.server_url, client.get_file(&conflict.path, &keys)).await?;
+        let bytes = obsink_core::decrypt(&keys.content_enc, &blob)?;
         String::from_utf8_lossy(&bytes).into_owned()
     };
 
@@ -671,11 +681,11 @@ async fn get_conflict_preview(
     vault_id: String,
     path: String,
     state: tauri::State<'_, AppState>,
-) -> Result<ConflictPreview, String> {
+) -> Result<ConflictPreview, CommandError> {
     get_conflict_preview_inner(vault_id, path, &state).await
 }
 
-fn validate_request(request: &AddVaultRequest) -> Result<(), String> {
+fn validate_request(request: &AddVaultRequest) -> Result<(), CommandError> {
     if request.server_url.trim().is_empty() {
         return Err("server URL is required".into());
     }
@@ -697,15 +707,17 @@ fn validate_request(request: &AddVaultRequest) -> Result<(), String> {
     }
 }
 
-async fn validate_passphrase(vault: &StoredVault, key: &KeyBytes) -> Result<(), String> {
+async fn validate_passphrase(vault: &StoredVault, key: &KeyBytes) -> Result<(), CommandError> {
     let keys = derive_keys(key);
     let client = ApiClient::new(to_vault_config(vault));
-    let manifest = fetch_remote_manifest(&client, Path::new(&vault.local_path), &keys)
-        .await
-        .map_err(err_string)?;
+    let manifest = bearer_call(
+        &vault.server_url,
+        fetch_remote_manifest(&client, Path::new(&vault.local_path), &keys),
+    )
+    .await?;
     if let Some((path, _)) = manifest.iter().find(|(_, entry)| !entry.deleted) {
-        let blob = client.get_file(path, &keys).await.map_err(err_string)?;
-        obsink_core::decrypt(&keys.content_enc, &blob).map_err(err_string)?;
+        let blob = bearer_call(&vault.server_url, client.get_file(path, &keys)).await?;
+        obsink_core::decrypt(&keys.content_enc, &blob)?;
     }
     Ok(())
 }
@@ -800,8 +812,160 @@ fn load_key_from_keychain(vault_id: &str) -> Result<KeyBytes, io::Error> {
     Ok(key)
 }
 
-fn err_string(error: impl std::fmt::Display) -> String {
-    error.to_string()
+// --- Errors -------------------------------------------------------------------
+
+/// What the UI needs to know about a failed command beyond the message: a
+/// 401 opens the sign-in form, a transport failure is retryable, a server
+/// status can be matched (403 invite gating) without parsing the text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ErrorKind {
+    /// The bearer was rejected; the local credential has been forgotten.
+    Unauthorized,
+    /// The request never got a response (DNS, refused, timeout, TLS).
+    Network,
+    /// The server answered with an error status; `status` carries it.
+    Server,
+    Other,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CommandError {
+    kind: ErrorKind,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<u16>,
+}
+
+impl CommandError {
+    fn other(message: impl Into<String>) -> Self {
+        Self {
+            kind: ErrorKind::Other,
+            message: message.into(),
+            status: None,
+        }
+    }
+
+    fn from_status(status: u16, message: String) -> Self {
+        if status == 401 {
+            Self {
+                kind: ErrorKind::Unauthorized,
+                message: "unauthorized: sign in again".into(),
+                status: Some(status),
+            }
+        } else {
+            Self {
+                kind: ErrorKind::Server,
+                message,
+                status: Some(status),
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for CommandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl From<String> for CommandError {
+    fn from(message: String) -> Self {
+        Self::other(message)
+    }
+}
+
+impl From<&str> for CommandError {
+    fn from(message: &str) -> Self {
+        Self::other(message)
+    }
+}
+
+impl From<io::Error> for CommandError {
+    fn from(error: io::Error) -> Self {
+        Self::other(error.to_string())
+    }
+}
+
+impl From<obsink_core::CryptoError> for CommandError {
+    fn from(error: obsink_core::CryptoError) -> Self {
+        Self::other(error.to_string())
+    }
+}
+
+impl From<AuthError> for CommandError {
+    fn from(error: AuthError) -> Self {
+        match error {
+            AuthError::Http(error) => Self {
+                kind: ErrorKind::Network,
+                message: error.to_string(),
+                status: None,
+            },
+            AuthError::Server { status, message } => Self::from_status(status.as_u16(), message),
+        }
+    }
+}
+
+impl From<ApiError> for CommandError {
+    fn from(error: ApiError) -> Self {
+        match error {
+            ApiError::Http(error) => Self {
+                kind: ErrorKind::Network,
+                message: error.to_string(),
+                status: None,
+            },
+            ApiError::Unauthorized => Self::from_status(401, String::new()),
+            ApiError::UnexpectedStatus { status, body } => {
+                Self::from_status(status.as_u16(), server_error_message(&body))
+            }
+            other @ (ApiError::Crypto(_) | ApiError::Conflict { .. }) => {
+                Self::other(other.to_string())
+            }
+        }
+    }
+}
+
+impl From<SyncEngineError> for CommandError {
+    fn from(error: SyncEngineError) -> Self {
+        match error {
+            SyncEngineError::Api(error) => error.into(),
+            other => Self::other(other.to_string()),
+        }
+    }
+}
+
+/// Server error bodies are `{ "error": "<text>" }`; show the text alone.
+fn server_error_message(body: &str) -> String {
+    #[derive(Deserialize)]
+    struct Body {
+        error: String,
+    }
+    serde_json::from_str::<Body>(body)
+        .map(|body| body.error)
+        .unwrap_or_else(|_| body.to_string())
+}
+
+/// A 401 means the session is gone (revoked, expired, account deleted), so
+/// the stored bearer is useless: forget it, and `get_account` reports
+/// signed-out until the user signs in again.
+fn forget_bearer_on_401<T>(
+    server_url: &str,
+    result: Result<T, CommandError>,
+) -> Result<T, CommandError> {
+    if let Err(error) = &result {
+        if error.kind == ErrorKind::Unauthorized {
+            delete_secret(&bearer_account(server_url));
+        }
+    }
+    result
+}
+
+/// Run one bearer-authenticated request and apply the 401 policy to it.
+async fn bearer_call<T, E: Into<CommandError>>(
+    server_url: &str,
+    request: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, CommandError> {
+    forget_bearer_on_401(server_url, request.await.map_err(Into::into))
 }
 
 #[allow(dead_code)]
@@ -1195,7 +1359,7 @@ mod live_tests {
         })
         .await
         .unwrap_err();
-        assert!(denied.contains("sign in"), "{denied}");
+        assert!(denied.message.contains("sign in"), "{denied}");
 
         // A fresh server lets the first account in without an invite; an
         // established one needs a code, which the operator bearer can mint.
@@ -1276,7 +1440,9 @@ mod live_tests {
         let refused = auth_email_verify(server_url.clone(), second.clone(), code.clone(), None)
             .await
             .unwrap_err();
-        assert!(refused.contains("invite"), "{refused}");
+        assert_eq!(refused.kind, ErrorKind::Server, "{refused}");
+        assert_eq!(refused.status, Some(403), "{refused}");
+        assert!(refused.message.contains("invite"), "{refused}");
         let accepted =
             auth_email_verify(server_url.clone(), second.clone(), code, Some(invite.code))
                 .await
@@ -1292,7 +1458,7 @@ mod live_tests {
         let err = sync_vault_inner(Some(summary.id.clone()), &state, &obsink_core::NoProgress)
             .await
             .unwrap_err();
-        assert!(err.to_lowercase().contains("unauthorized"), "{err}");
+        assert_eq!(err.kind, ErrorKind::Unauthorized, "{err}");
 
         println!("ACCOUNT FLOW VERIFIED: vault={}", summary.id);
         let _ = fs::remove_dir_all(&sandbox);

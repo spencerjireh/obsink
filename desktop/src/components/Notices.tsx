@@ -4,10 +4,23 @@ import { plural } from '../lib/format'
 
 type NoticeKind = 'info' | 'warning' | 'danger'
 
-export function Notice({ kind = 'info', children }: { kind?: NoticeKind; children: ReactNode }) {
+export function Notice({
+  kind = 'info',
+  action,
+  children,
+}: {
+  kind?: NoticeKind
+  // One button the notice offers next to its text (for example `Sign in`).
+  action?: ReactNode
+  children: ReactNode
+}) {
   return (
-    <div className={`notice notice--${kind}`} role={kind === 'info' ? 'status' : 'alert'}>
-      {children}
+    <div
+      className={`notice notice--${kind}${action ? ' notice--actionable' : ''}`}
+      role={kind === 'info' ? 'status' : 'alert'}
+    >
+      {action ? <span>{children}</span> : children}
+      {action ? <span className="notice__action">{action}</span> : null}
     </div>
   )
 }

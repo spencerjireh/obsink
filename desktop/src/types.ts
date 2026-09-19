@@ -1,6 +1,11 @@
 // Shapes shared between the Tauri commands (see src-tauri/src/main.rs) and
 // the components. Field names mirror the Rust structs (snake_case).
 
+// Every command rejects with this (Rust `CommandError`). `status` is set for
+// `server` errors so a 403 can be told apart without parsing the message.
+export type CommandErrorKind = 'unauthorized' | 'network' | 'server' | 'other'
+export type CommandError = { kind: CommandErrorKind; message: string; status?: number }
+
 export type SyncAction = {
   path: string
   kind: 'Upload' | 'Download' | 'DeleteLocal' | 'DeleteRemote'
