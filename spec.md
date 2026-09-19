@@ -53,24 +53,28 @@ There is no automatic file watching or background sync. Users press a "Sync" but
 
 When the user taps "Sync":
 
-1. **Pull manifest** — `GET /manifest` from the server. Compare server manifest against local manifest.
-2. **Compute diff** — Produce three lists:
-   - Files newer on server → need downloading
-   - Files newer locally → need uploading
-   - Files changed on both sides → conflicts
-3. **Download remote changes** — `GET /files/:path` for each server-newer file. Decrypt and save locally.
+1. **Pull manifest** — `GET /manifest` from the server. Compare it against the working manifest (the vault on disk) and the **base** (`.obsink/manifest.json`, the checkpoint of the last completed sync; a base entry with no file on disk is a local deletion).
+2. **Compute diff** — Per path, a side has changed when its version (§3.3) differs from the base:
+   - Changed on the server only → download (or delete locally when the server entry is a tombstone)
+   - Changed locally only → upload (or delete on the server when the file is gone locally)
+   - Changed on both sides to the same content → nothing (converged)
+   - Changed on both sides to different content → conflict
+   With no base (first sync on a device) a path present on both sides with different content is a conflict.
+3. **Download remote changes** — apply local deletions first, then `GET /files/:path` for each server-changed file. Decrypt and save locally.
 4. **Resolve conflicts** — If any conflicts exist, pause sync and present the conflict resolution UI. User picks a winner per file (see §5).
 5. **Upload local changes** — `POST /batch` (or individual `PUT /files/:path`) for all locally-changed files plus resolved conflicts.
-6. **Handle late 409s** — If any uploads return `409 Conflict` (edge case: another device synced between steps 1 and 5), re-pull and resolve those too.
-7. **Update local manifest** — Set local manifest to match server state. Sync complete.
+6. **Handle late 409s** — If any uploads return `409 Conflict` (edge case: another device synced between steps 1 and 5), return them as a conflict-only plan and resolve those too.
+7. **Update local manifest** — Re-fetch the server manifest and save it as the new base, except that paths which failed to transfer or are still in conflict keep their previous base entry, so the next sync retries them. Sync complete.
 
 ### 3.3 Change Detection (Content Hashing)
 
-Each file is identified by a SHA-256 hash of its **plaintext** content (before encryption). Clients compare local hashes against the server manifest to determine what changed.
+Each file is identified by a keyed hash — `HMAC-SHA256(content_mac_key, plaintext)` — of its **plaintext** content (before encryption). Clients compare hashes against the base and the server manifest to determine what changed.
+
+A path's **version** is the pair `(hash, deleted)`; a tombstone and an absent entry are the same version (a tombstone's hash exists only so the next write can present it as `X-Parent-Hash`). The `modified` timestamp is informational: the server stamps its own receipt time on every write, so timestamps from different devices are not comparable and never decide the diff.
 
 Hashing plaintext (not ciphertext) is required because AES-GCM produces different ciphertext each time due to random nonces. Hashing ciphertext would make every file appear "changed" on every sync.
 
-**Minor information leak:** An attacker with server access could confirm whether a specific known document exists in the vault by comparing hashes. Mitigation (optional, not v1): HMAC the hash with the encryption key so hashes are only meaningful to key holders.
+Keying the hash means an attacker with server access cannot confirm whether a specific known document exists in the vault; a plain SHA-256 would (that was wire-format v1's leak).
 
 ### 3.4 Stale Vault Warning
 
@@ -227,7 +231,7 @@ When sync detects conflicts, the sync pauses and shows a conflict resolution scr
 5. Three actions per file:
    - **Keep local** — upload local version, overwrite server
    - **Keep remote** — download server version, overwrite local
-   - **Keep both** — save remote version as `{filename}.conflict.{ext}` in the vault as an escape hatch
+   - **Keep both** — save remote version as `{filename}.conflict.{ext}` in the vault as an escape hatch. Only offered when both sides are live: with a deletion on one side it collapses to keeping the side that still exists.
 6. After all conflicts are resolved, sync completes
 
 ### 5.3 Future Enhancement (v2)

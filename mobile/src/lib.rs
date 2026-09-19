@@ -13,11 +13,10 @@ use std::{
 };
 
 use obsink_core::{
-    build_working_manifest_for_path, complete_sync, decrypt, derive_key, derive_keys,
-    diff_local_and_remote, fetch_remote_manifest, normalize_server_url, prepare_sync, ApiClient,
-    AuthClient, ConflictResolution, ConflictResolutionChoice, CreateVaultRequest, KeyBytes,
-    ProgressEvent, ProgressSink, SyncActionKind, SyncFailure, SyncPhase, SyncPlan, VaultConfig,
-    VaultSummary,
+    complete_sync, decrypt, derive_key, derive_keys, diff_local_and_remote, fetch_remote_manifest,
+    load_local_state, normalize_server_url, prepare_sync, ApiClient, AuthClient,
+    ConflictResolution, ConflictResolutionChoice, CreateVaultRequest, KeyBytes, ProgressEvent,
+    ProgressSink, SyncActionKind, SyncFailure, SyncPhase, SyncPlan, VaultConfig, VaultSummary,
 };
 
 uniffi::setup_scaffolding!();
@@ -656,15 +655,15 @@ impl VaultClient {
     /// any files. Powers the stale-vault warning on open (spec §3.4, OBS-33).
     pub fn vault_status(&self) -> Result<MobileVaultStatus, MobileError> {
         let keys = derive_keys(&self.key);
-        let local = build_working_manifest_for_path(Path::new(&self.config.local_path), &keys)
-            .map_err(sync_err)?;
+        let local =
+            load_local_state(Path::new(&self.config.local_path), &keys).map_err(sync_err)?;
         let remote = block_on(fetch_remote_manifest(
             &ApiClient::new(self.config.clone()),
             Path::new(&self.config.local_path),
             &keys,
         ))
         .map_err(sync_err)?;
-        let diff = diff_local_and_remote(&local, &remote);
+        let diff = diff_local_and_remote(&local.base, &local.working, &remote);
         Ok(MobileVaultStatus {
             pending_uploads: diff.upload.len() as u32,
             pending_downloads: diff.download.len() as u32,
@@ -700,11 +699,13 @@ impl VaultClient {
         resolutions: Vec<MobileResolution>,
         listener: Arc<dyn ProgressListener>,
     ) -> Result<SyncOutcome, MobileError> {
+        // The plan stays pending until the round succeeds, so a failed
+        // attempt can be retried without a fresh prepare.
         let plan = self
             .pending
             .lock()
             .expect("pending lock")
-            .take()
+            .clone()
             .ok_or(MobileError::NoPendingSync)?;
         let resolutions: Vec<ConflictResolution> = resolutions
             .into_iter()
@@ -722,6 +723,9 @@ impl VaultClient {
             &sink,
         ))
         .map_err(sync_err)?;
+        // Late 409s become a conflict-only plan so `complete` and
+        // `conflict_preview` work for the next round; otherwise nothing pends.
+        *self.pending.lock().expect("pending lock") = SyncPlan::from_late_conflicts(&result);
         Ok(SyncOutcome {
             uploaded: result.upload.len() as u32,
             downloaded: result.download.len() as u32,

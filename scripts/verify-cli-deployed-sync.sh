@@ -88,10 +88,8 @@ if [[ "$(cat "$VAULT_ONE/note.md")" != 'device two edit' ]]; then
   exit 1
 fi
 
-# Manifest timestamps have one-second resolution; edits in the same second as
-# the last sync tie on `modified` and are classified as conflicts on both
-# devices. Against a local server that second is easy to hit, so step past it.
-sleep 1
+# Both devices edit the same base: device one uploads, device two hits a
+# three-way conflict and picks "keep remote" (choice 2).
 printf 'device one conflict\n' > "$VAULT_ONE/note.md"
 printf 'device two conflict\n' > "$VAULT_TWO/note.md"
 run_cli "$HOME_ONE" sync

@@ -11,8 +11,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     api_client::{ApiClient, ApiError, ManifestFetch},
     crypto::{decrypt, derive_keys, encrypt, CryptoError, CryptoKeys, KeyBytes},
+    fs_util::write_atomic,
     hasher::{build_manifest_from_dir, hash_file, HasherError},
-    manifest::{diff_manifests, ManifestDiff},
+    manifest::{checkpoint_manifest, diff_manifests, ManifestDiff},
     progress::{ProgressEvent, ProgressSink, SyncPhase},
     types::{
         Conflict, ConflictResolution, ConflictResolutionChoice, FileEntry, Manifest, SyncAction,
@@ -20,6 +21,9 @@ use crate::{
     },
 };
 
+/// The checkpoint of the last completed sync: the server manifest as re-fetched
+/// after that sync, minus held-back paths. It is the *base* of the three-way
+/// diff and the source of local-deletion detection.
 const MANIFEST_FILE: &str = ".obsink/manifest.json";
 /// Last server manifest seen plus its ETag, so an unchanged manifest costs a
 /// 304 instead of a full download. Distinct from `MANIFEST_FILE`, which is the
@@ -57,7 +61,7 @@ pub fn save_manifest_to_disk(path: &Path, manifest: &Manifest) -> Result<(), Syn
     }
 
     let bytes = serde_json::to_vec_pretty(manifest)?;
-    fs::write(path, bytes)?;
+    write_atomic(path, &bytes)?;
     Ok(())
 }
 
@@ -85,10 +89,7 @@ fn save_remote_cache(
     cache: &RemoteManifestCache,
 ) -> Result<(), SyncEngineError> {
     let path = remote_manifest_cache_path(local_root);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, serde_json::to_vec(cache)?)?;
+    write_atomic(&path, &serde_json::to_vec(cache)?)?;
     Ok(())
 }
 
@@ -129,16 +130,27 @@ pub async fn fetch_remote_manifest(
     }
 }
 
-pub fn diff_local_and_remote(local: &Manifest, remote: &Manifest) -> ManifestDiff {
-    diff_manifests(local, remote)
+/// Three-way diff of the working manifest against the remote, using the last
+/// checkpoint as the base. See [`diff_manifests`].
+pub fn diff_local_and_remote(base: &Manifest, local: &Manifest, remote: &Manifest) -> ManifestDiff {
+    diff_manifests(base, local, remote)
 }
 
-pub fn build_working_manifest_for_path(
+/// The two local inputs of a sync: the last checkpoint (`base`) and the
+/// current on-disk state with local deletions synthesized (`working`).
+#[derive(Debug, Clone, Default)]
+pub struct LocalState {
+    pub base: Manifest,
+    pub working: Manifest,
+}
+
+pub fn load_local_state(
     local_root: &Path,
     keys: &CryptoKeys,
-) -> Result<Manifest, SyncEngineError> {
-    let previous_manifest = load_manifest_from_disk(&sync_manifest_path(local_root))?;
-    build_working_manifest(local_root, &previous_manifest, keys)
+) -> Result<LocalState, SyncEngineError> {
+    let base = load_manifest_from_disk(&sync_manifest_path(local_root))?;
+    let working = build_working_manifest(local_root, &base, keys)?;
+    Ok(LocalState { base, working })
 }
 
 pub async fn prepare_sync(
@@ -149,9 +161,9 @@ pub async fn prepare_sync(
     let keys = derive_keys(key);
     let client = ApiClient::new(config.clone());
     let local_root = Path::new(&config.local_path);
-    let working_manifest = build_working_manifest_for_path(local_root, &keys)?;
+    let local_state = load_local_state(local_root, &keys)?;
     let remote_manifest = fetch_remote_manifest(&client, local_root, &keys).await?;
-    let diff = diff_manifests(&working_manifest, &remote_manifest);
+    let diff = diff_manifests(&local_state.base, &local_state.working, &remote_manifest);
 
     progress.report(ProgressEvent::Phase(SyncPhase::Downloading));
     let download_failures =
@@ -200,7 +212,7 @@ pub async fn complete_sync(
             .get(&conflict.path)
             .ok_or_else(|| SyncEngineError::MissingResolution(conflict.path.clone()))?;
 
-        match choice {
+        match effective_choice(choice, conflict) {
             ConflictResolutionChoice::KeepLocal => {
                 pending_uploads.push(conflict_to_upload(conflict));
             }
@@ -245,6 +257,14 @@ pub async fn complete_sync(
     let mut late_conflicts = Vec::new();
     let mut upload_failures = Vec::new();
     let mut successful_uploads = 0usize;
+    // Paths whose checkpoint entry must not advance: a failed transfer keeps
+    // its old base so the next diff retries it, and a late conflict keeps it
+    // so the next diff still sees "both changed" instead of clobbering.
+    let mut hold_back = plan
+        .failures
+        .iter()
+        .map(|failure| failure.path.clone())
+        .collect::<BTreeSet<_>>();
     for (index, action) in pending_uploads.iter().enumerate() {
         progress.report(ProgressEvent::FileStarted {
             path: action.path.clone(),
@@ -262,20 +282,20 @@ pub async fn complete_sync(
                 });
             }
             Err(SyncEngineError::Api(ApiError::Conflict { path, conflict })) => {
-                if let Some(remote) = conflict.current {
-                    let local = action.local.clone().unwrap_or_else(|| FileEntry {
-                        hash: String::new(),
-                        modified: 0,
-                        size: 0,
-                        deleted: false,
-                        enc_path: String::new(),
-                    });
-                    late_conflicts.push(Conflict {
-                        path,
-                        local,
-                        remote,
-                    });
-                }
+                // A 409 without a `current` entry means the server row is gone
+                // from under us; surface it as a conflict against a tombstone
+                // rather than dropping the upload on the floor.
+                let remote = conflict.current.unwrap_or_else(|| FileEntry {
+                    deleted: true,
+                    ..FileEntry::default()
+                });
+                let local = action.local.clone().unwrap_or_default();
+                hold_back.insert(path.clone());
+                late_conflicts.push(Conflict {
+                    path,
+                    local,
+                    remote,
+                });
             }
             Err(error) => {
                 let fatal = is_fatal_sync_error(&error);
@@ -284,6 +304,7 @@ pub async fn complete_sync(
                     path: action.path.clone(),
                     error: message.clone(),
                 });
+                hold_back.insert(action.path.clone());
                 upload_failures.push(SyncFailure {
                     path: action.path.clone(),
                     kind: action.kind.clone(),
@@ -319,23 +340,18 @@ pub async fn complete_sync(
         failed: failures.len(),
     });
 
-    if !late_conflicts.is_empty() {
-        // Conflicts need the user's input before the manifest can advance.
-        return Ok(SyncResult {
-            upload: pending_uploads,
-            download: plan.download.clone(),
-            conflicts: late_conflicts,
-            failures,
-        });
-    }
-
-    // No late conflicts: checkpoint the server manifest so local state advances
-    // past every file that did transfer (the resume point). Skip the re-fetch
-    // when a fatal error already proved the network is gone.
+    // Checkpoint the server manifest so local state advances past every file
+    // that did transfer (the resume point); held-back paths keep their old base
+    // entry. Runs even with late conflicts pending, so the paths that did land
+    // do not turn into false conflicts if a third device edits them next. Skip
+    // the re-fetch when a fatal error already proved the network is gone.
     if !failures.iter().any(|failure| failure.fatal) {
         match fetch_remote_manifest(&client, local_root, &keys).await {
             Ok(remote_manifest) => {
-                save_manifest_to_disk(&sync_manifest_path(local_root), &remote_manifest)?;
+                let manifest_path = sync_manifest_path(local_root);
+                let previous_base = load_manifest_from_disk(&manifest_path)?;
+                let next = checkpoint_manifest(&previous_base, &remote_manifest, &hold_back);
+                save_manifest_to_disk(&manifest_path, &next)?;
             }
             Err(error) => {
                 failures.push(SyncFailure {
@@ -351,11 +367,31 @@ pub async fn complete_sync(
     Ok(SyncResult {
         upload: pending_uploads,
         download: plan.download.clone(),
-        conflicts: Vec::new(),
+        conflicts: late_conflicts,
         failures,
     })
 }
 
+/// `KeepBoth` needs two live versions. When one side is a deletion there is
+/// nothing to copy, so it collapses to keeping the side that still exists.
+fn effective_choice(
+    choice: &ConflictResolutionChoice,
+    conflict: &Conflict,
+) -> ConflictResolutionChoice {
+    match choice {
+        ConflictResolutionChoice::KeepBoth if conflict.remote.deleted => {
+            ConflictResolutionChoice::KeepLocal
+        }
+        ConflictResolutionChoice::KeepBoth if conflict.local.deleted => {
+            ConflictResolutionChoice::KeepRemote
+        }
+        other => other.clone(),
+    }
+}
+
+/// The on-disk manifest plus a tombstone for every base entry that is no
+/// longer on disk. Tombstones keep the base hash (the parent hash for the
+/// remote delete); their `modified` is informational only.
 fn build_working_manifest(
     local_root: &Path,
     previous_manifest: &Manifest,
@@ -393,7 +429,7 @@ async fn apply_downloads(
 ) -> Vec<SyncFailure> {
     let mut failures = Vec::new();
     let total = downloads.len();
-    for (index, action) in downloads.iter().enumerate() {
+    for (index, action) in ordered_for_apply(downloads).enumerate() {
         match action.kind {
             SyncActionKind::Download => {
                 progress.report(ProgressEvent::FileStarted {
@@ -450,6 +486,19 @@ async fn apply_downloads(
     failures
 }
 
+/// Local deletes run before downloads. On a case-insensitive volume (APFS
+/// default) `Note.md` and `note.md` are one directory entry, so deleting the
+/// tombstoned spelling after writing the new one would remove the download.
+fn ordered_for_apply(downloads: &[SyncAction]) -> impl Iterator<Item = &SyncAction> {
+    let deletes = downloads
+        .iter()
+        .filter(|action| action.kind == SyncActionKind::DeleteLocal);
+    let fetches = downloads
+        .iter()
+        .filter(|action| action.kind != SyncActionKind::DeleteLocal);
+    deletes.chain(fetches)
+}
+
 /// A fatal error is systemic (network down, auth failure, server error): it
 /// will likely strike every remaining file too, so the batch stops. Per-file
 /// errors (a too-large 413, a missing 404, a local crypto/path failure) leave
@@ -495,9 +544,10 @@ async fn write_conflict_copy(
     client: &ApiClient,
     conflict: &Conflict,
 ) -> Result<(String, u64), SyncEngineError> {
-    if conflict.remote.deleted {
-        return Ok((conflict_copy_path(&conflict.path), 0));
-    }
+    debug_assert!(
+        !conflict.remote.deleted,
+        "effective_choice collapses KeepBoth on a remote tombstone"
+    );
 
     let duplicate_path = conflict_copy_path(&conflict.path);
     let blob = client.get_file(&conflict.path, keys).await?;
@@ -520,7 +570,7 @@ async fn apply_upload(
             client
                 .put_file(
                     &action.path,
-                    action.remote.as_ref().map(|entry| entry.hash.as_str()),
+                    parent_hash(action),
                     action
                         .local
                         .as_ref()
@@ -533,15 +583,20 @@ async fn apply_upload(
                 .map_err(SyncEngineError::Api)
         }
         SyncActionKind::DeleteRemote => client
-            .delete_file(
-                &action.path,
-                action.remote.as_ref().map(|entry| entry.hash.as_str()),
-                keys,
-            )
+            .delete_file(&action.path, parent_hash(action), keys)
             .await
             .map_err(SyncEngineError::Api),
         _ => Ok(()),
     }
+}
+
+/// The remote hash the server checks; a synthesized tombstone has none.
+fn parent_hash(action: &SyncAction) -> Option<&str> {
+    action
+        .remote
+        .as_ref()
+        .map(|entry| entry.hash.as_str())
+        .filter(|hash| !hash.is_empty())
 }
 
 fn build_upload_action_for_path(
@@ -588,10 +643,7 @@ fn write_local_file(
     contents: &[u8],
 ) -> Result<(), SyncEngineError> {
     let path = local_root.join(relative_path);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, contents)?;
+    write_atomic(&path, contents)?;
     Ok(())
 }
 
@@ -651,19 +703,40 @@ fn now_seconds() -> u64 {
 mod tests {
     use std::fs;
 
-    use filetime::{set_file_mtime, FileTime};
-    use httpmock::{Method::GET, Method::PUT, MockServer};
+    use httpmock::{Method::DELETE, Method::GET, Method::PUT, MockServer};
     use tempfile::tempdir;
 
     use super::{
-        complete_sync, conflict_copy_path, load_manifest_from_disk, prepare_sync,
-        remote_manifest_cache_path, save_manifest_to_disk, sync_manifest_path,
+        complete_sync, conflict_copy_path, load_manifest_from_disk, ordered_for_apply,
+        prepare_sync, remote_manifest_cache_path, save_manifest_to_disk, sync_manifest_path,
     };
     use crate::{
         crypto::{content_hmac, derive_keys, encrypt, encrypt_path, path_token, CryptoKeys},
         progress::NoProgress,
-        types::{ConflictResolution, ConflictResolutionChoice, FileEntry, Manifest, VaultConfig},
+        types::{
+            ConflictResolution, ConflictResolutionChoice, FileEntry, Manifest, SyncAction,
+            SyncActionKind, SyncPlan, VaultConfig,
+        },
     };
+
+    /// One manifest entry as the server serialises it (also the `current`
+    /// body of a 409).
+    fn server_entry(
+        keys: &CryptoKeys,
+        path: &str,
+        content: &[u8],
+        modified: u64,
+        deleted: bool,
+    ) -> serde_json::Value {
+        let enc_path = encrypt_path(&keys.path_enc, path).unwrap();
+        serde_json::json!({
+            "hash": content_hmac(&keys.content_mac, content),
+            "modified": modified,
+            "size": content.len(),
+            "deleted": deleted,
+            "encPath": enc_path,
+        })
+    }
 
     /// Build the JSON the server would return for a single-file manifest:
     /// keyed by the path token, with an HMAC hash and recoverable `encPath`.
@@ -675,16 +748,46 @@ mod tests {
         deleted: bool,
     ) -> serde_json::Value {
         let token = path_token(&keys.path_token, path);
-        let enc_path = encrypt_path(&keys.path_enc, path).unwrap();
-        serde_json::json!({
-            token: {
-                "hash": content_hmac(&keys.content_mac, content),
-                "modified": modified,
-                "size": content.len(),
-                "deleted": deleted,
-                "encPath": enc_path,
+        serde_json::json!({ token: server_entry(keys, path, content, modified, deleted) })
+    }
+
+    /// Merge several single-file manifests into one server manifest.
+    fn merge_manifests(parts: Vec<serde_json::Value>) -> serde_json::Value {
+        let mut merged = serde_json::Map::new();
+        for part in parts {
+            if let serde_json::Value::Object(map) = part {
+                merged.extend(map);
             }
-        })
+        }
+        serde_json::Value::Object(merged)
+    }
+
+    /// The base checkpoint `.obsink/manifest.json` as an earlier sync would
+    /// have left it: keyed by real path.
+    fn write_base(dir: &std::path::Path, keys: &CryptoKeys, entries: &[(&str, &[u8], bool)]) {
+        let manifest = entries
+            .iter()
+            .map(|(path, content, deleted)| {
+                (
+                    (*path).to_string(),
+                    FileEntry {
+                        hash: content_hmac(&keys.content_mac, content),
+                        modified: 1,
+                        size: content.len() as u64,
+                        deleted: *deleted,
+                        enc_path: String::new(),
+                    },
+                )
+            })
+            .collect::<Manifest>();
+        save_manifest_to_disk(&sync_manifest_path(dir), &manifest).unwrap();
+    }
+
+    fn resolution(path: &str, choice: ConflictResolutionChoice) -> ConflictResolution {
+        ConflictResolution {
+            path: path.to_string(),
+            choice,
+        }
     }
 
     #[test]
@@ -850,30 +953,16 @@ mod tests {
     #[tokio::test]
     async fn keep_remote_resolves_conflict_and_updates_local_file() {
         let dir = tempdir().unwrap();
+        // base != local != remote: a real three-way conflict, whatever the mtimes.
         let note_path = dir.path().join("note.md");
         fs::write(&note_path, "local version").unwrap();
-        set_file_mtime(&note_path, FileTime::from_unix_time(1, 0)).unwrap();
         let server = MockServer::start_async().await;
         let key = [9_u8; 32];
         let keys = derive_keys(&key);
         let encrypted = encrypt(&keys.content_enc, b"remote version").unwrap();
         let token = path_token(&keys.path_token, "note.md");
         let remote_manifest = server_manifest(&keys, "note.md", b"remote version", 1, false);
-
-        save_manifest_to_disk(
-            &sync_manifest_path(dir.path()),
-            &Manifest::from([(
-                "note.md".to_string(),
-                FileEntry {
-                    hash: content_hmac(&keys.content_mac, b"base"),
-                    modified: 1,
-                    size: 4,
-                    deleted: false,
-                    enc_path: String::new(),
-                },
-            )]),
-        )
-        .unwrap();
+        write_base(dir.path(), &keys, &[("note.md", b"base", false)]);
 
         let body = remote_manifest.clone();
         server
@@ -912,13 +1001,19 @@ mod tests {
             fs::read_to_string(dir.path().join("note.md")).unwrap(),
             "remote version"
         );
+        let checkpoint = load_manifest_from_disk(&sync_manifest_path(dir.path())).unwrap();
+        assert_eq!(
+            checkpoint["note.md"].hash,
+            content_hmac(&keys.content_mac, b"remote version")
+        );
     }
 
     #[tokio::test]
     async fn upload_loop_continues_past_per_file_failure() {
         // a.md, b.md, c.md upload in BTreeSet (alphabetical) order. b returns
         // 413 (per-file, non-fatal): the loop records the failure and continues
-        // to c. The manifest still checkpoints because no fatal occurred.
+        // to c. The manifest still checkpoints because no fatal occurred, but
+        // b is held back so the next sync retries it.
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("a.md"), "aaa").unwrap();
         fs::write(dir.path().join("b.md"), "bbb").unwrap();
@@ -930,7 +1025,7 @@ mod tests {
         let token_b = path_token(&keys.path_token, "b.md");
         let token_c = path_token(&keys.path_token, "c.md");
 
-        server
+        let empty_manifest = server
             .mock_async(|when, then| {
                 when.method(GET).path("/vaults/vault_123/manifest");
                 then.status(200).json_body_obj(&serde_json::json!({}));
@@ -962,6 +1057,20 @@ mod tests {
         let plan = prepare_sync(&cfg, &key, &NoProgress).await.unwrap();
         assert_eq!(plan.upload.len(), 3);
 
+        // httpmock serves the first matching mock, so swap the manifest for
+        // what the server holds after a and c landed.
+        empty_manifest.delete_async().await;
+        let after = merge_manifests(vec![
+            server_manifest(&keys, "a.md", b"aaa", 5, false),
+            server_manifest(&keys, "c.md", b"ccc", 5, false),
+        ]);
+        server
+            .mock_async(move |when, then| {
+                when.method(GET).path("/vaults/vault_123/manifest");
+                then.status(200).json_body_obj(&after);
+            })
+            .await;
+
         let result = complete_sync(&cfg, &key, &plan, &[], &NoProgress)
             .await
             .unwrap();
@@ -974,6 +1083,16 @@ mod tests {
         assert_eq!(result.failures[0].path, "b.md");
         assert!(!result.failures[0].fatal);
         assert!(result.conflicts.is_empty());
+
+        let checkpoint = load_manifest_from_disk(&sync_manifest_path(dir.path())).unwrap();
+        assert!(checkpoint.contains_key("a.md"));
+        assert!(checkpoint.contains_key("c.md"));
+        assert!(!checkpoint.contains_key("b.md"));
+
+        let second = prepare_sync(&cfg, &key, &NoProgress).await.unwrap();
+        assert_eq!(second.upload.len(), 1);
+        assert_eq!(second.upload[0].path, "b.md");
+        assert!(second.download.is_empty() && second.conflicts.is_empty());
     }
 
     #[tokio::test]
@@ -1030,6 +1149,7 @@ mod tests {
         assert_eq!(result.failures.len(), 1);
         assert_eq!(result.failures[0].path, "b.md");
         assert!(result.failures[0].fatal);
+        assert!(!sync_manifest_path(dir.path()).exists());
     }
 
     #[tokio::test]
@@ -1044,14 +1164,10 @@ mod tests {
         let token_a = path_token(&keys.path_token, "a.md");
         let token_b = path_token(&keys.path_token, "b.md");
 
-        // Build a two-entry manifest by merging per-file server_manifest objects.
-        let mut manifest = server_manifest(&keys, "a.md", b"file a", 1, false);
-        let manifest_b = server_manifest(&keys, "b.md", b"file b", 1, false);
-        if let (Some(a), Some(b)) = (manifest.as_object_mut(), manifest_b.as_object()) {
-            for (k, v) in b {
-                a.insert(k.clone(), v.clone());
-            }
-        }
+        let manifest = merge_manifests(vec![
+            server_manifest(&keys, "a.md", b"file a", 1, false),
+            server_manifest(&keys, "b.md", b"file b", 1, false),
+        ]);
 
         server
             .mock_async(move |when, then| {
@@ -1180,5 +1296,398 @@ mod tests {
             fs::read(remote_manifest_cache_path(dir.path())).unwrap(),
             b"{garbage"
         );
+    }
+
+    #[tokio::test]
+    async fn download_failure_does_not_tombstone_next_sync() {
+        // b.md fails to download (404). complete_sync must hold b back from
+        // the checkpoint; the next prepare plans it as a Download again and
+        // never as a remote delete.
+        let dir = tempdir().unwrap();
+        let server = MockServer::start_async().await;
+        let key = [14_u8; 32];
+        let keys = derive_keys(&key);
+        let encrypted_a = encrypt(&keys.content_enc, b"file a").unwrap();
+        let token_a = path_token(&keys.path_token, "a.md");
+        let token_b = path_token(&keys.path_token, "b.md");
+        let manifest = merge_manifests(vec![
+            server_manifest(&keys, "a.md", b"file a", 1, false),
+            server_manifest(&keys, "b.md", b"file b", 1, false),
+        ]);
+
+        server
+            .mock_async(move |when, then| {
+                when.method(GET).path("/vaults/vault_123/manifest");
+                then.status(200).json_body_obj(&manifest);
+            })
+            .await;
+        server
+            .mock_async(move |when, then| {
+                when.method(GET)
+                    .path(format!("/vaults/vault_123/files/{token_a}"));
+                then.status(200).body(encrypted_a.clone());
+            })
+            .await;
+        server
+            .mock_async(move |when, then| {
+                when.method(GET)
+                    .path(format!("/vaults/vault_123/files/{token_b}"));
+                then.status(404).body("not found");
+            })
+            .await;
+        let token_b_delete = path_token(&keys.path_token, "b.md");
+        let delete_b = server
+            .mock_async(move |when, then| {
+                when.method(DELETE)
+                    .path(format!("/vaults/vault_123/files/{token_b_delete}"));
+                then.status(200);
+            })
+            .await;
+
+        let cfg = config(server.base_url(), dir.path().display().to_string());
+        let plan = prepare_sync(&cfg, &key, &NoProgress).await.unwrap();
+        let result = complete_sync(&cfg, &key, &plan, &[], &NoProgress)
+            .await
+            .unwrap();
+        assert_eq!(result.failures.len(), 1);
+
+        let checkpoint = load_manifest_from_disk(&sync_manifest_path(dir.path())).unwrap();
+        assert!(checkpoint.contains_key("a.md"));
+        assert!(!checkpoint.contains_key("b.md"));
+
+        let second = prepare_sync(&cfg, &key, &NoProgress).await.unwrap();
+        assert!(second.upload.is_empty(), "{:?}", second.upload);
+        assert_eq!(second.download.len(), 1);
+        assert_eq!(second.download[0].path, "b.md");
+        assert_eq!(second.download[0].kind, SyncActionKind::Download);
+        let _ = complete_sync(&cfg, &key, &second, &[], &NoProgress).await;
+        delete_b.assert_hits_async(0).await;
+    }
+
+    #[tokio::test]
+    async fn late_409_yields_reentrant_plan() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("note.md"), "local edit").unwrap();
+        let server = MockServer::start_async().await;
+        let key = [15_u8; 32];
+        let keys = derive_keys(&key);
+        let token = path_token(&keys.path_token, "note.md");
+        write_base(dir.path(), &keys, &[("note.md", b"base", false)]);
+        let base_hash = content_hmac(&keys.content_mac, b"base");
+        let other_hash = content_hmac(&keys.content_mac, b"other device");
+
+        // prepare sees the base still on the server; by the time we PUT,
+        // another device has landed "other device".
+        let stale = server_manifest(&keys, "note.md", b"base", 1, false);
+        server
+            .mock_async(move |when, then| {
+                when.method(GET).path("/vaults/vault_123/manifest");
+                then.status(200).json_body_obj(&stale);
+            })
+            .await;
+        let current = server_entry(&keys, "note.md", b"other device", 2, false);
+        let conflict_put = server
+            .mock_async(move |when, then| {
+                when.method(PUT)
+                    .path(format!("/vaults/vault_123/files/{token}"))
+                    .header("x-parent-hash", base_hash.clone());
+                then.status(409)
+                    .json_body(serde_json::json!({ "path": "note.md", "current": current }));
+            })
+            .await;
+
+        let cfg = config(server.base_url(), dir.path().display().to_string());
+        let plan = prepare_sync(&cfg, &key, &NoProgress).await.unwrap();
+        assert_eq!(plan.upload.len(), 1);
+        assert!(plan.conflicts.is_empty());
+
+        let result = complete_sync(&cfg, &key, &plan, &[], &NoProgress)
+            .await
+            .unwrap();
+        conflict_put.assert_hits_async(1).await;
+        assert_eq!(result.conflicts.len(), 1);
+        let late = &result.conflicts[0];
+        assert_eq!(
+            late.local.hash,
+            content_hmac(&keys.content_mac, b"local edit")
+        );
+        assert_eq!(late.remote.hash, other_hash);
+        // The checkpoint ran but kept the base entry for the conflicted path.
+        let checkpoint = load_manifest_from_disk(&sync_manifest_path(dir.path())).unwrap();
+        assert_eq!(
+            checkpoint["note.md"].hash,
+            content_hmac(&keys.content_mac, b"base")
+        );
+
+        let reentrant = SyncPlan::from_late_conflicts(&result).unwrap();
+        assert_eq!(reentrant.conflicts.len(), 1);
+        assert!(reentrant.upload.is_empty());
+
+        conflict_put.delete_async().await;
+        let token = path_token(&keys.path_token, "note.md");
+        let winning_put = server
+            .mock_async(move |when, then| {
+                when.method(PUT)
+                    .path(format!("/vaults/vault_123/files/{token}"))
+                    .header("x-parent-hash", other_hash.clone());
+                then.status(200);
+            })
+            .await;
+        let result = complete_sync(
+            &cfg,
+            &key,
+            &reentrant,
+            &[resolution("note.md", ConflictResolutionChoice::KeepLocal)],
+            &NoProgress,
+        )
+        .await
+        .unwrap();
+        winning_put.assert_hits_async(1).await;
+        assert!(result.conflicts.is_empty());
+        assert!(SyncPlan::from_late_conflicts(&result).is_none());
+    }
+
+    #[tokio::test]
+    async fn keep_both_on_remote_tombstone_behaves_as_keep_local() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("note.md"), "local edit").unwrap();
+        let server = MockServer::start_async().await;
+        let key = [16_u8; 32];
+        let keys = derive_keys(&key);
+        let token = path_token(&keys.path_token, "note.md");
+        write_base(dir.path(), &keys, &[("note.md", b"base", false)]);
+        let base_hash = content_hmac(&keys.content_mac, b"base");
+
+        let remote = server_manifest(&keys, "note.md", b"base", 2, true);
+        server
+            .mock_async(move |when, then| {
+                when.method(GET).path("/vaults/vault_123/manifest");
+                then.status(200).json_body_obj(&remote);
+            })
+            .await;
+        let get_file = server
+            .mock_async(move |when, then| {
+                when.method(GET).path_contains("/files/");
+                then.status(200).body(b"unused");
+            })
+            .await;
+        let put = server
+            .mock_async(move |when, then| {
+                when.method(PUT)
+                    .path(format!("/vaults/vault_123/files/{token}"))
+                    .header("x-parent-hash", base_hash.clone());
+                then.status(200);
+            })
+            .await;
+
+        let cfg = config(server.base_url(), dir.path().display().to_string());
+        let plan = prepare_sync(&cfg, &key, &NoProgress).await.unwrap();
+        assert_eq!(plan.conflicts.len(), 1);
+        assert!(plan.conflicts[0].remote.deleted);
+
+        let result = complete_sync(
+            &cfg,
+            &key,
+            &plan,
+            &[resolution("note.md", ConflictResolutionChoice::KeepBoth)],
+            &NoProgress,
+        )
+        .await
+        .unwrap();
+
+        put.assert_hits_async(1).await;
+        get_file.assert_hits_async(0).await;
+        assert!(result.conflicts.is_empty());
+        assert!(!dir.path().join("note.conflict.md").exists());
+        assert_eq!(
+            fs::read_to_string(dir.path().join("note.md")).unwrap(),
+            "local edit"
+        );
+    }
+
+    #[tokio::test]
+    async fn keep_both_on_local_tombstone_behaves_as_keep_remote() {
+        let dir = tempdir().unwrap();
+        let server = MockServer::start_async().await;
+        let key = [17_u8; 32];
+        let keys = derive_keys(&key);
+        let token = path_token(&keys.path_token, "note.md");
+        // base had the note; it is gone locally; the server has a newer edit.
+        write_base(dir.path(), &keys, &[("note.md", b"base", false)]);
+        let encrypted = encrypt(&keys.content_enc, b"remote edit").unwrap();
+
+        let remote = server_manifest(&keys, "note.md", b"remote edit", 2, false);
+        server
+            .mock_async(move |when, then| {
+                when.method(GET).path("/vaults/vault_123/manifest");
+                then.status(200).json_body_obj(&remote);
+            })
+            .await;
+        server
+            .mock_async(move |when, then| {
+                when.method(GET)
+                    .path(format!("/vaults/vault_123/files/{token}"));
+                then.status(200).body(encrypted.clone());
+            })
+            .await;
+        let delete = server
+            .mock_async(move |when, then| {
+                when.method(DELETE).path_contains("/files/");
+                then.status(200);
+            })
+            .await;
+
+        let cfg = config(server.base_url(), dir.path().display().to_string());
+        let plan = prepare_sync(&cfg, &key, &NoProgress).await.unwrap();
+        assert_eq!(plan.conflicts.len(), 1);
+        assert!(plan.conflicts[0].local.deleted);
+
+        let result = complete_sync(
+            &cfg,
+            &key,
+            &plan,
+            &[resolution("note.md", ConflictResolutionChoice::KeepBoth)],
+            &NoProgress,
+        )
+        .await
+        .unwrap();
+
+        delete.assert_hits_async(0).await;
+        assert!(result.conflicts.is_empty());
+        assert!(!dir.path().join("note.conflict.md").exists());
+        assert_eq!(
+            fs::read_to_string(dir.path().join("note.md")).unwrap(),
+            "remote edit"
+        );
+    }
+
+    #[test]
+    fn deletes_apply_before_downloads() {
+        let download = SyncAction {
+            path: "a.md".to_string(),
+            kind: SyncActionKind::Download,
+            local: None,
+            remote: None,
+        };
+        let delete = SyncAction {
+            path: "z.md".to_string(),
+            kind: SyncActionKind::DeleteLocal,
+            local: None,
+            remote: None,
+        };
+        let actions = [download, delete];
+        let ordered: Vec<&str> = ordered_for_apply(&actions)
+            .map(|action| action.path.as_str())
+            .collect();
+        assert_eq!(ordered, vec!["z.md", "a.md"]);
+    }
+
+    #[tokio::test]
+    async fn case_only_rename_survives_apply() {
+        // Server renamed Note.md -> note.md: a tombstone for the old spelling
+        // and a live entry for the new one. Deleting first, then downloading,
+        // leaves note.md in place on a case-insensitive volume.
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("Note.md"), "old spelling").unwrap();
+        let server = MockServer::start_async().await;
+        let key = [18_u8; 32];
+        let keys = derive_keys(&key);
+        write_base(dir.path(), &keys, &[("Note.md", b"old spelling", false)]);
+        let encrypted = encrypt(&keys.content_enc, b"new spelling").unwrap();
+        let token_new = path_token(&keys.path_token, "note.md");
+
+        let remote = merge_manifests(vec![
+            server_manifest(&keys, "Note.md", b"old spelling", 2, true),
+            server_manifest(&keys, "note.md", b"new spelling", 2, false),
+        ]);
+        server
+            .mock_async(move |when, then| {
+                when.method(GET).path("/vaults/vault_123/manifest");
+                then.status(200).json_body_obj(&remote);
+            })
+            .await;
+        server
+            .mock_async(move |when, then| {
+                when.method(GET)
+                    .path(format!("/vaults/vault_123/files/{token_new}"));
+                then.status(200).body(encrypted.clone());
+            })
+            .await;
+
+        let cfg = config(server.base_url(), dir.path().display().to_string());
+        let plan = prepare_sync(&cfg, &key, &NoProgress).await.unwrap();
+        assert_eq!(plan.download.len(), 2);
+        assert!(plan.failures.is_empty());
+        assert_eq!(
+            fs::read_to_string(dir.path().join("note.md")).unwrap(),
+            "new spelling"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_tombstone_removes_unchanged_local_and_converges() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("note.md"), "same").unwrap();
+        let server = MockServer::start_async().await;
+        let key = [19_u8; 32];
+        let keys = derive_keys(&key);
+        write_base(dir.path(), &keys, &[("note.md", b"same", false)]);
+
+        let remote = server_manifest(&keys, "note.md", b"same", 2, true);
+        server
+            .mock_async(move |when, then| {
+                when.method(GET).path("/vaults/vault_123/manifest");
+                then.status(200).json_body_obj(&remote);
+            })
+            .await;
+
+        let cfg = config(server.base_url(), dir.path().display().to_string());
+        let plan = prepare_sync(&cfg, &key, &NoProgress).await.unwrap();
+        assert_eq!(plan.download.len(), 1);
+        assert_eq!(plan.download[0].kind, SyncActionKind::DeleteLocal);
+        assert!(!dir.path().join("note.md").exists());
+
+        let result = complete_sync(&cfg, &key, &plan, &[], &NoProgress)
+            .await
+            .unwrap();
+        assert!(result.failures.is_empty());
+        let checkpoint = load_manifest_from_disk(&sync_manifest_path(dir.path())).unwrap();
+        assert!(checkpoint["note.md"].deleted);
+
+        let second = prepare_sync(&cfg, &key, &NoProgress).await.unwrap();
+        assert!(second.upload.is_empty() && second.download.is_empty());
+        assert!(second.conflicts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn converged_first_sync_is_noop() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("note.md"), "same").unwrap();
+        let server = MockServer::start_async().await;
+        let key = [20_u8; 32];
+        let keys = derive_keys(&key);
+
+        let remote = server_manifest(&keys, "note.md", b"same", 99, false);
+        server
+            .mock_async(move |when, then| {
+                when.method(GET).path("/vaults/vault_123/manifest");
+                then.status(200).json_body_obj(&remote);
+            })
+            .await;
+        let writes = server
+            .mock_async(|when, then| {
+                when.method(PUT);
+                then.status(200);
+            })
+            .await;
+
+        let cfg = config(server.base_url(), dir.path().display().to_string());
+        let plan = prepare_sync(&cfg, &key, &NoProgress).await.unwrap();
+        assert!(plan.upload.is_empty() && plan.download.is_empty());
+        assert!(plan.conflicts.is_empty());
+        let _ = complete_sync(&cfg, &key, &plan, &[], &NoProgress)
+            .await
+            .unwrap();
+        writes.assert_hits_async(0).await;
     }
 }

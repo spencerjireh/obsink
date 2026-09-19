@@ -77,6 +77,19 @@ type ConflictPreview = {
 type AddVaultMode = 'create' | 'connect'
 type ResolutionChoice = 'KeepLocal' | 'KeepRemote' | 'KeepBoth'
 
+// "Keep both" needs two live versions; when one side is a deletion the only
+// question is which side wins, and the labels say what that means.
+function availableChoices(conflict: Conflict): { choice: ResolutionChoice; label: string }[] {
+  const options: { choice: ResolutionChoice; label: string }[] = [
+    { choice: 'KeepLocal', label: conflict.local.deleted ? 'Delete on server' : 'Keep local' },
+    { choice: 'KeepRemote', label: conflict.remote.deleted ? 'Delete locally' : 'Keep remote' },
+  ]
+  if (!conflict.local.deleted && !conflict.remote.deleted) {
+    options.push({ choice: 'KeepBoth', label: 'Keep both' })
+  }
+  return options
+}
+
 type UsageInfo = {
   total_bytes: number
   max_vault_bytes: number | null
@@ -185,6 +198,10 @@ function App() {
   const [conflictPreview, setConflictPreview] = useState<ConflictPreview | null>(null)
   const [previewBusy, setPreviewBusy] = useState(false)
   const handleSyncRef = useRef<() => Promise<void>>(async () => {})
+  // Mirrors `busy` for the tray listener, which only sees refs: a second
+  // "Sync now" while a cycle runs must not start another one.
+  const busyRef = useRef(false)
+  const conflictsPendingRef = useRef(false)
 
   // One server per setup flow: enter the URL, sign in, then create or
   // connect a vault. The bearer lives in the keychain, keyed by server URL,
@@ -418,7 +435,33 @@ function App() {
     }
   }
 
+  // Apply a sync/resolve response: late 409s arrive as `pending_conflicts`
+  // next to a `completed_result`, so both paths share this.
+  async function applySyncResponse(response: SyncResponse, doneMessage: string) {
+    setSyncResult(response.completed_result)
+    setConflicts(response.pending_conflicts)
+    setSelectedConflictPath(response.pending_conflicts[0]?.path ?? null)
+    setConflictPreview(null)
+    setChoices(
+      Object.fromEntries(
+        response.pending_conflicts.map((conflict) => [conflict.path, 'KeepLocal']),
+      ),
+    )
+
+    if (response.pending_conflicts.length > 0) {
+      setMessage(`${response.pending_conflicts.length} conflicts need attention.`)
+      return
+    }
+    const failures = response.completed_result?.failures.length ?? 0
+    setMessage(failures === 0 ? doneMessage : `Sync finished with ${failures} failure(s).`)
+    await refresh()
+  }
+
   async function handleSync() {
+    if (busyRef.current) {
+      return
+    }
+    busyRef.current = true
     setBusy(true)
     setMessage('')
     setProgress(null)
@@ -427,24 +470,11 @@ function App() {
       const response = await call<SyncResponse>('sync_vault', {
         vaultId: activeVault?.id ?? null,
       })
-      setSyncResult(response.completed_result)
-      setConflicts(response.pending_conflicts)
-      setSelectedConflictPath(response.pending_conflicts[0]?.path ?? null)
-      setChoices(
-        Object.fromEntries(
-          response.pending_conflicts.map((conflict) => [conflict.path, 'KeepLocal']),
-        ),
-      )
-
-      if (response.pending_conflicts.length === 0) {
-        setMessage('Sync complete.')
-        await refresh()
-      } else {
-        setMessage(`${response.pending_conflicts.length} conflicts need attention.`)
-      }
+      await applySyncResponse(response, 'Sync complete.')
     } catch (error) {
       setMessage(String(error))
     } finally {
+      busyRef.current = false
       setBusy(false)
     }
   }
@@ -452,6 +482,7 @@ function App() {
   // Keep the ref pointed at the latest handleSync so the tray listener,
   // registered once, always runs the current closure (with fresh activeVault).
   handleSyncRef.current = handleSync
+  conflictsPendingRef.current = conflicts.length > 0
 
   useEffect(() => {
     const unlisten = listen<ProgressEvent>('sync://progress', (event) => {
@@ -476,6 +507,11 @@ function App() {
 
   useEffect(() => {
     const unlisten = listen('tray://sync-now', () => {
+      // A fresh cycle would discard the choices made so far; the resolver
+      // has to finish first.
+      if (conflictsPendingRef.current) {
+        return
+      }
       void handleSyncRef.current()
     })
     return () => {
@@ -488,28 +524,27 @@ function App() {
       return
     }
 
+    if (busyRef.current) {
+      return
+    }
+    busyRef.current = true
     setBusy(true)
     setMessage('')
     setProgress(null)
 
     try {
-      const result = await call<SyncResult>('resolve_conflict', {
+      const response = await call<SyncResponse>('resolve_conflict', {
         vaultId: activeVault.id,
         resolutions: conflicts.map((conflict) => ({
           path: conflict.path,
           choice: choices[conflict.path] ?? 'KeepLocal',
         })),
       })
-      setSyncResult(result)
-      setConflicts([])
-      setChoices({})
-      setSelectedConflictPath(null)
-      setConflictPreview(null)
-      setMessage('Conflict resolutions applied.')
-      await refresh()
+      await applySyncResponse(response, 'Conflict resolutions applied.')
     } catch (error) {
       setMessage(String(error))
     } finally {
+      busyRef.current = false
       setBusy(false)
     }
   }
@@ -858,14 +893,14 @@ function App() {
                   <div>Remote size: {conflict.remote.size} bytes</div>
                 </div>
                 <div className="choice-row">
-                  {(['KeepLocal', 'KeepRemote', 'KeepBoth'] as ResolutionChoice[]).map((choice) => (
+                  {availableChoices(conflict).map(({ choice, label }) => (
                     <button
                       key={choice}
                       className={choices[conflict.path] === choice ? 'is-selected' : ''}
                       onClick={() => setChoices((current) => ({ ...current, [conflict.path]: choice }))}
                       type="button"
                     >
-                      {choice}
+                      {label}
                     </button>
                   ))}
                 </div>

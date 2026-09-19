@@ -26,17 +26,19 @@ The **Rust core** (`core/`) holds all the logic worth sharing across platforms. 
 
 `prepare_sync` → (resolve conflicts) → `complete_sync`:
 
-1. **Build the working manifest** from the local folder (`build_manifest_from_dir`): walk files, record a keyed content hash, size, and mtime. The on-disk `.obsink/manifest.json` from the last sync is used to detect local deletions.
+1. **Load local state** (`load_local_state`): walk the folder into a working manifest (keyed content hash, size, mtime) and load the **base** — `.obsink/manifest.json`, the checkpoint of the last completed sync. A base entry with no file on disk becomes a local tombstone that keeps the base hash (the parent hash for the remote delete).
 2. **Fetch the remote manifest** (`fetch_remote_manifest`) and re-key it by real path. The last manifest and its `ETag` are cached in `.obsink/remote-manifest.json`; the fetch sends `If-None-Match` and reuses the cache on `304`. A corrupt or missing cache falls back to an unconditional fetch.
-3. **Diff** local vs remote (`diff_manifests`) into three lists:
-   - **upload** — local is newer or new
-   - **download** — remote is newer or new
-   - **conflict** — both changed since the last common state (decided by mtime; equal mtime + different hash ⇒ conflict)
-4. **Apply downloads** immediately; return uploads + conflicts as a `SyncPlan`.
+3. **Diff** base vs local vs remote (`diff_manifests`). A side "changed" when its version — the pair `(hash, deleted)`, with absent and deleted counting as the same version — differs from the base. `modified` is never consulted: the server stamps its own receipt time on every write, so mtimes are not comparable across devices.
+   - only local changed → **upload** (or a remote delete when the local side is gone)
+   - only remote changed → **download** (or a local delete when the remote side is gone)
+   - both changed to the same version → nothing (converged)
+   - both changed to different versions → **conflict**
+   With no base (first sync) a path that exists on both sides with different content is a conflict, never a silent pick.
+4. **Apply downloads** immediately — local deletes first, then downloads, so a case-only rename (`Note.md` → `note.md`) survives a case-insensitive volume — and return uploads + conflicts as a `SyncPlan`.
 5. The UI/CLI resolves conflicts (keep local / keep remote / keep both).
-6. `complete_sync` applies resolutions, uploads pending changes (each PUT is conflict-gated by the server via `X-Parent-Hash`), handles any late 409s, and saves the new remote manifest to disk. Transfers are best-effort: a per-file failure (e.g. a 413) is recorded and skipped while the batch continues; a fatal failure (network down, auth) stops the batch. When there are no late conflicts and no fatal failure, the server manifest is re-fetched and saved even on partial success — the resume point for the next sync. Per-file failures come back as `SyncFailure { path, kind, error, fatal }` on the `SyncResult`.
+6. `complete_sync` applies resolutions, uploads pending changes (each PUT is conflict-gated by the server via `X-Parent-Hash`), and **checkpoints**: the server manifest is re-fetched and saved as the next base, except that every **held-back** path — a failed download or upload, a failed local delete, or a late 409 — keeps its previous base entry (or none), so the next diff retries it or still sees "both changed". Transfers are best-effort: a per-file failure (e.g. a 413) is recorded and skipped while the batch continues; a fatal failure (network down, auth) stops the batch and skips the checkpoint. Late 409s come back on `SyncResult.conflicts`; `SyncPlan::from_late_conflicts` turns them into a conflict-only plan for another resolution round. Per-file failures come back as `SyncFailure { path, kind, error, fatal }`.
 
-The engine **never auto-resolves** a conflict — that's a UI decision.
+The engine **never auto-resolves** a conflict — that's a UI decision. The one collapse it does apply: **keep both** needs two live versions, so with a deletion on one side it becomes keep local (remote deleted) or keep remote (local deleted).
 
 ## Wire format (v2)
 
@@ -79,11 +81,15 @@ On `PUT`/`DELETE` the client sends `X-Parent-Hash` (the hash it believes is curr
 
 ## Network resilience
 
-`ApiClient` applies a 30s per-request timeout and retries transient failures (timeouts, connection errors) up to 3 times with exponential backoff. HTTP status errors and non-transient errors surface immediately as typed `ApiError`s. Logging is via `tracing` (`debug` per request, `info` per sync plan, `warn` on retry).
+`ApiClient` applies a 15s connect timeout and a 60s read-inactivity timeout to every request, plus a 30s whole-request budget on the small metadata calls (manifest, vault list, delete); blob transfers get no whole-request budget, so a slow but moving 50 MB upload completes. Transient failures (timeouts, connection errors) retry up to 3 times with exponential backoff. HTTP status errors and non-transient errors surface immediately as typed `ApiError`s. Logging is via `tracing` (`debug` per request, `info` per sync plan, `warn` on retry).
 
 ### Partial-sync recovery
 
-Above the per-request retry, the sync engine is partial-sync aware. Each non-conflict transfer error is classified **fatal** (`ApiError::Http`, or `UnexpectedStatus` 401/403/5xx → stop the batch) or **per-file** (413/404/other 4xx, local crypto/IO → record and continue). Recorded failures land on `SyncResult.failures` as `SyncFailure { path, kind, error, fatal }`. Because the manifest checkpoints on partial success (sync-cycle step 6), a dropped sync resumes on the next run — hash-based diffing means already-pushed files are skipped automatically.
+Above the per-request retry, the sync engine is partial-sync aware. Each non-conflict transfer error is classified **fatal** (`ApiError::Http`, or `UnexpectedStatus` 401/403/5xx → stop the batch) or **per-file** (413/404/other 4xx, local crypto/IO → record and continue). Recorded failures land on `SyncResult.failures` as `SyncFailure { path, kind, error, fatal }`. Because the manifest checkpoints on partial success (sync-cycle step 6) and holds back the paths that failed, a dropped sync resumes on the next run: files that landed are converged (local version == remote version ⇒ nothing to do) and the failed ones are diffed against their old base again.
+
+### Atomic writes
+
+Downloaded files, `.obsink/manifest.json`, the remote-manifest cache, and the client config files go through `write_atomic` (temp file in the same directory, `fsync`, rename), so a crash mid-write leaves the previous version in place rather than a truncated file. The hasher skips the `.obsink-tmp` temp files a crash could leave behind.
 
 ### Progress reporting
 

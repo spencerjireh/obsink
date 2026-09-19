@@ -185,16 +185,11 @@ conflict_round() {
     echo "BASE-$tag" > "$A_VAULT/hello.md"
     cli sync >"$WORK/cli-obs31-$tag-base.log" 2>&1
     run_test testSyncNow || { fail "OBS-31 ($choice): rebaseline sync"; return; }
-    # Diverge: A pushes REMOTE, iOS edits LOCAL without syncing. The engine is
-    # last-writer-wins by mtime and flags a conflict only on equal mtimes
-    # (spec §5), so pin B's mtime to A's — same trick as the desktop live test.
+    # Diverge: A pushes REMOTE, iOS edits LOCAL without syncing. Both sides
+    # changed since the shared base, so the three-way diff flags a conflict.
     echo "REMOTE-$tag" > "$A_VAULT/hello.md"
     cli sync >"$WORK/cli-obs31-$tag-remote.log" 2>&1
     echo "LOCAL-$tag" > "$B_VAULT/hello.md"
-    # The manifest's `modified` is stamped at upload time, so pin B's mtime to
-    # the manifest entry, not to A's file.
-    T="$(python3 -c "import json; print(json.load(open('$A_VAULT/.obsink/manifest.json'))['hello.md']['modified'])")"
-    python3 -c "import os; os.utime('$B_VAULT/hello.md', ($T, $T))"
     if ! run_test testResolveConflict TEST_RUNNER_OBSINK_TEST_CHOICE="$choice"; then
         fail "OBS-31 ($choice): resolve flow"
         return

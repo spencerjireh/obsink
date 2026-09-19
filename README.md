@@ -39,18 +39,19 @@ in [docs/architecture.md](docs/architecture.md).
 
 `prepare_sync` → resolve conflicts → `complete_sync`:
 
-1. Walk the vault directory into a working manifest (keyed hash, size, mtime); the last-sync
-   `.obsink/manifest.json` identifies local deletions.
+1. Walk the vault directory into a working manifest (keyed hash, size, mtime) and load the base —
+   the last-sync `.obsink/manifest.json` — which also identifies local deletions.
 2. Fetch the remote manifest (conditionally: the last ETag lives in
    `.obsink/remote-manifest.json`, so an unchanged manifest is a `304`) and re-key it by real path
    via `encPath`.
-3. `diff_manifests` splits into upload / download / conflict (mtime decides; equal mtime with
-   differing hash is a conflict).
+3. `diff_manifests` compares base, local, and remote by content hash: a side changed when its hash
+   differs from the base; only one side changed → upload or download; both changed to different
+   content → conflict. Timestamps never decide.
 4. Downloads apply immediately; uploads and conflicts return as a `SyncPlan`.
-5. The client resolves conflicts, then `complete_sync` uploads with parent-hash gating, handles late
-   409s, and persists the new manifest. Transfers are best-effort — per-file failures are skipped
-   while the batch continues, fatal failures stop early, and the manifest checkpoints on partial
-   success so a dropped sync resumes next time. Per-file progress streams to each client (CLI stderr,
+5. The client resolves conflicts, then `complete_sync` uploads with parent-hash gating, returns late
+   409s as another round of conflicts, and checkpoints the new manifest. Transfers are best-effort —
+   per-file failures are skipped while the batch continues, fatal failures stop early, and failed or
+   conflicted paths are held back from the checkpoint so a dropped sync resumes next time. Per-file progress streams to each client (CLI stderr,
    a desktop Tauri event, an iOS callback).
 
 ## Server API

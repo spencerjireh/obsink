@@ -11,8 +11,15 @@ use crate::types::{
     Manifest, ServerConflict, VaultConfig, VaultSummary,
 };
 
-/// Per-request timeout. Bounds hangs on a stalled connection.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Whole-request budget for the small metadata calls (manifest, vault list,
+/// delete). Blob transfers get no total budget: a 50 MB upload on a slow
+/// uplink legitimately takes minutes, so they rely on the inactivity timeouts.
+const SMALL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Time to establish a connection.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Inactivity timeout between bytes of a response; a stalled transfer fails
+/// here instead of hanging.
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// Total attempts (1 initial + retries) for transient network failures.
 const MAX_ATTEMPTS: u32 = 3;
 
@@ -44,7 +51,8 @@ pub enum ApiError {
 impl ApiClient {
     pub fn new(config: VaultConfig) -> Self {
         let client = reqwest::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(READ_TIMEOUT)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self { config, client }
@@ -97,6 +105,7 @@ impl ApiClient {
         let request = self
             .client
             .get(self.root_url("vaults"))
+            .timeout(SMALL_REQUEST_TIMEOUT)
             .bearer_auth(&self.config.api_key);
 
         parse_json(self.send_with_retry(request).await?).await
@@ -110,6 +119,7 @@ impl ApiClient {
         let http_request = self
             .client
             .post(self.root_url("vaults"))
+            .timeout(SMALL_REQUEST_TIMEOUT)
             .bearer_auth(&self.config.api_key)
             .json(request);
 
@@ -122,6 +132,7 @@ impl ApiClient {
         let request = self
             .client
             .delete(self.vault_url(""))
+            .timeout(SMALL_REQUEST_TIMEOUT)
             .bearer_auth(&self.config.api_key);
         parse_empty("", self.send_with_retry(request).await?).await
     }
@@ -150,6 +161,7 @@ impl ApiClient {
         let mut request = self
             .client
             .get(self.vault_url("manifest"))
+            .timeout(SMALL_REQUEST_TIMEOUT)
             .bearer_auth(&self.config.api_key);
         if let Some(etag) = if_none_match {
             request = request.header("If-None-Match", etag);
@@ -227,6 +239,7 @@ impl ApiClient {
         let mut request = self
             .client
             .delete(self.vault_url(&format!("files/{token}")))
+            .timeout(SMALL_REQUEST_TIMEOUT)
             .bearer_auth(&self.config.api_key);
 
         if let Some(parent_hash) = parent_hash {

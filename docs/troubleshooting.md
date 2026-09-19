@@ -49,10 +49,13 @@ Another device wrote the same file between your `prepare_sync` and `complete_syn
 ## Network
 
 **Sync hangs then errors**
-Requests time out after 30s and transient failures (timeouts, connection drops) retry 3× with backoff. A persistent failure means the server is unreachable or the URL is wrong. Check `curl -fsS $OBSINK_SERVER_URL/healthz` and `curl -fsS $OBSINK_SERVER_URL/vaults -H "Authorization: Bearer $OBSINK_API_KEY"`.
+Connections time out after 15s, a transfer that stops moving for 60s fails, small metadata calls have a 30s budget, and transient failures (timeouts, connection drops) retry 3× with backoff. A persistent failure means the server is unreachable or the URL is wrong. Check `curl -fsS $OBSINK_SERVER_URL/healthz` and `curl -fsS $OBSINK_SERVER_URL/vaults -H "Authorization: Bearer $OBSINK_API_KEY"`.
 
 **Uploads succeed but a later sync re-uploads the same file**
-Usually a clock/mtime issue or a `.obsink/manifest.json` that didn't persist. Confirm the local manifest is being written (it lives at `<vault>/.obsink/manifest.json`) and that the directory is writable.
+A `.obsink/manifest.json` that didn't persist: the diff compares content hashes against that checkpoint, never timestamps. Confirm the local manifest is being written (it lives at `<vault>/.obsink/manifest.json`) and that the directory is writable. A re-upload of identical content is harmless — the server answers `200` without writing.
+
+**The first sync after upgrading deletes a file on the server**
+Older builds checkpointed a file that had failed to download, so the next sync read it as a local deletion. Current builds hold failed paths back from the checkpoint; a vault whose last sync ran on an old build can carry one such entry over. Restore the file from the server's `_trash/` (retained 30 days) or from the other device, then sync again.
 
 **Sync sees no remote changes that you know exist**
 The client caches the last server manifest with its ETag in `<vault>/.obsink/remote-manifest.json` and asks the server "changed since?". The server answers from its own revision counter, so a stale answer means the two are out of step (a restored database backup, for example). Delete `.obsink/remote-manifest.json` and sync again.

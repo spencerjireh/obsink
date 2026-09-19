@@ -151,6 +151,19 @@ pub struct SyncPlan {
     pub failures: Vec<SyncFailure>,
 }
 
+impl SyncPlan {
+    /// A plan that carries only the late (409) conflicts of a completed sync,
+    /// so the caller can collect resolutions and call `complete_sync` again.
+    pub fn from_late_conflicts(result: &SyncResult) -> Option<SyncPlan> {
+        (!result.conflicts.is_empty()).then(|| SyncPlan {
+            upload: Vec::new(),
+            download: Vec::new(),
+            conflicts: result.conflicts.clone(),
+            failures: Vec::new(),
+        })
+    }
+}
+
 const fn default_max_file_size() -> u64 {
     50 * 1024 * 1024
 }

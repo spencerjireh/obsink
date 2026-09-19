@@ -8,10 +8,11 @@ use std::{
 use clap::{Parser, Subcommand};
 use dirs::home_dir;
 use obsink_core::{
-    build_manifest_from_dir, complete_sync, derive_key, derive_keys, diff_local_and_remote,
-    fetch_remote_manifest, normalize_server_url, prepare_sync, sync_manifest_path, ApiClient,
-    AuthClient, Conflict, ConflictResolution, ConflictResolutionChoice, CreateVaultRequest,
-    KeyBytes, ProgressEvent, ProgressSink, SyncActionKind, SyncPhase, VaultConfig,
+    complete_sync, derive_key, derive_keys, diff_local_and_remote, fetch_remote_manifest,
+    load_local_state, normalize_server_url, prepare_sync, sync_manifest_path, write_atomic,
+    ApiClient, AuthClient, Conflict, ConflictResolution, ConflictResolutionChoice,
+    CreateVaultRequest, KeyBytes, ProgressEvent, ProgressSink, SyncActionKind, SyncPhase, SyncPlan,
+    VaultConfig,
 };
 use rpassword::prompt_password;
 use serde::{Deserialize, Serialize};
@@ -312,6 +313,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             passphrase,
         } => {
             let (url, bearer) = resolve_server(&server)?;
+            let directory = resolve_vault_dir(&directory)?;
             let client = ApiClient::new(VaultConfig {
                 server_url: url.clone(),
                 api_key: bearer,
@@ -347,6 +349,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             passphrase,
         } => {
             let (url, _bearer) = resolve_server(&server)?;
+            let directory = resolve_vault_dir(&directory)?;
             let key = derive_key_from_passphrase(passphrase, &vault_id)?;
 
             let config = CliConfig {
@@ -365,12 +368,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Status { directory } => {
             let stored = load_config()?;
             let keys = derive_keys(&load_key_from_keychain(&stored.vault_id)?);
-            let directory = directory.unwrap_or_else(|| PathBuf::from(&stored.local_path));
-            let manifest = build_manifest_from_dir(&directory, &keys)?;
-            let total_size: u64 = manifest.values().map(|entry| entry.size).sum();
+            let directory = match directory {
+                Some(directory) => resolve_vault_dir(&directory)?,
+                None => PathBuf::from(&stored.local_path),
+            };
+            let local = load_local_state(&directory, &keys)?;
+            let live = local.working.values().filter(|entry| !entry.deleted);
+            let total_size: u64 = live.clone().map(|entry| entry.size).sum();
 
             println!("directory: {}", directory.display());
-            println!("files: {}", manifest.len());
+            println!("files: {}", live.count());
             println!("bytes: {total_size}");
 
             let remote = fetch_remote_manifest(
@@ -379,7 +386,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 &keys,
             )
             .await?;
-            let diff = diff_local_and_remote(&manifest, &remote);
+            let diff = diff_local_and_remote(&local.base, &local.working, &remote);
             println!("upload: {}", diff.upload.len());
             println!("download: {}", diff.download.len());
             println!("conflicts: {}", diff.conflicts.len());
@@ -490,8 +497,8 @@ async fn run_sync_for_config(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let vault_config = to_vault_config(config)?;
 
+    let mut plan = prepare_sync(&vault_config, key, &CliProgress).await?;
     loop {
-        let plan = prepare_sync(&vault_config, key, &CliProgress).await?;
         let resolutions = prompt_conflict_resolutions(&plan.conflicts)?;
         let result = complete_sync(&vault_config, key, &plan, &resolutions, &CliProgress).await?;
 
@@ -523,8 +530,18 @@ async fn run_sync_for_config(
             return Ok(());
         }
 
+        // Another device wrote between our manifest fetch and the upload; the
+        // 409s come back as a conflict-only plan to resolve in the next round.
         println!("late conflicts detected: {}", result.conflicts.len());
+        plan = SyncPlan::from_late_conflicts(&result).expect("conflicts are non-empty");
     }
+}
+
+/// The vault directory as stored in the config: created if missing and made
+/// absolute, so `obsink sync` from any working directory finds the same vault.
+fn resolve_vault_dir(directory: &Path) -> io::Result<PathBuf> {
+    fs::create_dir_all(directory)?;
+    fs::canonicalize(directory)
 }
 
 fn prompt_conflict_resolutions(
@@ -533,13 +550,32 @@ fn prompt_conflict_resolutions(
     let mut resolutions = Vec::new();
 
     for conflict in conflicts {
+        // "Keep both" needs two live versions; with a deletion on one side
+        // the choice is only which side wins.
+        let both_live = !conflict.local.deleted && !conflict.remote.deleted;
         println!("conflict: {}", conflict.path);
-        println!("  1. keep local");
-        println!("  2. keep remote");
-        println!("  3. keep both");
+        println!(
+            "  1. keep local{}",
+            if conflict.local.deleted {
+                " (deleted here)"
+            } else {
+                ""
+            }
+        );
+        println!(
+            "  2. keep remote{}",
+            if conflict.remote.deleted {
+                " (deleted on the server)"
+            } else {
+                ""
+            }
+        );
+        if both_live {
+            println!("  3. keep both");
+        }
 
         loop {
-            print!("choose [1-3]: ");
+            print!("choose [1-{}]: ", if both_live { 3 } else { 2 });
             io::stdout().flush()?;
 
             let mut input = String::new();
@@ -548,7 +584,7 @@ fn prompt_conflict_resolutions(
             let choice = match input.trim() {
                 "1" => Some(ConflictResolutionChoice::KeepLocal),
                 "2" => Some(ConflictResolutionChoice::KeepRemote),
-                "3" => Some(ConflictResolutionChoice::KeepBoth),
+                "3" if both_live => Some(ConflictResolutionChoice::KeepBoth),
                 _ => None,
             };
 
@@ -623,10 +659,7 @@ fn config_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
 
 fn save_config(config: &CliConfig) -> Result<(), Box<dyn std::error::Error>> {
     let path = config_path()?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, toml::to_string_pretty(config)?)?;
+    write_atomic(&path, toml::to_string_pretty(config)?.as_bytes())?;
     Ok(())
 }
 
@@ -748,4 +781,33 @@ fn load_key_from_keychain(vault_id: &str) -> Result<KeyBytes, Box<dyn std::error
     let mut key = [0_u8; 32];
     key.copy_from_slice(&bytes);
     Ok(key)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::resolve_vault_dir;
+
+    #[test]
+    fn resolve_vault_dir_returns_an_absolute_path() {
+        let resolved = resolve_vault_dir(Path::new(".")).unwrap();
+
+        assert!(resolved.is_absolute());
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap()
+        );
+    }
+
+    #[test]
+    fn resolve_vault_dir_creates_missing_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("new/vault");
+
+        let resolved = resolve_vault_dir(&target).unwrap();
+
+        assert!(target.is_dir());
+        assert_eq!(resolved, std::fs::canonicalize(&target).unwrap());
+    }
 }

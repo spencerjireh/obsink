@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs, io,
     path::{Path, PathBuf},
     process::Command,
@@ -15,10 +15,10 @@ use tauri::{
 };
 
 use obsink_core::{
-    build_working_manifest_for_path, complete_sync, derive_key, derive_keys, diff_local_and_remote,
-    fetch_remote_manifest, normalize_server_url, prepare_sync, sync_manifest_path, ApiClient,
-    AuthClient, Conflict, ConflictResolution, CreateVaultRequest, KeyBytes, ProgressEvent,
-    ProgressSink, SyncPlan, SyncResult, VaultConfig, VaultSummary,
+    complete_sync, derive_key, derive_keys, diff_local_and_remote, fetch_remote_manifest,
+    load_local_state, normalize_server_url, prepare_sync, sync_manifest_path, write_atomic,
+    ApiClient, AuthClient, Conflict, ConflictResolution, CreateVaultRequest, KeyBytes,
+    ProgressEvent, ProgressSink, SyncPlan, SyncResult, VaultConfig, VaultSummary,
 };
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +28,39 @@ const KEYCHAIN_SERVICE: &str = "obsink";
 #[derive(Default)]
 struct AppState {
     pending_plans: Mutex<HashMap<String, SyncPlan>>,
+    /// Vaults with a sync or resolution in progress. Two cycles on one vault
+    /// would race on the same files and checkpoint, so the second is refused.
+    in_flight: Mutex<HashSet<String>>,
+}
+
+/// Marks a vault as busy for the guard's lifetime.
+struct InFlightGuard<'a> {
+    state: &'a AppState,
+    vault_id: String,
+}
+
+impl<'a> InFlightGuard<'a> {
+    fn acquire(state: &'a AppState, vault_id: &str) -> Result<Self, String> {
+        let mut in_flight = state
+            .in_flight
+            .lock()
+            .map_err(|_| "in-flight lock poisoned".to_string())?;
+        if !in_flight.insert(vault_id.to_string()) {
+            return Err(format!("sync already running for vault {vault_id}"));
+        }
+        Ok(Self {
+            state,
+            vault_id: vault_id.to_string(),
+        })
+    }
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut in_flight) = self.state.in_flight.lock() {
+            in_flight.remove(&self.vault_id);
+        }
+    }
 }
 
 /// Bridges core sync progress events to the frontend via the Tauri event bus.
@@ -440,8 +473,8 @@ async fn get_status() -> Result<SyncStatus, String> {
     let remote_manifest = fetch_remote_manifest(&ApiClient::new(vault_config), &local_root, &keys)
         .await
         .map_err(err_string)?;
-    let local_manifest = build_working_manifest_for_path(&local_root, &keys).map_err(err_string)?;
-    let diff = diff_local_and_remote(&local_manifest, &remote_manifest);
+    let local = load_local_state(&local_root, &keys).map_err(err_string)?;
+    let diff = diff_local_and_remote(&local.base, &local.working, &remote_manifest);
 
     Ok(SyncStatus {
         active_vault_id: Some(vault.id.clone()),
@@ -459,8 +492,7 @@ async fn get_status() -> Result<SyncStatus, String> {
 async fn get_manifest_diff(vault_id: Option<String>) -> Result<SyncResult, String> {
     let vault = selected_vault(vault_id).map_err(err_string)?;
     let keys = derive_keys(&load_key_from_keychain(&vault.id).map_err(err_string)?);
-    let local_manifest =
-        build_working_manifest_for_path(Path::new(&vault.local_path), &keys).map_err(err_string)?;
+    let local = load_local_state(Path::new(&vault.local_path), &keys).map_err(err_string)?;
     let remote_manifest = fetch_remote_manifest(
         &ApiClient::new(to_vault_config(&vault)),
         Path::new(&vault.local_path),
@@ -468,7 +500,11 @@ async fn get_manifest_diff(vault_id: Option<String>) -> Result<SyncResult, Strin
     )
     .await
     .map_err(err_string)?;
-    Ok(diff_local_and_remote(&local_manifest, &remote_manifest))
+    Ok(diff_local_and_remote(
+        &local.base,
+        &local.working,
+        &remote_manifest,
+    ))
 }
 
 async fn sync_vault_inner(
@@ -477,7 +513,10 @@ async fn sync_vault_inner(
     progress: &dyn ProgressSink,
 ) -> Result<SyncCommandResponse, String> {
     let vault = selected_vault(vault_id).map_err(err_string)?;
+    let _guard = InFlightGuard::acquire(state, &vault.id)?;
     let key = load_key_from_keychain(&vault.id).map_err(err_string)?;
+    // A fresh cycle supersedes any plan left over from an earlier one.
+    set_pending_plan(state, &vault.id, None)?;
     let plan = prepare_sync(&to_vault_config(&vault), &key, progress)
         .await
         .map_err(err_string)?;
@@ -486,21 +525,50 @@ async fn sync_vault_inner(
         let result = complete_sync(&to_vault_config(&vault), &key, &plan, &[], progress)
             .await
             .map_err(err_string)?;
-        return Ok(SyncCommandResponse {
-            completed_result: Some(result),
-            pending_conflicts: Vec::new(),
-        });
+        return finish_cycle(state, &vault.id, result);
     }
 
     let pending_conflicts = plan.conflicts.clone();
-    state
-        .pending_plans
-        .lock()
-        .map_err(|_| "pending plan lock poisoned".to_string())?
-        .insert(vault.id.clone(), plan);
+    set_pending_plan(state, &vault.id, Some(plan))?;
 
     Ok(SyncCommandResponse {
         completed_result: None,
+        pending_conflicts,
+    })
+}
+
+fn set_pending_plan(
+    state: &AppState,
+    vault_id: &str,
+    plan: Option<SyncPlan>,
+) -> Result<(), String> {
+    let mut plans = state
+        .pending_plans
+        .lock()
+        .map_err(|_| "pending plan lock poisoned".to_string())?;
+    match plan {
+        Some(plan) => {
+            plans.insert(vault_id.to_string(), plan);
+        }
+        None => {
+            plans.remove(vault_id);
+        }
+    }
+    Ok(())
+}
+
+/// After `complete_sync`: late 409s become a conflict-only plan the UI can
+/// resolve in another round; otherwise the vault has no pending plan.
+fn finish_cycle(
+    state: &AppState,
+    vault_id: &str,
+    result: SyncResult,
+) -> Result<SyncCommandResponse, String> {
+    let late_plan = SyncPlan::from_late_conflicts(&result);
+    let pending_conflicts = result.conflicts.clone();
+    set_pending_plan(state, vault_id, late_plan)?;
+    Ok(SyncCommandResponse {
+        completed_result: Some(result),
         pending_conflicts,
     })
 }
@@ -520,17 +588,21 @@ async fn resolve_conflict_inner(
     resolutions: Vec<ConflictResolution>,
     state: &AppState,
     progress: &dyn ProgressSink,
-) -> Result<SyncResult, String> {
+) -> Result<SyncCommandResponse, String> {
     let vault = selected_vault(Some(vault_id.clone())).map_err(err_string)?;
+    let _guard = InFlightGuard::acquire(state, &vault.id)?;
+    // The plan stays in place until the round succeeds, so a failed attempt
+    // (network, keychain) can be retried without a fresh sync.
     let plan = state
         .pending_plans
         .lock()
         .map_err(|_| "pending plan lock poisoned".to_string())?
-        .remove(&vault_id)
+        .get(&vault_id)
+        .cloned()
         .ok_or_else(|| format!("no pending conflict set for {}", vault_id))?;
     let key = load_key_from_keychain(&vault.id).map_err(err_string)?;
 
-    complete_sync(
+    let result = complete_sync(
         &to_vault_config(&vault),
         &key,
         &plan,
@@ -538,7 +610,8 @@ async fn resolve_conflict_inner(
         progress,
     )
     .await
-    .map_err(err_string)
+    .map_err(err_string)?;
+    finish_cycle(state, &vault.id, result)
 }
 
 #[tauri::command]
@@ -547,7 +620,7 @@ async fn resolve_conflict(
     resolutions: Vec<ConflictResolution>,
     state: tauri::State<'_, AppState>,
     app: AppHandle,
-) -> Result<SyncResult, String> {
+) -> Result<SyncCommandResponse, String> {
     let sink = TauriProgressSink { app };
     resolve_conflict_inner(vault_id, resolutions, &state, &sink).await
 }
@@ -703,14 +776,9 @@ fn load_app_config() -> Result<StoredAppConfig, io::Error> {
 
 fn save_app_config(config: &StoredAppConfig) -> Result<(), io::Error> {
     let path = app_config_path()?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(
-        path,
-        serde_json::to_vec_pretty(config)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
-    )
+    let bytes = serde_json::to_vec_pretty(config)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    write_atomic(&path, &bytes)
 }
 
 fn upsert_vault(vault: StoredVault) -> Result<(), io::Error> {
@@ -953,14 +1021,10 @@ fn main() {
 #[cfg(test)]
 mod live_tests {
     use super::*;
-    use obsink_core::{
-        derive_keys, load_manifest_from_disk, sync_manifest_path, ApiClient,
-        ConflictResolutionChoice, VaultConfig,
-    };
+    use obsink_core::{derive_keys, ApiClient, ConflictResolutionChoice, VaultConfig};
     use std::{
         fs,
         path::{Path, PathBuf},
-        time::{Duration, SystemTime},
     };
 
     /// `#[ignore]`d live integration test: drives the real desktop command
@@ -1076,21 +1140,26 @@ mod live_tests {
             ConflictResolutionChoice::KeepBoth,
         ];
         for choice in choices {
-            // Rebaseline: A's a.md == "REMOTE", then sync so server == local.
-            // Manifest timestamps have one-second resolution; a write in the
-            // same second as the previous upload ties on `modified` and is
-            // classified as a conflict instead of an upload, so step past it.
-            tokio::time::sleep(Duration::from_millis(1100)).await;
-            fs::write(dir_a.join(file_rel), "REMOTE").unwrap();
+            // Rebaseline: A's a.md == BASE, synced, so base == local == remote.
+            let base_text = format!("BASE-{choice:?}");
+            fs::write(dir_a.join(file_rel), &base_text).unwrap();
             let _ = sync_vault_inner(Some(vault_id.clone()), &state, &obsink_core::NoProgress)
                 .await
                 .unwrap();
-            let ts = server_modified_for(&dir_a, file_rel);
 
-            // Engineer a conflict: different content, same (pinned) mtime.
+            // Engineer a three-way conflict: another device overwrites the
+            // server copy while A edits locally.
             let local_text = format!("LOCAL-{choice:?}");
+            put_remote_text(
+                &server_url,
+                &api_key,
+                &vault_id,
+                file_rel,
+                "REMOTE",
+                &base_text,
+            )
+            .await;
             fs::write(dir_a.join(file_rel), &local_text).unwrap();
-            set_mtime(&dir_a.join(file_rel), ts);
 
             let resp = sync_vault_inner(Some(vault_id.clone()), &state, &obsink_core::NoProgress)
                 .await
@@ -1128,7 +1197,7 @@ mod live_tests {
             .await
             .unwrap();
             assert!(
-                result.conflicts.is_empty(),
+                result.pending_conflicts.is_empty(),
                 "OBS-4 ({choice:?}): no late 409 expected"
             );
 
@@ -1357,14 +1426,30 @@ mod live_tests {
         .unwrap();
     }
 
-    fn server_modified_for(dir: &Path, rel: &str) -> u64 {
-        let manifest = load_manifest_from_disk(&sync_manifest_path(dir)).unwrap();
-        manifest.get(rel).unwrap().modified
-    }
-
-    fn set_mtime(path: &Path, secs: u64) {
-        let file = fs::OpenOptions::new().write(true).open(path).unwrap();
-        file.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+    /// Overwrite `path` on the server as another device would, gated on the
+    /// hash of `parent_text` (the version both sides last agreed on).
+    async fn put_remote_text(
+        server_url: &str,
+        api_key: &str,
+        vault_id: &str,
+        path: &str,
+        text: &str,
+        parent_text: &str,
+    ) {
+        let key = load_key_from_keychain(vault_id).unwrap();
+        let keys = derive_keys(&key);
+        let config = VaultConfig {
+            server_url: server_url.to_string(),
+            api_key: api_key.to_string(),
+            vault_id: vault_id.to_string(),
+            local_path: String::new(),
+        };
+        let parent = obsink_core::content_hmac(&keys.content_mac, parent_text.as_bytes());
+        let content_hash = obsink_core::content_hmac(&keys.content_mac, text.as_bytes());
+        let ciphertext = obsink_core::encrypt(&keys.content_enc, text.as_bytes()).unwrap();
+        ApiClient::new(config)
+            .put_file(path, Some(&parent), &content_hash, ciphertext, &keys)
+            .await
             .unwrap();
     }
 

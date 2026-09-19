@@ -8,6 +8,7 @@ use thiserror::Error;
 use walkdir::WalkDir;
 
 use crate::crypto::{content_hmac, CryptoKeys, KeyBytes};
+use crate::fs_util::TEMP_SUFFIX;
 use crate::types::{FileEntry, Manifest};
 
 #[derive(Debug, Error)]
@@ -55,6 +56,10 @@ pub fn build_manifest_from_dir(root: &Path, keys: &CryptoKeys) -> Result<Manifes
         let relative_key = relative.to_string_lossy().replace('\\', "/");
 
         if relative_key == ".obsink" || relative_key.starts_with(".obsink/") {
+            continue;
+        }
+        // A temp file left behind by an interrupted atomic write is not a note.
+        if relative_key.ends_with(TEMP_SUFFIX) {
             continue;
         }
 
@@ -116,6 +121,24 @@ mod tests {
 
         assert_eq!(entry.size, 0);
         assert_eq!(entry.hash, hash_bytes(&keys.content_mac, b""));
+    }
+
+    #[test]
+    fn ignores_obsink_temp_files() {
+        let keys = test_keys();
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("note.md"), b"note").unwrap();
+        fs::write(
+            dir.path()
+                .join(format!(".note.md.1-2{}", crate::fs_util::TEMP_SUFFIX)),
+            b"partial",
+        )
+        .unwrap();
+
+        let manifest = build_manifest_from_dir(dir.path(), &keys).unwrap();
+
+        assert_eq!(manifest.len(), 1);
+        assert!(manifest.contains_key("note.md"));
     }
 
     #[test]

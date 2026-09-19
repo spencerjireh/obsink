@@ -69,7 +69,7 @@ cargo test -p obsink-desktop live_tests -- --ignored --nocapture
 
 `desktop_flows_live` seeds the operator bearer into the file keyring the way a sign-in would; `account_flow_live` signs in with the email code and, on a server that already has accounts, mints the invite it needs with `OBSINK_TEST_API_KEY`.
 
-It verifies vault create/connect + passphrase validation, the full sync cycle with cross-device propagation, all three conflict resolutions (KeepLocal / KeepRemote / KeepBoth) via an equal-mtime conflict, stale-vault detection (the banner's data source), and multi-vault switching. It uses a sandboxed `HOME` and the file-backed keyring (`OBSINK_KEYRING_DIR`) so it never prompts the macOS keychain or pollutes `~/.obsink/app.json`.
+It verifies vault create/connect + passphrase validation, the full sync cycle with cross-device propagation, all three conflict resolutions (KeepLocal / KeepRemote / KeepBoth) via a three-way conflict (another device overwrites the server copy while the local file is edited), stale-vault detection (the banner's data source), and multi-vault switching. It uses a sandboxed `HOME` and the file-backed keyring (`OBSINK_KEYRING_DIR`) so it never prompts the macOS keychain or pollutes `~/.obsink/app.json`.
 
 ## iOS
 

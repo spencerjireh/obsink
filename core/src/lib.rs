@@ -1,6 +1,7 @@
 pub mod api_client;
 pub mod auth;
 pub mod crypto;
+pub mod fs_util;
 pub mod hasher;
 pub mod manifest;
 pub mod progress;
@@ -16,13 +17,14 @@ pub use crypto::{
     content_hmac, decrypt, decrypt_path, derive_key, derive_keys, encrypt, encrypt_path,
     path_token, CryptoError, CryptoKeys, KeyBytes, PROTOCOL_VERSION,
 };
+pub use fs_util::{write_atomic, TEMP_SUFFIX};
 pub use hasher::{build_manifest_from_dir, hash_bytes, hash_file, HasherError};
-pub use manifest::{diff_manifests, ManifestDiff};
+pub use manifest::{checkpoint_manifest, diff_manifests, ManifestDiff};
 pub use progress::{NoProgress, ProgressEvent, ProgressSink, SyncPhase};
 pub use sync_engine::{
-    build_working_manifest_for_path, complete_sync, diff_local_and_remote, fetch_remote_manifest,
+    complete_sync, diff_local_and_remote, fetch_remote_manifest, load_local_state,
     load_manifest_from_disk, prepare_sync, remote_manifest_cache_path, save_manifest_to_disk,
-    sync_manifest_path, SyncEngineError,
+    sync_manifest_path, LocalState, SyncEngineError,
 };
 pub use types::{
     BatchOp, BatchOperationResult, BatchResponse, Conflict, ConflictResolution,
