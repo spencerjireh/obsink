@@ -35,9 +35,9 @@ deployment in `docs/self-hosting.md`.
   (`mobile/` crate). Project generated with XcodeGen (`ios/project.yml`).
 - **Infra** — `server/Dockerfile` (cargo-chef, distroless), `docker-compose.yml`
   (local: server built from the checkout, Postgres 16, Mailpit) and
-  `docker-compose.coolify.yml` (production: `ghcr.io/spencerjireh/obsink-server`,
-  Postgres). TLS is the operator's proxy (Coolify Traefik). Windows, Linux, and
-  Android clients are out of scope.
+  `docker-compose.coolify.yml` (production: Coolify builds `server/Dockerfile`
+  from the branch on every deploy, Postgres). TLS is the operator's proxy
+  (Coolify Traefik). Windows, Linux, and Android clients are out of scope.
 
 ## Project structure
 
@@ -53,8 +53,12 @@ obsink/
   mobile/                # UniFFI facade over core (staticlib/cdylib for iOS)
   ios/                   # Xcode project: ObSink app + FileProvider ext + Tests (XcodeGen)
   docker-compose.yml     # local stack; docker-compose.coolify.yml for production
-  scripts/               # build-ios, release-ios, verify-* harnesses
+  scripts/               # build-ios, release-ios, verify-* harnesses, check-commit-msg
   docs/                  # self-hosting, architecture, platforms, troubleshooting
+  .github/               # ci.yml, release.yml, rulesets/main.json, PR template
+  lefthook.yml           # git hooks: rustfmt, prettier, commit message
+  deny.toml              # cargo-deny policy (advisories, licenses, bans, sources)
+  rust-toolchain.toml    # pinned Rust version (CI and local)
 ```
 
 ## Hard rules (non-negotiables)
@@ -81,18 +85,26 @@ obsink/
    do not add recovery without an explicit decision.
 6. **50 MB upload limit.** The server rejects larger files (`413`); a
    per-account byte budget answers `507`, which the sync engine treats as fatal.
-7. **Tests stay green.** `cargo test --workspace` (server integration tests
-   skip without `DATABASE_URL`; run them against Postgres before touching
-   `server/`) and `npm run build` in `desktop/`. Run them before considering
-   work done.
+7. **Tests and lints stay green.** `cargo test --workspace` (server integration
+   tests skip without `DATABASE_URL`; run them against Postgres before touching
+   `server/`), `cargo clippy --workspace --all-targets -- -D warnings`,
+   `cargo deny check`, and in `desktop/` `npm run lint && npm run format:check
+   && npm run build`. CI enforces all of them on every PR; run them before
+   considering work done.
 8. **No new dependencies without a one-line justification.** The core crypto
    stack (aes-gcm, argon2, hkdf, hmac, sha2) is fixed — do not swap it out.
 
 ## Commands
 
 ```bash
+# Once per clone: git hooks (rustfmt, prettier, commit-message check)
+brew install lefthook xcodegen && lefthook install
+
 # Rust core + CLI tests
 cargo test --workspace
+
+# Lints CI enforces
+cargo clippy --workspace --all-targets -- -D warnings && cargo deny check
 
 # Server integration tests need Postgres (any throwaway instance):
 docker run -d --name obsink-test-pg -e POSTGRES_PASSWORD=postgres -p 5433:5432 postgres:16-alpine
@@ -102,8 +114,8 @@ DATABASE_URL=postgres://postgres:postgres@localhost:5433/postgres OBSINK_TEST_RE
 docker compose up -d            # OBSINK_PORT=18080 if 8080 is taken
 docker compose exec server obsink-server invite
 
-# Desktop (build the web bundle, then check the Tauri Rust)
-(cd desktop && npm ci && npm run build && cargo check -p obsink-desktop)
+# Desktop (lint + format check, build the web bundle, then check the Tauri Rust)
+(cd desktop && npm ci && npm run lint && npm run format:check && npm run build && cargo check -p obsink-desktop)
 
 # Build iOS: device+simulator staticlibs, UniFFI bindings, xcframework, XcodeGen
 scripts/build-ios.sh
@@ -148,9 +160,43 @@ P8 pivot are decommissioned; nothing in the repo references them.
   propose a clarification instead of guessing. Log the outcome on the decision
   log (see below).
 - Prefer small commits per session/task. Reference the Plane work item in the
-  message: `P4: file-provider enumerateChanges (OBS-12)`.
+  message: `feat(ios): file-provider enumerateChanges (OBS-12)` (format below).
 - Crypto changes require matching test updates (round-trip, wrong-key rejection,
   tamper detection). Never ship crypto without tests.
+
+## Git workflow
+
+- **Never push to `main`.** A ruleset (`.github/rulesets/main.json`, applied with
+  `gh api`) requires a pull request with every CI job green, allows rebase merges
+  only, and blocks force-pushes and deletion; there are no bypass actors.
+  Branch -> PR -> CI green -> rebase-merge.
+- **Branches:** `<type>/obs-<n>-<slug>`, e.g. `feat/obs-95-batch-undo`,
+  `ci/obs-94-repo-hygiene`.
+- **Commits:** `<type>(<scope>)?: <subject> (OBS-<n>)`. Types
+  `feat|fix|refactor|test|perf|build|chore|docs|ci`; scope optional, lowercase
+  (`core`, `cli,desktop`); `(OBS-<n>)` required for
+  `feat|fix|refactor|test|perf|build`, optional for `chore|docs|ci`. Enforced by
+  `scripts/check-commit-msg.sh`: the lefthook `commit-msg` hook locally and the
+  `commits` CI job over the PR range. Regex:
+  `^(feat|fix|refactor|test|perf|build)(\([a-z0-9-]+([,/][a-z0-9-]+)*\))?: .+ \(OBS-[0-9]+(, OBS-[0-9]+)*\)$`
+  or `^(chore|docs|ci)(\([a-z0-9-]+([,/][a-z0-9-]+)*\))?: .+$`. Rebase branches
+  onto `main`; merge commits fail the check.
+- **PRs:** fill in `.github/pull_request_template.md` (Plane item, summary, how
+  tested, spec impact). Rebase merge only; the branch is deleted on merge.
+  Required checks are the six CI jobs by display name (`commits`,
+  `core + CLI + mobile`, `cargo deny`, `server (postgres)`, `desktop (macOS)`,
+  `ios (simulator)`); renaming a job means updating `rulesets/main.json` and
+  re-applying it (`gh api -X PUT repos/spencerjireh/obsink/rulesets/<id> --input .github/rulesets/main.json`).
+- **Hooks:** `brew install lefthook && lefthook install` once per clone.
+- **Version bump and release:** in one PR (`build: bump version to X.Y.Z (OBS-<n>)`),
+  set `[workspace.package].version` in `Cargo.toml`, run
+  `npm version --no-git-tag-version X.Y.Z` in `desktop/`, and set `version` in
+  `desktop/src-tauri/tauri.conf.json`. After the rebase-merge:
+  `git fetch origin && git tag vX.Y.Z origin/main && git push origin vX.Y.Z`.
+  The Release workflow fails if the three versions differ from the tag, then
+  builds and publishes the macOS arm64 CLI with generated notes.
+  `ios/project.yml` `MARKETING_VERSION` is separate (TestFlight,
+  `scripts/release-ios.sh`) and not checked.
 
 ## Current status and project management
 
@@ -163,7 +209,7 @@ Status, tasks, decisions, and session logs live in the Plane project **OBS**
   superseded by it.
 - Work items are session-sized; move to **In Progress** when starting, comment
   outcomes (e.g. test output or a deploy URL), then mark **Done**. Reference the
-  item in commits: `P4: file-provider enumerateChanges (OBS-12)`.
+  item in commits: `feat(ios): file-provider enumerateChanges (OBS-12)`.
 - Decisions and session notes go as comments on the pinned `[Log]` work items —
   `[Log] Decision log` (OBS-74) and `[Log] Session log` (OBS-73); one comment
   per entry, newest last. The specs themselves stay in this repo (`spec.md`);

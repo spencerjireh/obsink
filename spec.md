@@ -452,11 +452,16 @@ obsink/
 │       └── main.rs
 ├── scripts/                  build-ios, release-ios, verify-* harnesses
 ├── docker-compose.yml        local stack: server (built), Postgres, Mailpit
-├── docker-compose.coolify.yml production stack: GHCR image, Postgres
+├── docker-compose.coolify.yml production stack: server built from source, Postgres
+├── lefthook.yml              git hooks: rustfmt, prettier, commit message
+├── deny.toml                 cargo-deny policy
+├── rust-toolchain.toml       pinned Rust version
 └── .github/
+    ├── pull_request_template.md
+    ├── rulesets/main.json    branch ruleset for main (applied with gh api)
     └── workflows/
-        ├── ci.yml            core/CLI/mobile tests, server tests on Postgres, desktop check
-        └── server-image.yml  pushes ghcr.io/spencerjireh/obsink-server on main
+        ├── ci.yml            commit check, fmt/clippy/tests, cargo-deny, server on Postgres, desktop lint+build, iOS simulator tests
+        └── release.yml       on v*.*.* tags: verify versions, build + publish the macOS arm64 CLI
 ```
 
 ---

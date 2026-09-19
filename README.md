@@ -89,7 +89,7 @@ exponential backoff; HTTP status errors surface immediately as typed `ApiError`s
 | `desktop/` | Tauri v2 + React app (menu-bar on macOS) |
 | `ios/`, `mobile/` | SwiftUI app + File Provider extension over the shared core |
 | `docker-compose.yml` | Local stack: server built from the checkout, Postgres, Mailpit |
-| `docker-compose.coolify.yml` | Production stack: `ghcr.io/spencerjireh/obsink-server`, Postgres |
+| `docker-compose.coolify.yml` | Production stack: server built from source by Coolify, Postgres |
 | `scripts/` | iOS build/release tooling and live verification harnesses |
 | `docs/` | Self-hosting, architecture, platform, troubleshooting |
 
@@ -132,12 +132,17 @@ The desktop app and the iOS app wrap the same core — see [docs/platforms.md](d
 ## Development
 
 ```bash
+brew install lefthook xcodegen && lefthook install           # git hooks (once per clone)
 cargo test --workspace                                       # core, CLI, mobile, server unit tests
 DATABASE_URL=postgres://postgres:postgres@localhost:5433/postgres \
   OBSINK_TEST_REQUIRE_DB=1 cargo test -p obsink-server       # server integration tests (needs Postgres)
-(cd desktop && npm ci && npm run build && cargo check -p obsink-desktop)
+cargo clippy --workspace --all-targets -- -D warnings && cargo deny check
+(cd desktop && npm ci && npm run lint && npm run format:check && npm run build && cargo check -p obsink-desktop)
 docker compose up -d && ./scripts/verify-server-deploy.sh    # contract check against the local stack
 ```
+
+`main` only accepts rebase-merged pull requests with green CI; see [CONTRIBUTING.md](CONTRIBUTING.md)
+for branch and commit conventions.
 
 `RUST_LOG=obsink_core=debug` enables per-request and per-sync-plan logging (stderr; stdout stays
 clean for scripted parsing).

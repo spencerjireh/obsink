@@ -1,8 +1,7 @@
 # Production stack for Coolify (or any compose host behind a TLS proxy).
 # Coolify clones the repo and builds server/Dockerfile on the host (a Rust
-# release build: several minutes on the first deploy, cached afterwards). To
-# pull the prebuilt ghcr.io/spencerjireh/obsink-server image instead, replace
-# `build:` with `image:` (the package must be public or the host logged in).
+# release build: several minutes on the first deploy, cached afterwards); a
+# redeploy rebuilds from the current branch.
 # The server speaks plain HTTP on 8080; Coolify's Traefik terminates TLS and
 # routes the domain to it. Set these in the Coolify environment:
 #   OBSINK_SERVER_KEY   `obsink-server keygen` output; back it up
