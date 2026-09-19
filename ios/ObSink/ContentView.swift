@@ -233,14 +233,38 @@ private struct ConflictRow: View {
                 Text("Other device · \(conflict.remoteSize)B · \(Self.formatter.string(from: Date(timeIntervalSince1970: TimeInterval(conflict.remoteModified))))")
             }
             .font(.caption).foregroundStyle(.secondary)
-            Picker("Resolution", selection: $choice) {
-                Text("Keep local").tag(MobileChoice.keepLocal)
-                Text("Keep remote").tag(MobileChoice.keepRemote)
-                Text("Keep both").tag(MobileChoice.keepBoth)
-            }
-            .pickerStyle(.segmented)
+            ResolutionPicker(
+                title: "Resolution",
+                localDeleted: conflict.localDeleted,
+                remoteDeleted: conflict.remoteDeleted,
+                choice: $choice
+            )
         }
         .padding(.vertical, 4)
+    }
+}
+
+/// The winner picker for one conflict. "Keep both" needs two live versions;
+/// with a deletion on one side the only question is which side wins, and the
+/// labels say what that means.
+private struct ResolutionPicker: View {
+    let title: String
+    let localDeleted: Bool
+    let remoteDeleted: Bool
+    @Binding var choice: MobileChoice
+
+    var body: some View {
+        Picker(title, selection: $choice) {
+            Text(localDeleted ? "Delete on server" : "Keep local").tag(MobileChoice.keepLocal)
+            Text(remoteDeleted ? "Delete here" : "Keep remote").tag(MobileChoice.keepRemote)
+            if !localDeleted && !remoteDeleted {
+                Text("Keep both").tag(MobileChoice.keepBoth)
+            }
+        }
+        .pickerStyle(.segmented)
+        .onAppear {
+            if choice == .keepBoth && (localDeleted || remoteDeleted) { choice = .keepLocal }
+        }
     }
 }
 
@@ -251,15 +275,17 @@ private struct ConflictDetailView: View {
     @ObservedObject var model: SyncModel
     @Binding var choice: MobileChoice
 
+    private var conflict: MobileConflict? { model.conflicts.first { $0.path == path } }
+
     var body: some View {
         Form {
             Section("Resolution") {
-                Picker("Winner", selection: $choice) {
-                    Text("Keep local").tag(MobileChoice.keepLocal)
-                    Text("Keep remote").tag(MobileChoice.keepRemote)
-                    Text("Keep both").tag(MobileChoice.keepBoth)
-                }
-                .pickerStyle(.segmented)
+                ResolutionPicker(
+                    title: "Winner",
+                    localDeleted: conflict?.localDeleted ?? false,
+                    remoteDeleted: conflict?.remoteDeleted ?? false,
+                    choice: $choice
+                )
                 .accessibilityIdentifier("winnerPicker")
             }
             Section("This device") {
@@ -314,6 +340,10 @@ struct AddVaultView: View {
     @State private var authCode = ""
     @State private var inviteCode = ""
     @State private var codeSent = false
+    /// Sign in with Apple gave a token without an email claim plus an email
+    /// hint; the server wants a one-time code for that address before it
+    /// links the two. Held until the code is verified.
+    @State private var pendingAppleToken: String? = nil
 
     private var inviteOrNil: String? {
         let trimmed = inviteCode.trimmingCharacters(in: .whitespaces)
@@ -433,12 +463,16 @@ struct AddVaultView: View {
                 .textInputAutocapitalization(.characters)
                 .autocorrectionDisabled()
             if codeSent {
+                if pendingAppleToken != nil {
+                    Text("Enter the code sent to \(authEmail) to link it to your Apple ID.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 LabeledField("6-digit code", text: $authCode, identifier: "addVaultCode")
                     .keyboardType(.numberPad)
                 Button("Verify and sign in") { verifyCode() }
                     .disabled(busy || authCode.trimmingCharacters(in: .whitespaces).count != 6)
                     .accessibilityIdentifier("verifyCodeButton")
-                Button("Change email") { codeSent = false; authCode = "" }.disabled(busy)
+                Button("Change email") { codeSent = false; authCode = ""; pendingAppleToken = nil }.disabled(busy)
             } else {
                 Button("Send sign-in code") { sendCode() }
                     .disabled(busy || !authEmail.contains("@"))
@@ -490,16 +524,22 @@ struct AddVaultView: View {
         busy = true; status = ""
         let url = canonicalURL, email = authEmail.trimmingCharacters(in: .whitespaces)
         let code = authCode.trimmingCharacters(in: .whitespaces), device = Self.deviceName
-        let invite = inviteOrNil
+        let invite = inviteOrNil, appleToken = pendingAppleToken
         Task.detached {
             do {
-                let session = try authEmailVerify(serverUrl: url, email: email, code: code, deviceName: device, inviteCode: invite)
+                let session: MobileSession
+                if let appleToken {
+                    session = try authApple(serverUrl: url, identityToken: appleToken, deviceName: device, email: email, code: code, inviteCode: invite)
+                } else {
+                    session = try authEmailVerify(serverUrl: url, email: email, code: code, deviceName: device, inviteCode: invite)
+                }
                 KeychainStore.saveBearer(session.token, serverURL: url)
                 await MainActor.run {
                     accountEmail = session.email
                     signedIn = true
                     codeSent = false
                     authCode = ""
+                    pendingAppleToken = nil
                     busy = false
                     rememberServer()
                 }
@@ -528,7 +568,7 @@ struct AddVaultView: View {
             let invite = inviteOrNil
             Task.detached {
                 do {
-                    let session = try authApple(serverUrl: url, identityToken: identityToken, deviceName: device, email: email, inviteCode: invite)
+                    let session = try authApple(serverUrl: url, identityToken: identityToken, deviceName: device, email: email, code: nil, inviteCode: invite)
                     KeychainStore.saveBearer(session.token, serverURL: url)
                     await MainActor.run {
                         accountEmail = session.email
@@ -537,6 +577,24 @@ struct AddVaultView: View {
                         rememberServer()
                     }
                 } catch {
+                    // The token had no email claim: the server links the hint
+                    // only once a one-time code for that address checks out.
+                    if let email, error.localizedDescription.contains("email verification required") {
+                        do {
+                            let devCode = try authEmailStart(serverUrl: url, email: email)
+                            await MainActor.run {
+                                authEmail = email
+                                pendingAppleToken = identityToken
+                                codeSent = true
+                                authCode = devCode ?? ""
+                                busy = false
+                            }
+                            return
+                        } catch {
+                            await MainActor.run { status = error.localizedDescription; busy = false }
+                            return
+                        }
+                    }
                     await MainActor.run { status = error.localizedDescription; busy = false }
                 }
             }
@@ -602,6 +660,13 @@ struct AddVaultView: View {
                         return
                     }
                     let derived = try deriveMasterKey(passphrase: pass, vaultId: vid)
+                    // Prove the passphrase against a stored blob before keeping
+                    // the key; a wrong one would fail on every sync afterwards.
+                    let probe = MobileVaultConfig(serverUrl: url, apiKey: key, vaultId: vid, localPath: "")
+                    guard try validateVaultKey(config: probe, key: derived) else {
+                        await MainActor.run { status = "Passphrase does not match this vault."; busy = false }
+                        return
+                    }
                     _ = KeychainStore.save(derived, account: vid)
                     let vname = availableNames.first { $0.id == vid }?.name ?? vid
                     await MainActor.run {

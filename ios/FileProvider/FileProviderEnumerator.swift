@@ -8,7 +8,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
     private let container: NSFileProviderItemIdentifier
     private let store: ItemStore
 
-    init(container: NSFileProviderItemIdentifier, store: ItemStore = .shared) {
+    init(container: NSFileProviderItemIdentifier, store: ItemStore) {
         self.container = container
         self.store = store
     }

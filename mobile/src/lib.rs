@@ -244,6 +244,37 @@ pub fn create_vault(
     Ok(response.vault.into())
 }
 
+fn key_bytes(key: Vec<u8>) -> Result<KeyBytes, MobileError> {
+    key.as_slice()
+        .try_into()
+        .map_err(|_| MobileError::InvalidKey {
+            length: key.len() as u64,
+        })
+}
+
+/// Check a derived key against a vault before storing it: fetch the manifest
+/// and decrypt the first live blob. `Ok(true)` when it decrypts (or the vault
+/// has no live files yet, which proves nothing either way), `Ok(false)` when
+/// the key does not match, `Err` for network or auth failures. Mirrors the
+/// CLI's `validate_passphrase` (OBS-93).
+#[uniffi::export]
+pub fn validate_vault_key(config: MobileVaultConfig, key: Vec<u8>) -> Result<bool, MobileError> {
+    let key = key_bytes(key)?;
+    let keys = derive_keys(&key);
+    let config: VaultConfig = config.into();
+    let client = ApiClient::new(config.clone());
+    let manifest = block_on(client.get_manifest(&keys)).map_err(sync_err)?;
+    let Some(path) = manifest
+        .iter()
+        .find(|(_, entry)| !entry.deleted)
+        .map(|(path, _)| path.clone())
+    else {
+        return Ok(true);
+    };
+    let blob = block_on(client.get_file(&path, &keys)).map_err(sync_err)?;
+    Ok(decrypt(&keys.content_enc, &blob).is_ok())
+}
+
 // --- Accounts ---------------------------------------------------------------
 
 /// Canonical form of a server URL (the keychain account for its bearer).
@@ -361,13 +392,17 @@ pub fn auth_apple(
     code: Option<String>,
     invite_code: Option<String>,
 ) -> Result<MobileSession, MobileError> {
-    let session = block_on(AuthClient::new(&server_url).apple_sign_in(
-        &identity_token,
-        &device_name,
-        email.as_deref(),
-        code.as_deref().map(str::trim).filter(|code| !code.is_empty()),
-        clean_invite(invite_code.as_deref()),
-    ))
+    let session = block_on(
+        AuthClient::new(&server_url).apple_sign_in(
+            &identity_token,
+            &device_name,
+            email.as_deref(),
+            code.as_deref()
+                .map(str::trim)
+                .filter(|code| !code.is_empty()),
+            clean_invite(invite_code.as_deref()),
+        ),
+    )
     .map_err(sync_err)?;
     Ok(to_mobile_session(session))
 }
@@ -570,12 +605,7 @@ impl VaultClient {
         config: MobileVaultConfig,
         key: Vec<u8>,
     ) -> Result<std::sync::Arc<Self>, MobileError> {
-        let key: KeyBytes = key
-            .as_slice()
-            .try_into()
-            .map_err(|_| MobileError::InvalidKey {
-                length: key.len() as u64,
-            })?;
+        let key = key_bytes(key)?;
         Ok(std::sync::Arc::new(Self {
             config: config.into(),
             key,

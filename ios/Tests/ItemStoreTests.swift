@@ -194,4 +194,58 @@ final class ItemStoreTests: XCTestCase {
         XCTAssertFalse(try store.item(for: "U")?.pendingUpload ?? true) // upload flag cleared
         XCTAssertNil(try store.item(for: "D"))                          // deletion row removed
     }
+
+    // OBS-93: a tombstone and a live row for the same path (deleted in the FP,
+    // then re-created) must not both survive a reconcile.
+    func testReconcileDropsStaleTombstoneBesideLiveRow() throws {
+        let (store, root, _) = try makeStore()
+        let file = root.appendingPathComponent("a.md")
+        try Data("a".utf8).write(to: file)
+        try store.reconcile(vaultRoot: root)
+        let firstID = try XCTUnwrap(try store.item(path: "a.md")?.identifier)
+
+        // Deleted on disk: reconcile tombstones the row.
+        try FileManager.default.removeItem(at: file)
+        try store.reconcile(vaultRoot: root)
+        XCTAssertNil(try store.item(path: "a.md"))
+
+        // Re-created through the FP with a fresh identifier (createItem path).
+        try Data("again".utf8).write(to: file)
+        try store.upsert(ItemRecord(identifier: "fresh", parentIdentifier: "", filename: "a.md",
+                                    contentHash: nil, localPath: "a.md", isDirectory: false,
+                                    size: 5, modified: 1, pendingUpload: true))
+        try store.drainPendingAfterSync(completed: true)
+        try store.reconcile(vaultRoot: root)
+
+        let rows = try store.changes(from: 0).filter { $0.localPath == "a.md" }
+        XCTAssertEqual(rows.count, 1, "one row per path after reconcile")
+        XCTAssertEqual(rows.first?.identifier, "fresh")
+        XCTAssertFalse(rows.first?.isDeleted ?? true)
+        XCTAssertNotEqual(rows.first?.identifier, firstID)
+    }
+
+    // OBS-93: per-vault stores are separate databases.
+    func testStoresForDifferentVaultsDoNotShareRows() throws {
+        XCTAssertNotEqual(
+            ItemStore.defaultDatabaseURL(vaultID: "vault_a"),
+            ItemStore.defaultDatabaseURL(vaultID: "vault_b")
+        )
+        XCTAssertTrue(ItemStore.defaultDatabaseURL(vaultID: "vault_a").lastPathComponent.contains("vault_a"))
+    }
+
+    // OBS-93: fetchContents hands the system a copy, never the vault file.
+    func testStagedCopyLeavesSourceInPlace() throws {
+        let (_, root, _) = try makeStore()
+        let source = root.appendingPathComponent("note.md")
+        try Data("body".utf8).write(to: source)
+        let staging = root.deletingLastPathComponent().appendingPathComponent("staging")
+
+        let copy = try FileProviderPaths.stagedCopy(of: source, in: staging)
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: source.path))
+        XCTAssertNotEqual(copy, source)
+        XCTAssertEqual(try Data(contentsOf: copy), Data("body".utf8))
+        try FileManager.default.removeItem(at: copy)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: source.path))
+    }
 }

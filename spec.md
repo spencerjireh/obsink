@@ -335,7 +335,7 @@ The server keeps a `vaults` table scoped by tenant. Clients can list, create, an
 
 ### 10.3 Client UX
 
-On app launch, the client shows a vault picker if multiple vaults are configured. Each vault's passphrase is stored separately in the platform keychain. The user can add/remove vaults from settings.
+On app launch, the client shows a vault picker if multiple vaults are configured. Each vault's passphrase is stored separately in the platform keychain, and on iOS each vault has its own cache directory, item database, and File Provider location (§11.2). The user can add/remove vaults from settings.
 
 ---
 
@@ -347,14 +347,15 @@ Uses `NSFileProviderReplicatedExtension` (the modern replicated API).
 
 ### 11.2 Architecture
 
-The main app and File Provider extension share data through an **App Group** container:
-- **SQLite database** (via GRDB or similar) — item metadata (identifiers, parent identifiers, filenames, hashes, sync state, pending flags)
-- **Local file cache** — decrypted file contents in the shared container
+The main app and File Provider extension share data through an **App Group** container, laid out per vault:
+- **SQLite database** per vault (`items-<vault id>.sqlite`, via GRDB) — item metadata (identifiers, parent identifiers, filenames, hashes, sync state, pending flags)
+- **Local file cache** per vault (`Vault/<vault id>/`) — decrypted file contents in the shared container
+- **One File Provider domain per vault** — identifier = vault id, display name = vault name; the extension derives its directory and database from the domain it is instantiated for
 
 ### 11.3 Extension Responsibilities
 
 - `enumerateChanges` — reports items added/modified/deleted since last enumeration, driven by database state
-- `fetchContents` — serves decrypted files from local cache
+- `fetchContents` — serves decrypted files from local cache as a staged copy (the system consumes the file it is handed, so the vault copy is never returned directly)
 - `createItem` / `modifyItem` — accepts writes from Obsidian, saves to local cache, sets `pendingUpload = true` in database
 
 ### 11.4 The Extension Does NOT Touch the Network

@@ -82,9 +82,11 @@ final class SyncProgressListener: ProgressListener {
 /// Drives sync from the SwiftUI layer by calling the Rust core through the
 /// generated UniFFI bindings (`VaultClient`, `deriveMasterKey`, ...).
 ///
-/// Vault files live in the shared App Group container so the File Provider
-/// extension can serve the same data. Config persists in the group's
-/// UserDefaults; the passphrase is held only in memory.
+/// Vault files live in the shared App Group container, one directory and one
+/// item database per vault (`Vault/<vaultID>/`, `items-<vaultID>.sqlite`),
+/// each exposed through its own File Provider domain so the extension can
+/// serve the same data. Config persists in the group's UserDefaults; the
+/// passphrase is held only in memory.
 @MainActor
 final class SyncModel: ObservableObject {
     static let appGroup = "group.com.obsink.shared"
@@ -155,10 +157,11 @@ final class SyncModel: ObservableObject {
             self.activeVaultID = first.vaultID
         }
 
+        Self.migrateLegacyStorage(activeVaultID: activeVaultID, defaults: defaults)
         loadActiveIntoFields()
         refreshPending()
         refreshStoredKey()
-        registerFileProviderDomain()
+        syncFileProviderDomains()
     }
 
     var activeEntry: VaultEntry? {
@@ -248,17 +251,22 @@ final class SyncModel: ObservableObject {
         status = "Signed out"
     }
 
-    /// Switch the active vault (spec §10.3 vault picker).
+    /// Switch the active vault (spec §10.3 vault picker). Each vault has its
+    /// own directory, item database, and File Provider domain, so switching
+    /// only changes which one the Sync button drives.
     func selectVault(_ id: String) {
         guard entries.contains(where: { $0.vaultID == id }), id != activeVaultID else { return }
         persistConfig()
         activeVaultID = id
         Self.saveEntries(entries, active: activeVaultID, to: defaults)
         loadActiveIntoFields()
+        client = nil
         conflicts = []
         choices = [:]
         previews = [:]
+        failures = []
         staleDownloads = 0
+        refreshPending()
         refreshStoredKey()
         status = "Switched to \(activeEntry?.name ?? id)"
         checkStale()
@@ -274,7 +282,14 @@ final class SyncModel: ObservableObject {
         activeVaultID = entry.vaultID
         Self.saveEntries(entries, active: activeVaultID, to: defaults)
         loadActiveIntoFields()
+        client = nil
+        conflicts = []
+        choices = [:]
+        previews = [:]
+        failures = []
+        refreshPending()
         refreshStoredKey()
+        syncFileProviderDomains()
         status = "Added vault \(entry.name)"
     }
 
@@ -308,7 +323,8 @@ final class SyncModel: ObservableObject {
     /// Count of File-Provider-queued local changes (pendingUpload/pendingDeletion),
     /// read from the shared item DB. Surfaces a "Sync to push" hint in the UI.
     func refreshPending() {
-        pendingLocalChanges = (try? ItemStore.shared.pendingCount()) ?? 0
+        guard !activeVaultID.isEmpty else { pendingLocalChanges = 0; return }
+        pendingLocalChanges = (try? ItemStore.store(for: activeVaultID).pendingCount()) ?? 0
     }
 
     /// Whether a derived key is already in the Keychain for this vault (so sync
@@ -317,14 +333,44 @@ final class SyncModel: ObservableObject {
         hasStoredKey = !vaultID.isEmpty && KeychainStore.load(account: vaultID) != nil
     }
 
-    /// Directory the Rust core reads/writes; Obsidian (via File Provider) sees the same files.
+    /// Directory the Rust core reads/writes for a vault; Obsidian (via that
+    /// vault's File Provider domain) sees the same files.
+    static func vaultDirectory(for vaultID: String) -> URL {
+        FileProviderPaths.vaultRoot(vaultID: vaultID)
+    }
+
+    /// The active vault's directory.
     var vaultDirectory: URL {
-        let base = FileManager.default
-            .containerURL(forSecurityApplicationGroupIdentifier: Self.appGroup)
-            ?? FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        let dir = base.appendingPathComponent("Vault", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir
+        Self.vaultDirectory(for: activeVaultID)
+    }
+
+    /// Builds before per-vault storage kept every vault in one `Vault/` dir
+    /// and one `obsink.sqlite`. On the first launch after the update, move
+    /// that content under the active vault so nothing is lost; the other
+    /// vaults re-download into their own directories on their next sync.
+    static func migrateLegacyStorage(activeVaultID: String, defaults: UserDefaults) {
+        let flag = "storageLayoutV2"
+        guard !defaults.bool(forKey: flag) else { return }
+        defer { defaults.set(true, forKey: flag) }
+        let fm = FileManager.default
+        let base = FileProviderPaths.vaultsBase
+        let legacyDB = ItemStore.legacyDatabaseURL()
+        guard !activeVaultID.isEmpty else { return }
+        let target = base.appendingPathComponent(activeVaultID, isDirectory: true)
+        if let children = try? fm.contentsOfDirectory(atPath: base.path), !children.isEmpty,
+           !fm.fileExists(atPath: target.path) {
+            try? fm.createDirectory(at: target, withIntermediateDirectories: true)
+            for child in children where child != activeVaultID {
+                try? fm.moveItem(at: base.appendingPathComponent(child), to: target.appendingPathComponent(child))
+            }
+        }
+        for suffix in ["", "-wal", "-shm"] {
+            let from = URL(fileURLWithPath: legacyDB.path + suffix)
+            let to = URL(fileURLWithPath: ItemStore.defaultDatabaseURL(vaultID: activeVaultID).path + suffix)
+            if fm.fileExists(atPath: from.path), !fm.fileExists(atPath: to.path) {
+                try? fm.moveItem(at: from, to: to)
+            }
+        }
     }
 
     func sync() {
@@ -408,10 +454,11 @@ final class SyncModel: ObservableObject {
             staleDownloads = 0
             // OBS-20/21: mirror the freshly synced vault into the item DB, then
             // tell the File Provider to re-enumerate so Obsidian/Files see it.
-            try? ItemStore.shared.reconcileAfterSync(completed: true, vaultRoot: vaultDirectory)
+            let store = ItemStore.store(for: activeVaultID)
+            try? store.reconcileAfterSync(completed: true, vaultRoot: vaultDirectory)
             // OBS-22/23: the core sync already pushed uploads/deletes by scanning
             // the vault dir; clear the FP's pending flags now.
-            try? ItemStore.shared.drainPendingAfterSync(completed: true)
+            try? store.drainPendingAfterSync(completed: true)
             signalFileProvider()
             refreshPending()
         } else if !outcome.conflicts.isEmpty {
@@ -440,44 +487,63 @@ final class SyncModel: ObservableObject {
 
     // MARK: File Provider domain
 
-    /// The single ObSink File Provider domain (spec §11). Registered on launch
-    /// so synced files appear under "ObSink" in the Files app and Obsidian.
-    static let fpDomain = NSFileProviderDomain(
-        identifier: NSFileProviderDomainIdentifier(rawValue: "obsink"),
-        displayName: "ObSink"
-    )
-
-    /// Register the domain with the system. Adding an already-registered domain
-    /// is a no-op, so this is safe to call on every launch.
-    private func registerFileProviderDomain() {
-        let domain = Self.fpDomain
+    /// One File Provider domain per vault (spec §11): the identifier is the
+    /// vault ID (which picks the directory and database in the extension) and
+    /// the display name is what Files and Obsidian show.
+    static func fpDomain(for entry: VaultEntry) -> NSFileProviderDomain {
+        let domain = NSFileProviderDomain(
+            identifier: NSFileProviderDomainIdentifier(rawValue: entry.vaultID),
+            displayName: entry.name.isEmpty ? "ObSink" : entry.name
+        )
         #if targetEnvironment(simulator)
         // The simulator keeps third-party domains user-disabled (FP error
         // -2011) with no UI to enable them; testing modes force the domain on.
         // Simulator builds only — on device the user enables it in Files.
         domain.testingModes = [.alwaysEnabled, .interactive]
         #endif
-        let add = {
-            NSFileProviderManager.add(domain) { error in
-                if let error {
-                    NSLog("ObSink: File Provider domain registration failed: \(error.localizedDescription)")
+        return domain
+    }
+
+    /// Make the registered domains match the configured vaults: add missing
+    /// ones, drop the ones whose vault is gone (including the single
+    /// "obsink" domain from before per-vault storage). Adding an
+    /// already-registered domain is a no-op, so this is safe on every launch.
+    private func syncFileProviderDomains() {
+        let wanted = entries
+        let reset = resetFileProviderDomain
+        resetFileProviderDomain = false
+        NSFileProviderManager.getDomainsWithCompletionHandler { registered, error in
+            if let error {
+                NSLog("ObSink: could not list File Provider domains: \(error.localizedDescription)")
+            }
+            let wantedIDs = Set(wanted.map(\.vaultID))
+            // UI-test reset: domain state survives app reinstall, so drop
+            // every domain before re-adding to start from a clean slate.
+            let stale = registered.filter { reset || !wantedIDs.contains($0.identifier.rawValue) }
+            let group = DispatchGroup()
+            for domain in stale {
+                group.enter()
+                NSFileProviderManager.remove(domain) { _ in group.leave() }
+            }
+            group.notify(queue: .main) {
+                for entry in wanted {
+                    NSFileProviderManager.add(Self.fpDomain(for: entry)) { error in
+                        if let error {
+                            NSLog("ObSink: File Provider domain registration failed for \(entry.vaultID): \(error.localizedDescription)")
+                        }
+                    }
                 }
             }
         }
-        if resetFileProviderDomain {
-            // UI-test reset: domain state survives app reinstall, so drop it
-            // before re-adding to start from a clean slate.
-            NSFileProviderManager.remove(domain) { _ in add() }
-        } else {
-            add()
-        }
     }
 
-    /// Ask the system to re-enumerate the working set so the File Provider picks
-    /// up the DB changes from `reconcileAfterSync`. Errors are ignored: on a fresh
-    /// install the domain registration may still be in flight.
+    /// Ask the system to re-enumerate the active vault's working set so the
+    /// File Provider picks up the DB changes from `reconcileAfterSync`. Errors
+    /// are ignored: on a fresh install the domain registration may still be
+    /// in flight.
     private func signalFileProvider() {
-        NSFileProviderManager(for: Self.fpDomain)?.signalEnumerator(for: .workingSet) { _ in }
+        guard let entry = activeEntry else { return }
+        NSFileProviderManager(for: Self.fpDomain(for: entry))?.signalEnumerator(for: .workingSet) { _ in }
     }
 
     // MARK: Stale-vault warning (spec §3.4, OBS-33)

@@ -7,11 +7,21 @@ import GRDB
 final class ItemStore {
     static let appGroup = "group.com.obsink.shared"
 
-    /// Singleton used by the app and extension. Points at the App Group database.
-    /// Failing to open the backing store is fatal: the FP can't operate without it.
-    static let shared: ItemStore = {
-        try! ItemStore(databaseURL: ItemStore.defaultDatabaseURL())
-    }()
+    /// One store per vault, shared by the app and the extension (each in its
+    /// own process) through the App Group database `items-<vaultID>.sqlite`.
+    /// Failing to open the backing store is fatal: the FP can't operate
+    /// without it.
+    static func store(for vaultID: String) -> ItemStore {
+        storesLock.lock()
+        defer { storesLock.unlock() }
+        if let existing = stores[vaultID] { return existing }
+        let store = try! ItemStore(databaseURL: ItemStore.defaultDatabaseURL(vaultID: vaultID))
+        stores[vaultID] = store
+        return store
+    }
+
+    private static var stores: [String: ItemStore] = [:]
+    private static let storesLock = NSLock()
 
     private let dbQueue: DatabaseQueue
 
@@ -19,6 +29,9 @@ final class ItemStore {
     init(databaseURL: URL) throws {
         var config = Configuration()
         config.label = "obsink.itemstore"
+        // The app and the extension write from separate processes; wait for a
+        // held lock instead of failing the write immediately (SQLITE_BUSY).
+        config.busyMode = .timeout(5)
         // WAL lets the app and the extension read concurrently with a single writer.
         config.prepareDatabase { db in
             try db.execute(sql: "PRAGMA journal_mode=WAL")
@@ -61,11 +74,20 @@ final class ItemStore {
         return m
     }
 
-    static func defaultDatabaseURL() -> URL {
-        let base = FileManager.default
+    static func defaultDatabaseURL(vaultID: String) -> URL {
+        containerBase().appendingPathComponent("items-\(vaultID).sqlite")
+    }
+
+    /// The single-vault database from before per-vault storage (migrated by
+    /// the app on first launch, see `SyncModel.migrateLegacyStorage`).
+    static func legacyDatabaseURL() -> URL {
+        containerBase().appendingPathComponent("obsink.sqlite")
+    }
+
+    static func containerBase() -> URL {
+        FileManager.default
             .containerURL(forSecurityApplicationGroupIdentifier: appGroup)
             ?? FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        return base.appendingPathComponent("obsink.sqlite")
     }
 
     // MARK: Reads
@@ -204,14 +226,22 @@ final class ItemStore {
 
     /// Scan `vaultRoot` and upsert item rows, assigning stable UUIDs on first
     /// encounter and bumping `rowVersion` only for genuinely changed/new items.
-    /// Rows for paths no longer on disk are dropped (the sync engine's
+    /// Rows for paths no longer on disk are tombstoned (the sync engine's
     /// working-manifest delete-detection handles server propagation).
     func reconcile(vaultRoot: URL) throws {
         try dbQueue.write { db in
-            let existing: [String: ItemRecord] = try Dictionary(
-                ItemRecord.fetchAll(db).map { ($0.localPath, $0) },
-                uniquingKeysWith: { a, _ in a }
+            let all = try ItemRecord.fetchAll(db)
+            // A path can have a live row and an older tombstone (deleted in
+            // the FP, then re-created). The live row is the one to update;
+            // the stale tombstone is dropped below so it cannot resurrect
+            // beside it.
+            let existing: [String: ItemRecord] = Dictionary(
+                all.map { ($0.localPath, $0) },
+                uniquingKeysWith: { a, b in a.isDeleted ? b : a }
             )
+            for rec in all where rec.isDeleted && existing[rec.localPath]?.identifier != rec.identifier {
+                _ = try ItemRecord.filter(Column("identifier") == rec.identifier).deleteAll(db)
+            }
             let scanned = try Self.scan(vaultRoot: vaultRoot)
             let sorted = scanned.sorted { $0.path.count < $1.path.count } // parents first
 

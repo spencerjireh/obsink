@@ -219,14 +219,19 @@ final class SyncE2ETests: XCTestCase {
         let files = XCUIApplication(bundleIdentifier: "com.apple.DocumentsApp")
         files.launch()
 
-        // Browse tab → sidebar list. The provider shows up as "ObSink".
+        // Browse tab → sidebar list. Each vault is its own File Provider
+        // domain, listed under the vault's name (the provider itself is "ObSink").
         let browse = files.buttons["Browse"].firstMatch
         if browse.waitForExistence(timeout: 10) { browse.tap(); browse.tap() }
 
-        let location = files.staticTexts["ObSink"].firstMatch
+        let vaultName = env["OBSINK_TEST_VAULT_NAME"] ?? "ObSink"
+        var location = files.staticTexts[vaultName].firstMatch
         if !location.waitForExistence(timeout: 30) {
-            add(XCTAttachment(screenshot: files.screenshot()))
-            XCTFail("ObSink location not in Files sidebar")
+            location = files.staticTexts["ObSink"].firstMatch
+            if !location.waitForExistence(timeout: 10) {
+                add(XCTAttachment(screenshot: files.screenshot()))
+                XCTFail("\(vaultName) location not in Files sidebar")
+            }
         }
         location.tap()
 

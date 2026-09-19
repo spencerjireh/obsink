@@ -6,22 +6,26 @@ import UniformTypeIdentifiers
 final class FileProviderItem: NSObject, NSFileProviderItem {
     private let record: ItemRecord?
     private let isRoot: Bool
+    private let rootName: String
 
-    private init(record: ItemRecord?, isRoot: Bool) {
+    private init(record: ItemRecord?, isRoot: Bool, rootName: String) {
         self.record = record
         self.isRoot = isRoot
+        self.rootName = rootName
         super.init()
     }
 
     init(record: ItemRecord) {
         self.record = record
         self.isRoot = false
+        self.rootName = ""
         super.init()
     }
 
-    /// Synthesized root container item.
-    static func root() -> FileProviderItem {
-        FileProviderItem(record: nil, isRoot: true)
+    /// Synthesized root container item, shown under the domain's name (the
+    /// vault name).
+    static func root(named name: String = "ObSink") -> FileProviderItem {
+        FileProviderItem(record: nil, isRoot: true, rootName: name)
     }
 
     var itemIdentifier: NSFileProviderItemIdentifier {
@@ -35,7 +39,7 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
         return NSFileProviderItemIdentifier(parent)
     }
 
-    var filename: String { isRoot ? "ObSink" : (record?.filename ?? "") }
+    var filename: String { isRoot ? rootName : (record?.filename ?? "") }
 
     var contentType: UTType {
         guard !isRoot, let rec = record else { return .folder }

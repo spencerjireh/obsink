@@ -70,7 +70,8 @@ run_test() {
     fi
 }
 
-# App-group Vault dir inside the simulator, readable from the host.
+# App-group container inside the simulator, readable from the host. The
+# vault's files live under Vault/<vault id>/ (one directory per vault).
 app_vault_dir() {
     xcrun simctl get_app_container "$SIM_NAME" "$APP_BUNDLE_ID" groups \
         | awk -F'\t' '/group\.com\.obsink\.shared/ {print $2}'
@@ -110,7 +111,7 @@ if run_test testConnectVaultFlow; then pass "Add Vault → Connect flow"; else f
 
 step "OBS-29 (2/2): sync pulls Mac-created notes to iOS"
 if run_test testSyncNow; then
-    B_VAULT="$(app_vault_dir)/Vault"
+    B_VAULT="$(app_vault_dir)/Vault/$VAULT_ID"
     if [ "$(cat "$B_VAULT/hello.md" 2>/dev/null)" = "# Hello from Mac" ] \
         && [ "$(cat "$B_VAULT/notes/note1.md" 2>/dev/null)" = "note one" ]; then
         pass "OBS-29: Mac → server → iOS propagation"
@@ -120,7 +121,7 @@ if run_test testSyncNow; then
 else
     fail "OBS-29: sync failed"
 fi
-B_VAULT="$(app_vault_dir)/Vault"
+B_VAULT="$(app_vault_dir)/Vault/$VAULT_ID"
 
 # ---------- OBS-19 (sim half) / OBS-29: Files app shows the vault ----------
 # Known limitation: on the iOS 26 simulator, fileproviderd never instantiates
