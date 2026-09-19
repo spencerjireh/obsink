@@ -89,6 +89,10 @@ export type AddVaultForm = {
   passphrase: string
 }
 
+// Bytes one vault uses on the server against the per-vault cap (null when
+// the server sets none).
+export type VaultUsage = { bytes: number; max: number | null }
+
 export type UsageInfo = {
   total_bytes: number
   max_vault_bytes: number | null
@@ -127,7 +131,7 @@ export type InviteInfo = {
 // account needs an invite code.
 export type AuthCapabilities = { email: boolean; apple: boolean; invite_required: boolean }
 
-export type RemoteVault = { id: string; name: string; created: number }
+export type RemoteVault = { id: string; name: string; created: number; max_file_size: number }
 
 // Which pane the main area shows. Setup replaces the vault pane; the sidebar
 // stays so the user can always get back.

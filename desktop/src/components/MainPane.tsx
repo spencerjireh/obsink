@@ -6,13 +6,15 @@ import type {
   ResolutionChoice,
   SyncResult,
   SyncStatus,
+  VaultUsage,
 } from '../types'
 import { SESSION_EXPIRED } from '../lib/errors'
-import { phaseLabel, plural } from '../lib/format'
+import { phaseLabel, plural, vaultUsageLine } from '../lib/format'
 import { Conflicts } from './Conflicts'
 import { LastResult } from './LastResult'
 import { FailureNotice, Notice } from './Notices'
 import { StatusCounts } from './StatusCounts'
+import { VaultActions } from './VaultActions'
 
 type Props = {
   activeVault: LocalVault | null
@@ -28,12 +30,15 @@ type Props = {
   selectedConflictPath: string | null
   conflictPreview: ConflictPreview | null
   previewBusy: boolean
+  vaultUsage: VaultUsage | null
   onSync: () => void
   onResolve: () => void
   onSelectConflict: (path: string) => void
   onChoose: (path: string, choice: ResolutionChoice) => void
   onAddVault: () => void
   onSignIn: () => void
+  onRemoveVault: () => Promise<boolean>
+  onDeleteRemoteVault: () => Promise<boolean>
 }
 
 export function MainPane({
@@ -50,12 +55,15 @@ export function MainPane({
   selectedConflictPath,
   conflictPreview,
   previewBusy,
+  vaultUsage,
   onSync,
   onResolve,
   onSelectConflict,
   onChoose,
   onAddVault,
   onSignIn,
+  onRemoveVault,
+  onDeleteRemoteVault,
 }: Props) {
   const sessionNotice = sessionExpired ? (
     <Notice
@@ -99,6 +107,12 @@ export function MainPane({
             <code>{activeVault.local_path}</code>
             <span aria-hidden="true"> · </span>
             <code>{activeVault.server_url}</code>
+            {vaultUsage ? (
+              <>
+                <span aria-hidden="true"> · </span>
+                <span className="mono">{vaultUsageLine(vaultUsage)}</span>
+              </>
+            ) : null}
           </p>
         </div>
         <button
@@ -150,6 +164,14 @@ export function MainPane({
         onSelect={onSelectConflict}
         onChoose={onChoose}
         onResolve={onResolve}
+      />
+
+      <VaultActions
+        key={activeVault.id}
+        vault={activeVault}
+        busy={busy}
+        onRemove={onRemoveVault}
+        onDeleteRemote={onDeleteRemoteVault}
       />
     </main>
   )

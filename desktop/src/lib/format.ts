@@ -1,4 +1,4 @@
-import type { InviteStatus, SyncPhase, SyncResult, UsageInfo } from '../types'
+import type { InviteStatus, SyncPhase, SyncResult, UsageInfo, VaultUsage } from '../types'
 
 export function formatBytes(value: number): string {
   if (value < 1024) return `${value} B`
@@ -21,6 +21,13 @@ export function usageLine(usage: UsageInfo | null): string {
   const cap =
     usage.max_vault_bytes === null ? '' : ` · ${formatBytes(usage.max_vault_bytes)} per vault`
   return ` · ${formatBytes(usage.total_bytes)} used · ${vaults}${cap}`
+}
+
+export function vaultUsageLine(usage: VaultUsage | null): string {
+  if (!usage) return ''
+  return usage.max === null
+    ? formatBytes(usage.bytes)
+    : `${formatBytes(usage.bytes)} of ${formatBytes(usage.max)}`
 }
 
 export function formatUnix(value: number): string {
