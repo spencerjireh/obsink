@@ -59,6 +59,12 @@ struct ContentView: View {
                             .font(.caption)
                             .foregroundStyle(.orange)
                     }
+                    // The passphrase is asked for where it unblocks Sync now,
+                    // and only until the derived key is in the Keychain.
+                    if !model.vaultID.isEmpty && !model.hasStoredKey {
+                        SecureField("Passphrase", text: $model.passphrase)
+                            .accessibilityIdentifier("passphraseField")
+                    }
                     // The one primary action (DESIGN.md §1): full width, amber
                     // fill with ink text in both appearances. The identifier
                     // stays on the Button so the UI tests keep finding it.
@@ -145,8 +151,6 @@ struct ContentView: View {
                         Text("Vault ID").font(.caption).foregroundStyle(.secondary)
                         Text(model.vaultID).font(.caption.monospaced()).textSelection(.enabled)
                     }
-                    SecureField(model.hasStoredKey ? "Passphrase (saved — not needed)" : "Passphrase", text: $model.passphrase)
-                        .accessibilityIdentifier("passphraseField")
                     if model.hasStoredKey {
                         Label("Key saved on this device", systemImage: "key.fill")
                             .font(.caption).foregroundStyle(.green)
