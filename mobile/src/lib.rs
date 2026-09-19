@@ -14,27 +14,103 @@ use std::{
 
 use obsink_core::{
     complete_sync, decrypt, derive_key, derive_keys, diff_local_and_remote, fetch_remote_manifest,
-    load_local_state, normalize_server_url, prepare_sync, ApiClient, AuthClient,
-    ConflictResolution, ConflictResolutionChoice, CreateVaultRequest, KeyBytes, ProgressEvent,
-    ProgressSink, SyncActionKind, SyncFailure, SyncPhase, SyncPlan, VaultConfig, VaultSummary,
+    load_local_state, normalize_server_url, prepare_sync, ApiClient, ApiError, AuthClient,
+    AuthError, ConflictResolution, ConflictResolutionChoice, CreateVaultRequest, CryptoError,
+    KeyBytes, ProgressEvent, ProgressSink, SyncActionKind, SyncEngineError, SyncFailure, SyncPhase,
+    SyncPlan, VaultConfig, VaultSummary,
 };
 
 uniffi::setup_scaffolding!();
 
+/// Errors crossing the FFI. The host decides what to show from the variant,
+/// not from the text: `Unauthorized` opens sign-in, `Network` is retryable,
+/// `Server` carries the status for the two 403s that need a follow-up (invite
+/// code, Apple email verification).
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum MobileError {
+    /// Local failure (crypto, io, json) or a message with no better home.
     #[error("{message}")]
     Sync { message: String },
     #[error("invalid key length: expected 32 bytes, got {length}")]
     InvalidKey { length: u64 },
     #[error("no pending sync; call prepare() first")]
     NoPendingSync,
+    /// The bearer was rejected (revoked, expired, account deleted).
+    #[error("{message}")]
+    Unauthorized { message: String },
+    /// No response: DNS, refused, timeout, TLS.
+    #[error("{message}")]
+    Network { message: String },
+    /// Any other non-2xx, with the server's `error` text.
+    #[error("server returned {status}: {message}")]
+    Server { status: u16, message: String },
 }
 
-fn sync_err(error: impl std::fmt::Display) -> MobileError {
-    MobileError::Sync {
-        message: error.to_string(),
+impl MobileError {
+    fn sync(error: impl std::fmt::Display) -> Self {
+        MobileError::Sync {
+            message: error.to_string(),
+        }
     }
+}
+
+/// A 401 on a bearer call means the session is gone; on a sign-in call it
+/// means the code was wrong, which is an ordinary server answer.
+fn map_status(status: u16, message: String, bearer_call: bool) -> MobileError {
+    if status == 401 && bearer_call {
+        MobileError::Unauthorized {
+            message: "unauthorized: sign in again".into(),
+        }
+    } else {
+        MobileError::Server { status, message }
+    }
+}
+
+fn from_auth(error: AuthError, bearer_call: bool) -> MobileError {
+    match error {
+        AuthError::Http(error) => MobileError::Network {
+            message: error.to_string(),
+        },
+        AuthError::Server { status, message } => map_status(status.as_u16(), message, bearer_call),
+    }
+}
+
+/// Every `ApiClient` call carries the bearer.
+fn from_api(error: ApiError) -> MobileError {
+    match error {
+        ApiError::Http(error) => MobileError::Network {
+            message: error.to_string(),
+        },
+        ApiError::Unauthorized => map_status(401, String::new(), true),
+        ApiError::UnexpectedStatus { status, body } => {
+            map_status(status.as_u16(), parse_error_body(&body), true)
+        }
+        other @ (ApiError::Crypto(_) | ApiError::Conflict { .. }) => MobileError::sync(other),
+    }
+}
+
+fn from_sync(error: SyncEngineError) -> MobileError {
+    match error {
+        SyncEngineError::Api(error) => from_api(error),
+        other => MobileError::sync(other),
+    }
+}
+
+impl From<CryptoError> for MobileError {
+    fn from(error: CryptoError) -> Self {
+        MobileError::sync(error)
+    }
+}
+
+/// Server error bodies are `{ "error": "<text>" }`; keep the text alone.
+fn parse_error_body(body: &str) -> String {
+    #[derive(serde::Deserialize)]
+    struct Body {
+        error: String,
+    }
+    serde_json::from_str::<Body>(body)
+        .map(|body| body.error)
+        .unwrap_or_else(|_| body.to_string())
 }
 
 /// Connection details for one vault, supplied by the host app.
@@ -211,9 +287,7 @@ fn server_only(server_url: String, api_key: String) -> VaultConfig {
 /// Derive the 32-byte master key from a passphrase and vault ID (the salt).
 #[uniffi::export]
 pub fn derive_master_key(passphrase: String, vault_id: String) -> Result<Vec<u8>, MobileError> {
-    derive_key(&passphrase, vault_id.as_bytes())
-        .map(|key| key.to_vec())
-        .map_err(sync_err)
+    Ok(derive_key(&passphrase, vault_id.as_bytes())?.to_vec())
 }
 
 /// List vaults reachable at a server (OBS-28).
@@ -223,7 +297,7 @@ pub fn list_vaults(
     api_key: String,
 ) -> Result<Vec<MobileVaultSummary>, MobileError> {
     let vaults = block_on(ApiClient::new(server_only(server_url, api_key)).list_vaults())
-        .map_err(sync_err)?;
+        .map_err(from_api)?;
     Ok(vaults.into_iter().map(MobileVaultSummary::from).collect())
 }
 
@@ -240,7 +314,7 @@ pub fn create_vault(
     };
     let response =
         block_on(ApiClient::new(server_only(server_url, api_key)).create_vault(&request))
-            .map_err(sync_err)?;
+            .map_err(from_api)?;
     Ok(response.vault.into())
 }
 
@@ -263,7 +337,7 @@ pub fn validate_vault_key(config: MobileVaultConfig, key: Vec<u8>) -> Result<boo
     let keys = derive_keys(&key);
     let config: VaultConfig = config.into();
     let client = ApiClient::new(config.clone());
-    let manifest = block_on(client.get_manifest(&keys)).map_err(sync_err)?;
+    let manifest = block_on(client.get_manifest(&keys)).map_err(from_api)?;
     let Some(path) = manifest
         .iter()
         .find(|(_, entry)| !entry.deleted)
@@ -271,7 +345,7 @@ pub fn validate_vault_key(config: MobileVaultConfig, key: Vec<u8>) -> Result<boo
     else {
         return Ok(true);
     };
-    let blob = block_on(client.get_file(&path, &keys)).map_err(sync_err)?;
+    let blob = block_on(client.get_file(&path, &keys)).map_err(from_api)?;
     Ok(decrypt(&keys.content_enc, &blob).is_ok())
 }
 
@@ -328,8 +402,23 @@ pub struct MobileVaultUsage {
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct MobileInvite {
     pub code: String,
+    pub created: u64,
     pub expires: u64,
+    /// `active`, `used`, or `expired` (the server decides).
     pub status: String,
+    pub used_at: Option<u64>,
+}
+
+impl From<obsink_core::Invite> for MobileInvite {
+    fn from(invite: obsink_core::Invite) -> Self {
+        MobileInvite {
+            code: invite.code,
+            created: invite.created,
+            expires: invite.expires,
+            status: invite.status,
+            used_at: invite.used_at,
+        }
+    }
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -342,7 +431,8 @@ pub struct MobileDevice {
 
 #[uniffi::export]
 pub fn auth_capabilities(server_url: String) -> Result<MobileCapabilities, MobileError> {
-    let caps = block_on(AuthClient::new(&server_url).capabilities()).map_err(sync_err)?;
+    let caps = block_on(AuthClient::new(&server_url).capabilities())
+        .map_err(|error| from_auth(error, false))?;
     Ok(MobileCapabilities {
         email: caps.auth.email,
         apple: caps.auth.apple,
@@ -354,7 +444,8 @@ pub fn auth_capabilities(server_url: String) -> Result<MobileCapabilities, Mobil
 /// server (`AUTH_DEV_RETURN_CODE=1`), otherwise `None`.
 #[uniffi::export]
 pub fn auth_email_start(server_url: String, email: String) -> Result<Option<String>, MobileError> {
-    let result = block_on(AuthClient::new(&server_url).email_start(&email)).map_err(sync_err)?;
+    let result = block_on(AuthClient::new(&server_url).email_start(&email))
+        .map_err(|error| from_auth(error, false))?;
     Ok(result.code)
 }
 
@@ -372,7 +463,7 @@ pub fn auth_email_verify(
         &device_name,
         clean_invite(invite_code.as_deref()),
     ))
-    .map_err(sync_err)?;
+    .map_err(|error| from_auth(error, false))?;
     Ok(to_mobile_session(session))
 }
 
@@ -403,16 +494,17 @@ pub fn auth_apple(
             clean_invite(invite_code.as_deref()),
         ),
     )
-    .map_err(sync_err)?;
+    .map_err(|error| from_auth(error, false))?;
     Ok(to_mobile_session(session))
 }
 
 #[uniffi::export]
 pub fn auth_me(server_url: String, token: String) -> Result<MobileAccount, MobileError> {
-    let me = block_on(AuthClient::new(&server_url).me(&token)).map_err(sync_err)?;
-    let user = me
-        .user
-        .ok_or_else(|| sync_err("this credential is the operator API key, not an account"))?;
+    let me = block_on(AuthClient::new(&server_url).me(&token))
+        .map_err(|error| from_auth(error, true))?;
+    let user = me.user.ok_or_else(|| {
+        MobileError::sync("this credential is the operator API key, not an account")
+    })?;
     Ok(MobileAccount {
         user_id: user.id,
         email: user.email,
@@ -445,12 +537,9 @@ pub fn auth_me(server_url: String, token: String) -> Result<MobileAccount, Mobil
 /// Mint an invite code so someone else can create an account.
 #[uniffi::export]
 pub fn auth_create_invite(server_url: String, token: String) -> Result<MobileInvite, MobileError> {
-    let invite = block_on(AuthClient::new(&server_url).create_invite(&token)).map_err(sync_err)?;
-    Ok(MobileInvite {
-        code: invite.code,
-        expires: invite.expires,
-        status: invite.status,
-    })
+    let invite = block_on(AuthClient::new(&server_url).create_invite(&token))
+        .map_err(|error| from_auth(error, true))?;
+    Ok(invite.into())
 }
 
 /// Invites this account has minted, newest first.
@@ -459,27 +548,33 @@ pub fn auth_list_invites(
     server_url: String,
     token: String,
 ) -> Result<Vec<MobileInvite>, MobileError> {
-    let invites = block_on(AuthClient::new(&server_url).list_invites(&token)).map_err(sync_err)?;
-    Ok(invites
-        .into_iter()
-        .map(|invite| MobileInvite {
-            code: invite.code,
-            expires: invite.expires,
-            status: invite.status,
-        })
-        .collect())
+    let invites = block_on(AuthClient::new(&server_url).list_invites(&token))
+        .map_err(|error| from_auth(error, true))?;
+    Ok(invites.into_iter().map(MobileInvite::from).collect())
 }
 
 /// Revoke the current session (sign out this device).
 #[uniffi::export]
 pub fn auth_logout(server_url: String, token: String) -> Result<(), MobileError> {
-    block_on(AuthClient::new(&server_url).logout(&token)).map_err(sync_err)
+    block_on(AuthClient::new(&server_url).logout(&token)).map_err(|error| from_auth(error, true))
+}
+
+/// Sign out another device of the same account (`DELETE /auth/sessions/:id`).
+#[uniffi::export]
+pub fn auth_revoke_session(
+    server_url: String,
+    token: String,
+    session_id: String,
+) -> Result<(), MobileError> {
+    block_on(AuthClient::new(&server_url).revoke_session(&token, &session_id))
+        .map_err(|error| from_auth(error, true))
 }
 
 /// Delete the account and every vault it owns. Irreversible.
 #[uniffi::export]
 pub fn auth_delete_account(server_url: String, token: String) -> Result<(), MobileError> {
-    block_on(AuthClient::new(&server_url).delete_account(&token)).map_err(sync_err)
+    block_on(AuthClient::new(&server_url).delete_account(&token))
+        .map_err(|error| from_auth(error, true))
 }
 
 /// Delete a vault (and its server-side blobs) the bearer owns.
@@ -495,7 +590,7 @@ pub fn delete_vault(
         vault_id,
         local_path: String::new(),
     };
-    block_on(ApiClient::new(config).delete_vault()).map_err(sync_err)
+    block_on(ApiClient::new(config).delete_vault()).map_err(from_api)
 }
 
 fn to_mobile_session(session: obsink_core::Session) -> MobileSession {
@@ -669,8 +764,8 @@ impl VaultClient {
             (String::new(), true)
         } else {
             let blob = block_on(ApiClient::new(self.config.clone()).get_file(&path, &keys))
-                .map_err(sync_err)?;
-            let bytes = decrypt(&keys.content_enc, &blob).map_err(sync_err)?;
+                .map_err(from_api)?;
+            let bytes = decrypt(&keys.content_enc, &blob)?;
             (String::from_utf8_lossy(&bytes).into_owned(), false)
         };
 
@@ -688,13 +783,13 @@ impl VaultClient {
     pub fn vault_status(&self) -> Result<MobileVaultStatus, MobileError> {
         let keys = derive_keys(&self.key);
         let local =
-            load_local_state(Path::new(&self.config.local_path), &keys).map_err(sync_err)?;
+            load_local_state(Path::new(&self.config.local_path), &keys).map_err(from_sync)?;
         let remote = block_on(fetch_remote_manifest(
             &ApiClient::new(self.config.clone()),
             Path::new(&self.config.local_path),
             &keys,
         ))
-        .map_err(sync_err)?;
+        .map_err(from_sync)?;
         let diff = diff_local_and_remote(&local.base, &local.working, &remote);
         Ok(MobileVaultStatus {
             pending_uploads: diff.upload.len() as u32,
@@ -714,7 +809,7 @@ impl VaultClient {
         listener: Arc<dyn ProgressListener>,
     ) -> Result<SyncOutcome, MobileError> {
         let sink = ListenerSink(listener);
-        let plan = block_on(prepare_sync(&self.config, &self.key, &sink)).map_err(sync_err)?;
+        let plan = block_on(prepare_sync(&self.config, &self.key, &sink)).map_err(from_sync)?;
         let outcome = SyncOutcome {
             uploaded: plan.upload.len() as u32,
             downloaded: plan.download.len() as u32,
@@ -754,7 +849,7 @@ impl VaultClient {
             &resolutions,
             &sink,
         ))
-        .map_err(sync_err)?;
+        .map_err(from_sync)?;
         // Late 409s become a conflict-only plan so `complete` and
         // `conflict_preview` work for the next round; otherwise nothing pends.
         *self.pending.lock().expect("pending lock") = SyncPlan::from_late_conflicts(&result);
@@ -789,4 +884,66 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
         .build()
         .expect("failed to build Tokio runtime")
         .block_on(future)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_401_is_unauthorized_only_on_bearer_calls() {
+        assert!(matches!(
+            map_status(401, "x".into(), true),
+            MobileError::Unauthorized { .. }
+        ));
+        // A wrong sign-in code is an ordinary server answer.
+        assert!(matches!(
+            map_status(401, "incorrect code".into(), false),
+            MobileError::Server { status: 401, message } if message == "incorrect code"
+        ));
+        assert!(matches!(
+            map_status(403, "invite code is required".into(), true),
+            MobileError::Server { status: 403, .. }
+        ));
+    }
+
+    #[test]
+    fn server_error_bodies_are_unwrapped() {
+        assert_eq!(
+            parse_error_body(r#"{"error":"vault storage limit reached"}"#),
+            "vault storage limit reached"
+        );
+        assert_eq!(parse_error_body("plain text"), "plain text");
+        assert_eq!(parse_error_body(""), "");
+    }
+
+    #[test]
+    fn api_and_sync_errors_map_by_kind() {
+        assert!(matches!(
+            from_api(ApiError::Unauthorized),
+            MobileError::Unauthorized { .. }
+        ));
+        assert!(matches!(
+            from_api(ApiError::Crypto(CryptoError::Decrypt)),
+            MobileError::Sync { .. }
+        ));
+        assert!(matches!(
+            from_sync(SyncEngineError::Api(ApiError::Unauthorized)),
+            MobileError::Unauthorized { .. }
+        ));
+        assert!(matches!(
+            from_sync(SyncEngineError::MissingResolution("a.md".into())),
+            MobileError::Sync { message } if message.contains("a.md")
+        ));
+    }
+
+    #[test]
+    fn a_refused_connection_is_a_network_error() {
+        // Port 9 (discard) is closed on a developer machine; the connection is refused at once.
+        let error = block_on(AuthClient::new("http://127.0.0.1:9").capabilities()).unwrap_err();
+        assert!(matches!(
+            from_auth(error, false),
+            MobileError::Network { .. }
+        ));
+    }
 }

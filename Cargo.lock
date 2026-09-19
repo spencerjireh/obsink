@@ -3434,6 +3434,8 @@ name = "obsink-mobile"
 version = "0.1.0"
 dependencies = [
  "obsink-core",
+ "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "uniffi",
