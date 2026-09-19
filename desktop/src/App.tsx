@@ -3,6 +3,7 @@ import { listen } from '@tauri-apps/api/event'
 import type {
   AccountState,
   AddVaultForm,
+  AuthCapabilities,
   Conflict,
   ConflictPreview,
   InviteInfo,
@@ -19,7 +20,7 @@ import type {
   View,
 } from './types'
 import { call } from './lib/tauri'
-import { isUnauthorized, SESSION_EXPIRED, toCommandError } from './lib/errors'
+import { isInviteRequired, isUnauthorized, SESSION_EXPIRED, toCommandError } from './lib/errors'
 import { emptyForm } from './lib/conflicts'
 import { countRemoteChanges, plural } from './lib/format'
 import { DEFAULT_SERVER_URL, rememberServerUrl, rememberedServerUrl } from './lib/server-url'
@@ -62,6 +63,12 @@ function App() {
   const [inviteCode, setInviteCode] = useState('')
   const [codeSent, setCodeSent] = useState(false)
   const [issuedInvite, setIssuedInvite] = useState<InviteInfo | null>(null)
+  // What `GET /` says about this server; null until the URL has been checked.
+  const [capabilities, setCapabilities] = useState<AuthCapabilities | null>(null)
+  // The server refused a sign-up without an invite: show the field even when
+  // capabilities said none was needed (they can go stale).
+  const [inviteForced, setInviteForced] = useState(false)
+  const [inviteFocusAt, setInviteFocusAt] = useState(0)
   const [remoteVaults, setRemoteVaults] = useState<RemoteVault[] | null>(null)
 
   const currentServerUrl = serverUrl.trim()
@@ -95,15 +102,31 @@ function App() {
     }
   }
 
+  async function refreshCapabilities(url: string) {
+    if (!url || url === DEFAULT_SERVER_URL) {
+      setCapabilities(null)
+      return
+    }
+    try {
+      setCapabilities(await call<AuthCapabilities>('get_auth_capabilities', { serverUrl: url }))
+    } catch (error) {
+      setCapabilities(null)
+      fail(error)
+    }
+  }
+
   useEffect(() => {
     void refreshAccount(currentServerUrl)
+    void refreshCapabilities(currentServerUrl)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   function handleServerUrlBlur() {
     setRemoteVaults(null)
     setCodeSent(false)
+    setInviteForced(false)
     void refreshAccount(currentServerUrl)
+    void refreshCapabilities(currentServerUrl)
   }
 
   async function handleSendCode() {
@@ -147,7 +170,14 @@ function App() {
         next.kind === 'account' ? `Signed in as ${next.email ?? next.user_id}.` : 'Signed in.',
       )
     } catch (error) {
-      fail(error)
+      const failure = toCommandError(error)
+      if (isInviteRequired(failure)) {
+        setInviteForced(true)
+        setInviteFocusAt(Date.now())
+        setMessage('Enter the invite code you were given.')
+      } else {
+        fail(failure)
+      }
     } finally {
       setBusy(false)
     }
@@ -482,6 +512,9 @@ function App() {
             codeSent,
             issuedInvite,
             busy,
+            capabilities,
+            inviteRequired: (capabilities?.invite_required ?? false) || inviteForced,
+            inviteFocusAt,
             onServerUrlChange: setServerUrl,
             onServerUrlBlur: handleServerUrlBlur,
             onAuthEmailChange: setAuthEmail,
