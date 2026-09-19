@@ -828,7 +828,7 @@ fn show_main_window(app: &AppHandle) {
 
 /// Build the menu-bar tray icon and wire its menu and click behavior.
 fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
-    let sync_now = MenuItem::with_id(app, "sync_now", "Sync Now", true, None::<&str>)?;
+    let sync_now = MenuItem::with_id(app, "sync_now", "Sync now", true, None::<&str>)?;
     let show = MenuItem::with_id(app, "show", "Show ObSink", true, None::<&str>)?;
     let separator = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "quit", "Quit ObSink", true, None::<&str>)?;

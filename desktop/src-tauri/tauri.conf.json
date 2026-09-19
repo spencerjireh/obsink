@@ -25,10 +25,10 @@
       {
         "title": "ObSink",
         "label": "main",
-        "width": 1240,
-        "height": 860,
-        "minWidth": 980,
-        "minHeight": 720,
+        "width": 1000,
+        "height": 680,
+        "minWidth": 760,
+        "minHeight": 520,
         "resizable": true
       }
     ],
