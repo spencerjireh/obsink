@@ -19,6 +19,7 @@ import type {
   View,
 } from './types'
 import { call } from './lib/tauri'
+import { isUnauthorized, SESSION_EXPIRED, toCommandError } from './lib/errors'
 import { emptyForm } from './lib/conflicts'
 import { countRemoteChanges, plural } from './lib/format'
 import { DEFAULT_SERVER_URL, rememberServerUrl, rememberedServerUrl } from './lib/server-url'
@@ -41,6 +42,9 @@ function App() {
   const [conflictPreview, setConflictPreview] = useState<ConflictPreview | null>(null)
   const [previewBusy, setPreviewBusy] = useState(false)
   const [view, setView] = useState<View>('vault')
+  // Set by any command that came back 401: the bearer is gone, and the main
+  // pane offers a way back to sign-in.
+  const [sessionExpired, setSessionExpired] = useState(false)
   const [setupFocus, setSetupFocus] = useState<SetupFocus | null>(null)
   const handleSyncRef = useRef<() => Promise<void>>(async () => {})
   // Mirrors `busy` for the tray listener, which only sees refs: a second
@@ -62,15 +66,32 @@ function App() {
 
   const currentServerUrl = serverUrl.trim()
 
+  // Every command failure lands here. A 401 has already cost the bearer on
+  // the Rust side, so the account is signed out from this point.
+  function fail(error: unknown) {
+    const failure = toCommandError(error)
+    if (isUnauthorized(failure)) {
+      setSessionExpired(true)
+      setAccount({ kind: 'signed_out' })
+      setMessage(SESSION_EXPIRED)
+    } else {
+      setMessage(failure.message)
+    }
+  }
+
   async function refreshAccount(url: string) {
     if (!url || url === DEFAULT_SERVER_URL) {
       setAccount(null)
       return
     }
     try {
-      setAccount(await call<AccountState>('get_account', { serverUrl: url }))
+      const next = await call<AccountState>('get_account', { serverUrl: url })
+      setAccount(next)
+      if (next.kind === 'account') {
+        setSessionExpired(false)
+      }
     } catch (error) {
-      setMessage(String(error))
+      fail(error)
     }
   }
 
@@ -101,7 +122,7 @@ function App() {
         setMessage(`Sent a 6-digit code to ${authEmail}.`)
       }
     } catch (error) {
-      setMessage(String(error))
+      fail(error)
     } finally {
       setBusy(false)
     }
@@ -126,7 +147,7 @@ function App() {
         next.kind === 'account' ? `Signed in as ${next.email ?? next.user_id}.` : 'Signed in.',
       )
     } catch (error) {
-      setMessage(String(error))
+      fail(error)
     } finally {
       setBusy(false)
     }
@@ -139,7 +160,7 @@ function App() {
       const invite = await call<InviteInfo>('create_invite', { serverUrl: currentServerUrl })
       setIssuedInvite(invite)
     } catch (error) {
-      setMessage(String(error))
+      fail(error)
     } finally {
       setBusy(false)
     }
@@ -151,7 +172,7 @@ function App() {
       await navigator.clipboard.writeText(issuedInvite.code)
       setMessage('Invite code copied.')
     } catch (error) {
-      setMessage(String(error))
+      fail(error)
     }
   }
 
@@ -165,7 +186,7 @@ function App() {
       setRemoteVaults(null)
       setMessage(`Signed out of ${currentServerUrl}.`)
     } catch (error) {
-      setMessage(String(error))
+      fail(error)
     } finally {
       setBusy(false)
     }
@@ -183,7 +204,7 @@ function App() {
         setForm((current) => ({ ...current, vault_id: list[0].id }))
       }
     } catch (error) {
-      setMessage(String(error))
+      fail(error)
     } finally {
       setBusy(false)
     }
@@ -214,7 +235,7 @@ function App() {
   }
 
   useEffect(() => {
-    refresh().catch((error) => setMessage(String(error)))
+    refresh().catch(fail)
   }, [])
 
   useEffect(() => {
@@ -252,7 +273,7 @@ function App() {
       })
       .catch((error) => {
         if (!cancelled) {
-          setMessage(String(error))
+          fail(error)
           setConflictPreview(null)
         }
       })
@@ -284,7 +305,7 @@ function App() {
       await refreshAccount(currentServerUrl)
       setView('vault')
     } catch (error) {
-      setMessage(String(error))
+      fail(error)
     } finally {
       setBusy(false)
     }
@@ -328,7 +349,7 @@ function App() {
       })
       await applySyncResponse(response, 'Sync complete.')
     } catch (error) {
-      setMessage(String(error))
+      fail(error)
     } finally {
       busyRef.current = false
       setBusy(false)
@@ -398,7 +419,7 @@ function App() {
       })
       await applySyncResponse(response, 'Conflict resolutions applied.')
     } catch (error) {
-      setMessage(String(error))
+      fail(error)
     } finally {
       busyRef.current = false
       setBusy(false)
@@ -418,7 +439,7 @@ function App() {
       setConflictPreview(null)
       await refresh()
     } catch (error) {
-      setMessage(String(error))
+      fail(error)
     } finally {
       setBusy(false)
     }
@@ -489,6 +510,7 @@ function App() {
           busy={busy}
           progress={progress}
           message={message}
+          sessionExpired={sessionExpired}
           staleRemoteChanges={staleRemoteChanges}
           syncResult={syncResult}
           conflicts={conflicts}
@@ -501,6 +523,7 @@ function App() {
           onSelectConflict={setSelectedConflictPath}
           onChoose={(path, choice) => setChoices((current) => ({ ...current, [path]: choice }))}
           onAddVault={() => openSetup('add-vault')}
+          onSignIn={() => openSetup('account')}
         />
       )}
     </div>

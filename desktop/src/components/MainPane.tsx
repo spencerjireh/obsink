@@ -7,6 +7,7 @@ import type {
   SyncResult,
   SyncStatus,
 } from '../types'
+import { SESSION_EXPIRED } from '../lib/errors'
 import { phaseLabel, plural } from '../lib/format'
 import { Conflicts } from './Conflicts'
 import { LastResult } from './LastResult'
@@ -19,6 +20,7 @@ type Props = {
   busy: boolean
   progress: Progress | null
   message: string
+  sessionExpired: boolean
   staleRemoteChanges: number
   syncResult: SyncResult | null
   conflicts: Conflict[]
@@ -31,6 +33,7 @@ type Props = {
   onSelectConflict: (path: string) => void
   onChoose: (path: string, choice: ResolutionChoice) => void
   onAddVault: () => void
+  onSignIn: () => void
 }
 
 export function MainPane({
@@ -39,6 +42,7 @@ export function MainPane({
   busy,
   progress,
   message,
+  sessionExpired,
   staleRemoteChanges,
   syncResult,
   conflicts,
@@ -51,7 +55,23 @@ export function MainPane({
   onSelectConflict,
   onChoose,
   onAddVault,
+  onSignIn,
 }: Props) {
+  const sessionNotice = sessionExpired ? (
+    <Notice
+      kind="warning"
+      action={
+        <button className="button button--ghost" disabled={busy} onClick={onSignIn} type="button">
+          Sign in
+        </button>
+      }
+    >
+      {SESSION_EXPIRED}
+    </Notice>
+  ) : null
+  // The expiry notice carries the same text, so the plain one is redundant.
+  const plainMessage = message && !(sessionExpired && message === SESSION_EXPIRED) ? message : ''
+
   if (!activeVault) {
     return (
       <main className="main">
@@ -64,7 +84,8 @@ export function MainPane({
             Add vault
           </button>
         </header>
-        {message ? <Notice>{message}</Notice> : null}
+        {sessionNotice}
+        {plainMessage ? <Notice>{plainMessage}</Notice> : null}
       </main>
     )
   }
@@ -80,7 +101,12 @@ export function MainPane({
             <code>{activeVault.server_url}</code>
           </p>
         </div>
-        <button className="button button--primary" disabled={busy} onClick={onSync} type="button">
+        <button
+          className="button button--primary"
+          disabled={busy || sessionExpired}
+          onClick={onSync}
+          type="button"
+        >
           {busy ? 'Working…' : 'Sync now'}
         </button>
       </header>
@@ -107,7 +133,8 @@ export function MainPane({
             {plural(staleRemoteChanges, 'file')} changed on another device. Sync before editing.
           </Notice>
         ) : null}
-        {message ? <Notice>{message}</Notice> : null}
+        {sessionNotice}
+        {plainMessage ? <Notice>{plainMessage}</Notice> : null}
         {syncResult?.failures?.length ? <FailureNotice failures={syncResult.failures} /> : null}
       </section>
 
