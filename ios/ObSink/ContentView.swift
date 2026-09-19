@@ -9,9 +9,9 @@ struct ContentView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("Vaults") {
+                Section {
                     if model.entries.isEmpty {
-                        Text("No vault configured. Tap “Add Vault…”.")
+                        Text("No vault yet. Tap Add vault.")
                             .font(.caption).foregroundStyle(.secondary)
                     } else {
                         Picker("Active", selection: Binding(
@@ -24,11 +24,13 @@ struct ContentView: View {
                         }
                         .accessibilityIdentifier("activeVaultPicker")
                     }
-                    Button("Add Vault…") { showingAddVault = true }
+                    Button("Add vault") { showingAddVault = true }
                         .accessibilityIdentifier("addVaultButton")
+                } header: {
+                    Label("Vaults", systemImage: "folder")
                 }
 
-                Section("Status") {
+                Section {
                     Text(model.status)
                         .font(.callout)
                         .foregroundStyle(model.status.hasPrefix("Error") ? .red : .primary)
@@ -41,16 +43,24 @@ struct ContentView: View {
                             .accessibilityIdentifier("staleBanner")
                     }
                     if model.pendingLocalChanges > 0 {
-                        Label("\(model.pendingLocalChanges) local change\(model.pendingLocalChanges == 1 ? "" : "s") — Sync to push", systemImage: "arrow.up.circle")
+                        Label("\(model.pendingLocalChanges) local change\(model.pendingLocalChanges == 1 ? "" : "s") not uploaded yet", systemImage: "arrow.up.circle")
                             .font(.caption)
                             .foregroundStyle(.orange)
                     }
+                    // The one primary action (DESIGN.md §1): full width, amber
+                    // fill with ink text in both appearances. The identifier
+                    // stays on the Button so the UI tests keep finding it.
                     Button(action: model.sync) {
-                        HStack {
-                            if model.busy { ProgressView() }
-                            Text(model.busy ? "Working…" : "Sync Now")
+                        HStack(spacing: 8) {
+                            if model.busy { ProgressView().tint(Color("Ink")) }
+                            Text(model.busy ? "Working…" : "Sync now")
+                                .fontWeight(.semibold)
                         }
+                        .foregroundStyle(Color("Ink"))
+                        .frame(maxWidth: .infinity, minHeight: 32)
                     }
+                    .buttonStyle(.borderedProminent)
+                    .tint(Color("Amber"))
                     .disabled(model.busy || model.vaultID.isEmpty || (model.passphrase.isEmpty && !model.hasStoredKey))
                     .accessibilityIdentifier("syncButton")
 
@@ -64,9 +74,11 @@ struct ContentView: View {
                             }
                         }
                     }
+                } header: {
+                    Label("Status", systemImage: "arrow.triangle.2.circlepath")
                 }
 
-                Section("Account") {
+                Section {
                     if model.hasBearer {
                         Text(model.accountEmail.map { "Signed in as \($0)" } ?? "Signed in")
                             .font(.callout)
@@ -107,13 +119,19 @@ struct ContentView: View {
                     SecureField(model.hasStoredKey ? "Passphrase (saved — not needed)" : "Passphrase", text: $model.passphrase)
                         .accessibilityIdentifier("passphraseField")
                     if model.hasStoredKey {
-                        Text("Key saved in Keychain for this vault.")
+                        Label("Key saved on this device", systemImage: "key.fill")
                             .font(.caption).foregroundStyle(.green)
                     }
+                } header: {
+                    Label("Account", systemImage: "person.crop.circle")
                 }
 
-                if !model.conflicts.isEmpty {
-                    Section("Conflicts") {
+                // Always visible: conflicts are first-class (DESIGN.md §1).
+                Section {
+                    if model.conflicts.isEmpty {
+                        Text("No conflicts. Sync pauses here when both devices changed the same file.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    } else {
                         ForEach(model.conflicts, id: \.path) { conflict in
                             NavigationLink {
                                 ConflictDetailView(
@@ -132,14 +150,16 @@ struct ContentView: View {
                             }
                             .accessibilityIdentifier("conflictRow")
                         }
-                        Button("Apply Resolutions", action: model.resolve)
+                        Button("Apply resolutions", action: model.resolve)
                             .disabled(model.busy)
                             .accessibilityIdentifier("applyResolutionsButton")
                     }
+                } header: {
+                    Label("Conflicts", systemImage: "arrow.triangle.branch")
                 }
 
                 if !model.failures.isEmpty {
-                    Section("Failed this sync") {
+                    Section {
                         ForEach(model.failures, id: \.self) { failure in
                             VStack(alignment: .leading, spacing: 2) {
                                 HStack(spacing: 6) {
@@ -153,6 +173,8 @@ struct ContentView: View {
                                     .foregroundStyle(.secondary)
                             }
                         }
+                    } header: {
+                        Label("Failed this sync", systemImage: "xmark.octagon")
                     }
                 }
             }
@@ -191,24 +213,6 @@ private struct LabeledField: View {
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
                 .accessibilityIdentifier(identifier)
-        }
-    }
-}
-
-private struct SecureLabeledField: View {
-    let label: String
-    @Binding var text: String
-
-    init(_ label: String, text: Binding<String>) {
-        self.label = label
-        self._text = text
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(label).font(.caption).foregroundStyle(.secondary)
-            SecureField(label, text: $text)
-                .accessibilityIdentifier(label)
         }
     }
 }
@@ -399,7 +403,7 @@ struct AddVaultView: View {
                             .disabled(busy || bearer == nil)
                             .accessibilityIdentifier("listVaultsButton")
                         if available.isEmpty {
-                            Text("Tap “List vaults”, then pick one.")
+                            Text("Tap List vaults, then pick one.")
                                 .font(.caption).foregroundStyle(.secondary)
                         } else {
                             Picker("Vault", selection: $pickedVaultID) {
@@ -421,12 +425,12 @@ struct AddVaultView: View {
                         .accessibilityIdentifier("addVaultStatusText")
                 }
                 Section {
-                    Button(mode == .create ? "Create Vault" : "Connect Vault") { submit() }
+                    Button(mode == .create ? "Create vault" : "Connect vault") { submit() }
                         .disabled(!canSubmit)
                         .accessibilityIdentifier("addVaultSubmitButton")
                 }
             }
-            .navigationTitle("Add Vault")
+            .navigationTitle("Add vault")
             .toolbar { Button("Cancel") { dismiss() } }
             .onAppear { refreshSignInState() }
         }

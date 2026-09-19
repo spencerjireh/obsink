@@ -462,7 +462,8 @@ final class SyncModel: ObservableObject {
             signalFileProvider()
             refreshPending()
         } else if !outcome.conflicts.isEmpty {
-            status = "\(outcome.conflicts.count) conflict(s) need attention"
+            let count = outcome.conflicts.count
+            status = count == 1 ? "1 conflict needs attention" : "\(count) conflicts need attention"
             loadPreviews()
         } else {
             status = "Prepared · ↑\(outcome.uploaded) ↓\(outcome.downloaded)\(failedSuffix)"
