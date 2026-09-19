@@ -17,6 +17,10 @@ services:
     build:
       context: .
       dockerfile: server/Dockerfile
+    # No host port; Coolify's Traefik reaches the container on 8080 (the
+    # `expose` tells Coolify which port the domain routes to).
+    expose:
+      - "8080"
     environment:
       DATABASE_URL: postgres://obsink:${POSTGRES_PASSWORD}@postgres:5432/obsink
       OBSINK_SERVER_KEY: ${OBSINK_SERVER_KEY}
