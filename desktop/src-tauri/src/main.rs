@@ -78,19 +78,10 @@ impl ProgressSink for TauriProgressSink {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct StoredAppConfig {
     vaults: Vec<StoredVault>,
     active_vault_id: Option<String>,
-}
-
-impl Default for StoredAppConfig {
-    fn default() -> Self {
-        Self {
-            vaults: Vec::new(),
-            active_vault_id: None,
-        }
-    }
 }
 
 /// One configured vault. The server bearer (session token) is NOT stored
