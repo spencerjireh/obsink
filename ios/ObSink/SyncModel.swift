@@ -97,6 +97,10 @@ final class SyncModel: ObservableObject {
     @Published var passphrase: String = ""
     /// Email of the account behind the active vault (nil when signed out).
     @Published var accountEmail: String?
+    /// Storage usage reported by the server for the signed-in account.
+    @Published var accountUsage: MobileUsage?
+    /// The most recently minted invite code, shown until dismissed.
+    @Published var issuedInvite: MobileInvite?
     @Published var hasBearer: Bool = false
 
     @Published var status: String = "Not synced"
@@ -178,6 +182,8 @@ final class SyncModel: ObservableObject {
         passphrase = ""
         hasBearer = KeychainStore.loadBearer(serverURL: serverURL) != nil
         accountEmail = nil
+        accountUsage = nil
+        issuedInvite = nil
         refreshAccount()
     }
 
@@ -187,12 +193,44 @@ final class SyncModel: ObservableObject {
         guard let token = KeychainStore.loadBearer(serverURL: serverURL) else { return }
         let url = serverURL
         Task.detached { [weak self] in
-            let email = (try? authMe(serverUrl: url, token: token))?.email
+            let account = try? authMe(serverUrl: url, token: token)
             await MainActor.run { [weak self] in
                 guard let self, self.serverURL == url else { return }
-                self.accountEmail = email
+                self.accountEmail = account?.email
+                self.accountUsage = account?.usage
             }
         }
+    }
+
+    /// Mint an invite code for someone else to join this server.
+    func createInvite() {
+        guard let token = KeychainStore.loadBearer(serverURL: serverURL) else { return }
+        let url = serverURL
+        Task.detached { [weak self] in
+            do {
+                let invite = try authCreateInvite(serverUrl: url, token: token)
+                await MainActor.run { [weak self] in self?.issuedInvite = invite }
+            } catch {
+                await MainActor.run { [weak self] in self?.status = "Invite failed: \(error.localizedDescription)" }
+            }
+        }
+    }
+
+    /// "12 MB used · 2 of 10 vaults · 1 GB per vault", or nil when unknown.
+    var usageText: String? {
+        guard let usage = accountUsage else { return nil }
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        var parts = [formatter.string(fromByteCount: Int64(usage.totalBytes)) + " used"]
+        if let maxVaults = usage.maxVaults {
+            parts.append("\(usage.vaults.count) of \(maxVaults) vaults")
+        } else {
+            parts.append("\(usage.vaults.count) vaults")
+        }
+        if let perVault = usage.maxVaultBytes {
+            parts.append(formatter.string(fromByteCount: Int64(perVault)) + " per vault")
+        }
+        return parts.joined(separator: " · ")
     }
 
     /// Sign out of the active vault's server: revoke the session (best effort)
@@ -204,6 +242,8 @@ final class SyncModel: ObservableObject {
         }
         KeychainStore.deleteBearer(serverURL: url)
         accountEmail = nil
+        accountUsage = nil
+        issuedInvite = nil
         hasBearer = false
         status = "Signed out"
     }

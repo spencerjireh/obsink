@@ -7,8 +7,8 @@ use tracing::{debug, warn};
 
 use crate::crypto::{decrypt_path, encrypt_path, path_token, CryptoError, CryptoKeys};
 use crate::types::{
-    BatchRequest, BatchResponse, CreateVaultRequest, CreateVaultResponse, Manifest, ServerConflict,
-    VaultConfig, VaultSummary,
+    BatchOp, BatchOperationResult, BatchResponse, CreateVaultRequest, CreateVaultResponse,
+    Manifest, ServerConflict, VaultConfig, VaultSummary,
 };
 
 /// Per-request timeout. Bounds hangs on a stalled connection.
@@ -130,13 +130,40 @@ impl ApiClient {
     /// real path, decrypting each entry's `encPath`. Entries the caller's key
     /// can't decrypt are skipped (different vault key or corruption).
     pub async fn get_manifest(&self, keys: &CryptoKeys) -> Result<Manifest, ApiError> {
-        debug!("fetching manifest");
-        let request = self
+        match self.get_manifest_if_changed(keys, None).await? {
+            ManifestFetch::Modified { manifest, .. } => Ok(manifest),
+            // Without a validator the server cannot answer 304; treat it as empty.
+            ManifestFetch::NotModified => Ok(Manifest::new()),
+        }
+    }
+
+    /// Conditional manifest fetch. With `if_none_match` set to the ETag of the
+    /// last copy, an unchanged manifest comes back as [`ManifestFetch::NotModified`]
+    /// with no body. Servers without ETags always return `Modified` with
+    /// `etag: None`.
+    pub async fn get_manifest_if_changed(
+        &self,
+        keys: &CryptoKeys,
+        if_none_match: Option<&str>,
+    ) -> Result<ManifestFetch, ApiError> {
+        debug!(conditional = if_none_match.is_some(), "fetching manifest");
+        let mut request = self
             .client
             .get(self.vault_url("manifest"))
             .bearer_auth(&self.config.api_key);
-
-        let raw: Manifest = parse_json(self.send_with_retry(request).await?).await?;
+        if let Some(etag) = if_none_match {
+            request = request.header("If-None-Match", etag);
+        }
+        let response = self.send_with_retry(request).await?;
+        if response.status() == StatusCode::NOT_MODIFIED {
+            return Ok(ManifestFetch::NotModified);
+        }
+        let etag = response
+            .headers()
+            .get("etag")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let raw: Manifest = parse_json(response).await?;
         let mut decoded = Manifest::new();
         for entry in raw.into_values() {
             if entry.enc_path.is_empty() {
@@ -146,7 +173,10 @@ impl ApiClient {
             decoded.insert(path, entry);
         }
 
-        Ok(decoded)
+        Ok(ManifestFetch::Modified {
+            manifest: decoded,
+            etag,
+        })
     }
 
     pub async fn get_file(&self, path: &str, keys: &CryptoKeys) -> Result<Vec<u8>, ApiError> {
@@ -206,15 +236,109 @@ impl ApiClient {
         parse_empty(path, self.send_with_retry(request).await?).await
     }
 
-    pub async fn batch(&self, request: &BatchRequest) -> Result<BatchResponse, ApiError> {
-        let http_request = self
+    /// Send several puts/deletes in one `multipart/form-data` request: an
+    /// `operations` JSON part plus one `content` part per put, named by
+    /// operation index. Results come back keyed by real path. Sent once (a
+    /// multipart body cannot be cloned for the retry loop); the per-operation
+    /// parent-hash gate makes a resend safe anyway.
+    pub async fn batch(
+        &self,
+        operations: &[BatchOp],
+        keys: &CryptoKeys,
+    ) -> Result<Vec<BatchOperationResult>, ApiError> {
+        let mut wire = Vec::with_capacity(operations.len());
+        let mut form = reqwest::multipart::Form::new();
+        let mut real_paths = Vec::with_capacity(operations.len());
+        for (index, op) in operations.iter().enumerate() {
+            match op {
+                BatchOp::Put {
+                    path,
+                    parent_hash,
+                    content_hash,
+                    content,
+                } => {
+                    wire.push(WireBatchOperation {
+                        action: "put",
+                        path: path_token(&keys.path_token, path),
+                        parent_hash: parent_hash.clone(),
+                        content_hash: Some(content_hash.clone()),
+                        enc_path: Some(encrypt_path(&keys.path_enc, path)?),
+                    });
+                    form = form.part(
+                        "content",
+                        reqwest::multipart::Part::bytes(content.clone())
+                            .file_name(index.to_string())
+                            .mime_str("application/octet-stream")
+                            .map_err(ApiError::Http)?,
+                    );
+                    real_paths.push(path.clone());
+                }
+                BatchOp::Delete { path, parent_hash } => {
+                    wire.push(WireBatchOperation {
+                        action: "delete",
+                        path: path_token(&keys.path_token, path),
+                        parent_hash: parent_hash.clone(),
+                        content_hash: None,
+                        enc_path: None,
+                    });
+                    real_paths.push(path.clone());
+                }
+            }
+        }
+        let operations_json = serde_json::to_string(&serde_json::json!({ "operations": wire }))
+            .map_err(|error| ApiError::UnexpectedStatus {
+                status: StatusCode::BAD_REQUEST,
+                body: error.to_string(),
+            })?;
+        let form = form.part(
+            "operations",
+            reqwest::multipart::Part::text(operations_json)
+                .mime_str("application/json")
+                .map_err(ApiError::Http)?,
+        );
+        debug!(operations = operations.len(), "sending batch");
+        let response = self
             .client
             .post(self.vault_url("batch"))
             .bearer_auth(&self.config.api_key)
-            .json(request);
-
-        parse_json(self.send_with_retry(http_request).await?).await
+            .multipart(form)
+            .send()
+            .await?;
+        let parsed: BatchResponse = parse_json(response).await?;
+        Ok(parsed
+            .results
+            .into_iter()
+            .enumerate()
+            .map(|(index, result)| BatchOperationResult {
+                path: real_paths.get(index).cloned().unwrap_or(result.path),
+                status: result.status,
+                conflict: result.conflict,
+            })
+            .collect())
     }
+}
+
+/// Outcome of a conditional manifest fetch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManifestFetch {
+    Modified {
+        manifest: Manifest,
+        etag: Option<String>,
+    },
+    NotModified,
+}
+
+/// One batch operation as the server sees it (path token, no bytes).
+#[derive(serde::Serialize)]
+struct WireBatchOperation {
+    action: &'static str,
+    path: String,
+    #[serde(rename = "parentHash", skip_serializing_if = "Option::is_none")]
+    parent_hash: Option<String>,
+    #[serde(rename = "contentHash", skip_serializing_if = "Option::is_none")]
+    content_hash: Option<String>,
+    #[serde(rename = "encPath", skip_serializing_if = "Option::is_none")]
+    enc_path: Option<String>,
 }
 
 async fn parse_json<T: DeserializeOwned>(response: Response) -> Result<T, ApiError> {
@@ -269,11 +393,11 @@ async fn parse_empty(path: &str, response: Response) -> Result<(), ApiError> {
 
 #[cfg(test)]
 mod tests {
-    use httpmock::{Method::GET, Method::PUT, MockServer};
+    use httpmock::{Method::GET, Method::POST, Method::PUT, MockServer};
 
-    use super::{ApiClient, ApiError};
+    use super::{ApiClient, ApiError, ManifestFetch};
     use crate::crypto::{derive_key, derive_keys, encrypt_path, path_token, CryptoKeys};
-    use crate::types::{FileEntry, VaultConfig};
+    use crate::types::{BatchOp, FileEntry, VaultConfig};
 
     fn config(base_url: String) -> VaultConfig {
         VaultConfig {
@@ -372,5 +496,106 @@ mod tests {
             }
             other => panic!("expected conflict error, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn manifest_304_returns_not_modified() {
+        let keys = test_keys();
+        let server = MockServer::start_async().await;
+        let fresh = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/vaults/vault_123/manifest")
+                    .matches(|req| {
+                        !req.headers.as_ref().is_some_and(|headers| {
+                            headers
+                                .iter()
+                                .any(|(name, _)| name.eq_ignore_ascii_case("if-none-match"))
+                        })
+                    });
+                then.status(200)
+                    .header("etag", "\"7\"")
+                    .json_body_obj(&serde_json::json!({}));
+            })
+            .await;
+        let cached = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/vaults/vault_123/manifest")
+                    .header("if-none-match", "\"7\"");
+                then.status(304).header("etag", "\"7\"");
+            })
+            .await;
+
+        let client = ApiClient::new(config(server.base_url()));
+        let first = client.get_manifest_if_changed(&keys, None).await.unwrap();
+        assert_eq!(
+            first,
+            ManifestFetch::Modified {
+                manifest: Default::default(),
+                etag: Some("\"7\"".to_string())
+            }
+        );
+        let second = client
+            .get_manifest_if_changed(&keys, Some("\"7\""))
+            .await
+            .unwrap();
+        assert_eq!(second, ManifestFetch::NotModified);
+        fresh.assert_async().await;
+        cached.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn batch_sends_multipart() {
+        let keys = test_keys();
+        let token = path_token(&keys.path_token, "note.md");
+        let del_token = path_token(&keys.path_token, "old.md");
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/vaults/vault_123/batch")
+                    .header("authorization", "Bearer token")
+                    .header_exists("content-type")
+                    .body_contains("name=\"operations\"")
+                    .body_contains("name=\"content\"; filename=\"0\"")
+                    .body_contains(&format!("\"path\":\"{token}\""))
+                    .body_contains("\"contentHash\":\"h1\"")
+                    .body_contains("\"action\":\"delete\"")
+                    .body_contains("payload-bytes");
+                then.status(200).json_body_obj(&serde_json::json!({
+                    "results": [
+                        { "path": token, "status": 200, "conflict": null },
+                        { "path": del_token, "status": 409, "conflict": { "path": del_token, "current": null } }
+                    ]
+                }));
+            })
+            .await;
+
+        let client = ApiClient::new(config(server.base_url()));
+        let results = client
+            .batch(
+                &[
+                    BatchOp::Put {
+                        path: "note.md".to_string(),
+                        parent_hash: None,
+                        content_hash: "h1".to_string(),
+                        content: b"payload-bytes".to_vec(),
+                    },
+                    BatchOp::Delete {
+                        path: "old.md".to_string(),
+                        parent_hash: Some("h0".to_string()),
+                    },
+                ],
+                &keys,
+            )
+            .await
+            .unwrap();
+        mock.assert_async().await;
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].path, "note.md");
+        assert_eq!(results[0].status, 200);
+        assert_eq!(results[1].path, "old.md");
+        assert_eq!(results[1].status, 409);
     }
 }

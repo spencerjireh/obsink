@@ -1,7 +1,7 @@
 use std::{
     fs,
     io::{self, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
 };
 
@@ -9,9 +9,9 @@ use clap::{Parser, Subcommand};
 use dirs::home_dir;
 use obsink_core::{
     build_manifest_from_dir, complete_sync, derive_key, derive_keys, diff_local_and_remote,
-    normalize_server_url, prepare_sync, sync_manifest_path, ApiClient, AuthClient, Conflict,
-    ConflictResolution, ConflictResolutionChoice, CreateVaultRequest, KeyBytes, ProgressEvent,
-    ProgressSink, SyncActionKind, SyncPhase, VaultConfig,
+    fetch_remote_manifest, normalize_server_url, prepare_sync, sync_manifest_path, ApiClient,
+    AuthClient, Conflict, ConflictResolution, ConflictResolutionChoice, CreateVaultRequest,
+    KeyBytes, ProgressEvent, ProgressSink, SyncActionKind, SyncPhase, VaultConfig,
 };
 use rpassword::prompt_password;
 use serde::{Deserialize, Serialize};
@@ -69,6 +69,17 @@ enum Commands {
         server_url: Option<String>,
         #[arg(long)]
         device_name: Option<String>,
+        /// Needed to create a new account once the server has any user.
+        #[arg(long)]
+        invite_code: Option<String>,
+    },
+    /// Mint an invite code so someone else can create an account.
+    Invite {
+        #[arg(long, env = "OBSINK_SERVER_URL")]
+        server_url: Option<String>,
+        /// List the invites you have minted instead of creating one.
+        #[arg(long)]
+        list: bool,
     },
     /// Sign out this device (revokes the session and forgets the credential).
     Logout {
@@ -154,6 +165,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             code,
             server_url,
             device_name,
+            invite_code,
         } => {
             let url = resolve_server_url(server_url.as_deref())?;
             let auth = AuthClient::new(&url);
@@ -181,7 +193,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             let device = device_name.unwrap_or_else(default_device_name);
-            let session = auth.email_verify(&email, code.trim(), &device).await?;
+            let session = match auth
+                .email_verify(&email, code.trim(), &device, invite_code.as_deref())
+                .await
+            {
+                Ok(session) => session,
+                Err(obsink_core::AuthError::Server { status, message })
+                    if status.as_u16() == 403 && invite_code.is_none() =>
+                {
+                    return Err(format!("{message} (pass --invite-code)").into());
+                }
+                Err(error) => return Err(error.into()),
+            };
             save_secret(&bearer_account(&url), &session.token)?;
             println!(
                 "signed in as {} on {url}",
@@ -227,6 +250,39 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 None => println!("credential: operator API key ({})", me.kind),
+            }
+            if let Some(usage) = me.usage {
+                let limit = match (usage.max_vault_bytes, usage.max_vaults) {
+                    (Some(bytes), Some(vaults)) => {
+                        format!("; limit {bytes} bytes per vault, {vaults} vaults")
+                    }
+                    _ => String::new(),
+                };
+                println!(
+                    "usage: {} bytes across {} vault(s){limit}",
+                    usage.total_bytes,
+                    usage.vaults.len()
+                );
+                for vault in usage.vaults {
+                    println!("  vault {}: {} bytes", vault.id, vault.bytes);
+                }
+            }
+        }
+        Commands::Invite { server_url, list } => {
+            let url = resolve_server_url(server_url.as_deref())?;
+            let token = load_secret(&bearer_account(&url))
+                .map_err(|_| format!("not signed in to {url}; run `obsink login`"))?;
+            let auth = AuthClient::new(&url);
+            if list {
+                for invite in auth.list_invites(&token).await? {
+                    println!(
+                        "{} {} (expires {})",
+                        invite.code, invite.status, invite.expires
+                    );
+                }
+            } else {
+                let invite = auth.create_invite(&token).await?;
+                println!("invite code: {} (expires {})", invite.code, invite.expires);
             }
         }
         Commands::Vaults { server } => {
@@ -311,9 +367,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("files: {}", manifest.len());
             println!("bytes: {total_size}");
 
-            let remote = ApiClient::new(to_vault_config(&stored)?)
-                .get_manifest(&keys)
-                .await?;
+            let remote = fetch_remote_manifest(
+                &ApiClient::new(to_vault_config(&stored)?),
+                &directory,
+                &keys,
+            )
+            .await?;
             let diff = diff_local_and_remote(&manifest, &remote);
             println!("upload: {}", diff.upload.len());
             println!("download: {}", diff.download.len());
@@ -506,7 +565,7 @@ async fn validate_passphrase(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let keys = derive_keys(key);
     let client = ApiClient::new(to_vault_config(config)?);
-    let manifest = client.get_manifest(&keys).await?;
+    let manifest = fetch_remote_manifest(&client, Path::new(&config.local_path), &keys).await?;
 
     if let Some((path, entry)) = manifest.iter().find(|(_, entry)| !entry.deleted) {
         let blob = client.get_file(path, &keys).await?;

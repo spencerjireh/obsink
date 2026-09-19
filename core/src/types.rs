@@ -99,27 +99,19 @@ pub struct ServerConflict {
     pub current: Option<FileEntry>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BatchRequest {
-    pub operations: Vec<BatchOperation>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "action", rename_all = "lowercase")]
-pub enum BatchOperation {
+/// One operation for [`ApiClient::batch`](crate::ApiClient::batch). Paths are
+/// real (plaintext-side) paths; the client tokenises them on the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BatchOp {
     Put {
         path: String,
-        #[serde(rename = "parentHash")]
         parent_hash: Option<String>,
-        #[serde(rename = "contentHash")]
         content_hash: String,
-        content: String,
-        #[serde(default, rename = "encPath")]
-        enc_path: String,
+        /// Encrypted blob bytes, sent raw as a multipart part.
+        content: Vec<u8>,
     },
     Delete {
         path: String,
-        #[serde(rename = "parentHash")]
         parent_hash: Option<String>,
     },
 }

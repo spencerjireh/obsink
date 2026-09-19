@@ -71,6 +71,24 @@ struct ContentView: View {
                         Text(model.accountEmail.map { "Signed in as \($0)" } ?? "Signed in")
                             .font(.callout)
                             .accessibilityIdentifier("accountText")
+                        if let usage = model.usageText {
+                            Text(usage).font(.caption).foregroundStyle(.secondary)
+                                .accessibilityIdentifier("usageText")
+                        }
+                        Button("Invite someone") { model.createInvite() }
+                            .disabled(model.busy)
+                            .accessibilityIdentifier("inviteButton")
+                        if let invite = model.issuedInvite {
+                            HStack {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Invite code").font(.caption).foregroundStyle(.secondary)
+                                    Text(invite.code).font(.body.monospaced()).textSelection(.enabled)
+                                        .accessibilityIdentifier("inviteCodeText")
+                                }
+                                Spacer()
+                                Button("Copy") { UIPasteboard.general.string = invite.code }
+                            }
+                        }
                         Button("Sign out", role: .destructive) { model.signOut() }
                             .disabled(model.busy)
                             .accessibilityIdentifier("signOutButton")
@@ -294,7 +312,13 @@ struct AddVaultView: View {
     @State private var signedIn = false
     @State private var authEmail = ""
     @State private var authCode = ""
+    @State private var inviteCode = ""
     @State private var codeSent = false
+
+    private var inviteOrNil: String? {
+        let trimmed = inviteCode.trimmingCharacters(in: .whitespaces)
+        return trimmed.isEmpty ? nil : trimmed
+    }
 
     private enum Mode: String, CaseIterable, Identifiable {
         case create = "Create", connect = "Connect"
@@ -405,6 +429,9 @@ struct AddVaultView: View {
             LabeledField("Email", text: $authEmail, identifier: "addVaultEmail")
                 .keyboardType(.emailAddress)
                 .disabled(codeSent)
+            LabeledField("Invite code (new accounts only)", text: $inviteCode, identifier: "addVaultInviteCode")
+                .textInputAutocapitalization(.characters)
+                .autocorrectionDisabled()
             if codeSent {
                 LabeledField("6-digit code", text: $authCode, identifier: "addVaultCode")
                     .keyboardType(.numberPad)
@@ -463,9 +490,10 @@ struct AddVaultView: View {
         busy = true; status = ""
         let url = canonicalURL, email = authEmail.trimmingCharacters(in: .whitespaces)
         let code = authCode.trimmingCharacters(in: .whitespaces), device = Self.deviceName
+        let invite = inviteOrNil
         Task.detached {
             do {
-                let session = try authEmailVerify(serverUrl: url, email: email, code: code, deviceName: device)
+                let session = try authEmailVerify(serverUrl: url, email: email, code: code, deviceName: device, inviteCode: invite)
                 KeychainStore.saveBearer(session.token, serverURL: url)
                 await MainActor.run {
                     accountEmail = session.email
@@ -497,9 +525,10 @@ struct AddVaultView: View {
             }
             busy = true; status = ""
             let url = canonicalURL, email = credential.email, device = Self.deviceName
+            let invite = inviteOrNil
             Task.detached {
                 do {
-                    let session = try authApple(serverUrl: url, identityToken: identityToken, deviceName: device, email: email)
+                    let session = try authApple(serverUrl: url, identityToken: identityToken, deviceName: device, email: email, inviteCode: invite)
                     KeychainStore.saveBearer(session.token, serverURL: url)
                     await MainActor.run {
                         accountEmail = session.email

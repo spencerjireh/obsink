@@ -322,6 +322,23 @@ input {
   background: rgba(243, 184, 90, 0.08);
 }
 
+.invite-box {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: -8px 0 18px;
+  padding: 10px 14px;
+  border-radius: 16px;
+  border: 1px dashed rgba(243, 184, 90, 0.4);
+  font-size: 0.9rem;
+}
+
+.invite-box code {
+  font-size: 1rem;
+  letter-spacing: 0.08em;
+}
+
 .form-grid select {
   width: 100%;
   border-radius: 16px;

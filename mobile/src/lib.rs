@@ -14,9 +14,10 @@ use std::{
 
 use obsink_core::{
     build_working_manifest_for_path, complete_sync, decrypt, derive_key, derive_keys,
-    diff_local_and_remote, normalize_server_url, prepare_sync, ApiClient, AuthClient,
-    ConflictResolution, ConflictResolutionChoice, CreateVaultRequest, KeyBytes, ProgressEvent,
-    ProgressSink, SyncActionKind, SyncFailure, SyncPhase, SyncPlan, VaultConfig, VaultSummary,
+    diff_local_and_remote, fetch_remote_manifest, normalize_server_url, prepare_sync, ApiClient,
+    AuthClient, ConflictResolution, ConflictResolutionChoice, CreateVaultRequest, KeyBytes,
+    ProgressEvent, ProgressSink, SyncActionKind, SyncFailure, SyncPhase, SyncPlan, VaultConfig,
+    VaultSummary,
 };
 
 uniffi::setup_scaffolding!();
@@ -257,6 +258,8 @@ pub fn canonical_server_url(url: String) -> String {
 pub struct MobileCapabilities {
     pub email: bool,
     pub apple: bool,
+    /// New accounts need an invite code once the server has any user.
+    pub invite_required: bool,
 }
 
 /// A signed-in session: `token` is the bearer to store in the Keychain.
@@ -274,6 +277,29 @@ pub struct MobileAccount {
     pub user_id: String,
     pub email: Option<String>,
     pub devices: Vec<MobileDevice>,
+    pub usage: Option<MobileUsage>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MobileUsage {
+    pub total_bytes: u64,
+    pub max_vault_bytes: Option<u64>,
+    pub max_vaults: Option<u32>,
+    pub vaults: Vec<MobileVaultUsage>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MobileVaultUsage {
+    pub id: String,
+    pub bytes: u64,
+}
+
+/// An invite code for someone else to create an account.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MobileInvite {
+    pub code: String,
+    pub expires: u64,
+    pub status: String,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -290,6 +316,7 @@ pub fn auth_capabilities(server_url: String) -> Result<MobileCapabilities, Mobil
     Ok(MobileCapabilities {
         email: caps.auth.email,
         apple: caps.auth.apple,
+        invite_required: caps.invite_required,
     })
 }
 
@@ -307,10 +334,20 @@ pub fn auth_email_verify(
     email: String,
     code: String,
     device_name: String,
+    invite_code: Option<String>,
 ) -> Result<MobileSession, MobileError> {
-    let session = block_on(AuthClient::new(&server_url).email_verify(&email, &code, &device_name))
-        .map_err(sync_err)?;
+    let session = block_on(AuthClient::new(&server_url).email_verify(
+        &email,
+        &code,
+        &device_name,
+        clean_invite(invite_code.as_deref()),
+    ))
+    .map_err(sync_err)?;
     Ok(to_mobile_session(session))
+}
+
+fn clean_invite(code: Option<&str>) -> Option<&str> {
+    code.map(str::trim).filter(|code| !code.is_empty())
 }
 
 /// Exchange an Apple identity token (from `ASAuthorizationAppleIDCredential`)
@@ -322,11 +359,13 @@ pub fn auth_apple(
     identity_token: String,
     device_name: String,
     email: Option<String>,
+    invite_code: Option<String>,
 ) -> Result<MobileSession, MobileError> {
     let session = block_on(AuthClient::new(&server_url).apple_sign_in(
         &identity_token,
         &device_name,
         email.as_deref(),
+        clean_invite(invite_code.as_deref()),
     ))
     .map_err(sync_err)?;
     Ok(to_mobile_session(session))
@@ -351,7 +390,48 @@ pub fn auth_me(server_url: String, token: String) -> Result<MobileAccount, Mobil
                 current: session.current,
             })
             .collect(),
+        usage: me.usage.map(|usage| MobileUsage {
+            total_bytes: usage.total_bytes,
+            max_vault_bytes: usage.max_vault_bytes,
+            max_vaults: usage.max_vaults,
+            vaults: usage
+                .vaults
+                .into_iter()
+                .map(|vault| MobileVaultUsage {
+                    id: vault.id,
+                    bytes: vault.bytes,
+                })
+                .collect(),
+        }),
     })
+}
+
+/// Mint an invite code so someone else can create an account.
+#[uniffi::export]
+pub fn auth_create_invite(server_url: String, token: String) -> Result<MobileInvite, MobileError> {
+    let invite = block_on(AuthClient::new(&server_url).create_invite(&token)).map_err(sync_err)?;
+    Ok(MobileInvite {
+        code: invite.code,
+        expires: invite.expires,
+        status: invite.status,
+    })
+}
+
+/// Invites this account has minted, newest first.
+#[uniffi::export]
+pub fn auth_list_invites(
+    server_url: String,
+    token: String,
+) -> Result<Vec<MobileInvite>, MobileError> {
+    let invites = block_on(AuthClient::new(&server_url).list_invites(&token)).map_err(sync_err)?;
+    Ok(invites
+        .into_iter()
+        .map(|invite| MobileInvite {
+            code: invite.code,
+            expires: invite.expires,
+            status: invite.status,
+        })
+        .collect())
 }
 
 /// Revoke the current session (sign out this device).
@@ -578,8 +658,12 @@ impl VaultClient {
         let keys = derive_keys(&self.key);
         let local = build_working_manifest_for_path(Path::new(&self.config.local_path), &keys)
             .map_err(sync_err)?;
-        let remote =
-            block_on(ApiClient::new(self.config.clone()).get_manifest(&keys)).map_err(sync_err)?;
+        let remote = block_on(fetch_remote_manifest(
+            &ApiClient::new(self.config.clone()),
+            Path::new(&self.config.local_path),
+            &keys,
+        ))
+        .map_err(sync_err)?;
         let diff = diff_local_and_remote(&local, &remote);
         Ok(MobileVaultStatus {
             pending_uploads: diff.upload.len() as u32,

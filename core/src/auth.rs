@@ -48,6 +48,9 @@ pub enum AuthError {
 pub struct Capabilities {
     pub service: String,
     pub auth: AuthMethods,
+    /// True once the server has an account: new sign-ups need an invite code.
+    #[serde(default)]
+    pub invite_required: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +85,43 @@ pub struct Me {
     pub user: Option<MeUser>,
     #[serde(default)]
     pub sessions: Vec<MeSession>,
+    /// Storage accounting for the principal's vaults.
+    #[serde(default)]
+    pub usage: Option<Usage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Usage {
+    #[serde(default)]
+    pub vaults: Vec<VaultUsage>,
+    pub total_bytes: u64,
+    /// `None` for the operator bearer, which has no limits.
+    pub max_vault_bytes: Option<u64>,
+    pub max_vaults: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VaultUsage {
+    pub id: String,
+    pub bytes: u64,
+}
+
+/// An invite code that lets one new account sign up (spec §4.1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Invite {
+    pub code: String,
+    #[serde(default)]
+    pub created: u64,
+    pub expires: u64,
+    /// `active`, `used`, or `expired`.
+    #[serde(default = "default_invite_status")]
+    pub status: String,
+    #[serde(default)]
+    pub used_at: Option<u64>,
+}
+
+fn default_invite_status() -> String {
+    "active".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,13 +190,21 @@ impl AuthClient {
         .await
     }
 
+    /// Trade a one-time code for a session. `invite_code` is needed only when
+    /// this email has no account yet and the server already has users.
     pub async fn email_verify(
         &self,
         email: &str,
         code: &str,
         device_name: &str,
+        invite_code: Option<&str>,
     ) -> Result<Session, AuthError> {
-        let body = serde_json::json!({ "email": email, "code": code, "device_name": device_name });
+        let body = serde_json::json!({
+            "email": email,
+            "code": code,
+            "device_name": device_name,
+            "invite_code": invite_code,
+        });
         parse(
             self.client
                 .post(self.url("auth/email/verify"))
@@ -175,11 +223,13 @@ impl AuthClient {
         identity_token: &str,
         device_name: &str,
         email: Option<&str>,
+        invite_code: Option<&str>,
     ) -> Result<Session, AuthError> {
         let body = serde_json::json!({
             "identity_token": identity_token,
             "device_name": device_name,
             "email": email,
+            "invite_code": invite_code,
         });
         parse(
             self.client
@@ -236,6 +286,40 @@ impl AuthClient {
                 .await?,
         )
         .await
+    }
+
+    /// Mint an invite code for someone else to create an account.
+    pub async fn create_invite(&self, token: &str) -> Result<Invite, AuthError> {
+        #[derive(Deserialize)]
+        struct Body {
+            invite: Invite,
+        }
+        let body: Body = parse(
+            self.client
+                .post(self.url("auth/invites"))
+                .bearer_auth(token)
+                .send()
+                .await?,
+        )
+        .await?;
+        Ok(body.invite)
+    }
+
+    /// Invites this principal has minted, newest first.
+    pub async fn list_invites(&self, token: &str) -> Result<Vec<Invite>, AuthError> {
+        #[derive(Deserialize)]
+        struct Body {
+            invites: Vec<Invite>,
+        }
+        let body: Body = parse(
+            self.client
+                .get(self.url("auth/invites"))
+                .bearer_auth(token)
+                .send()
+                .await?,
+        )
+        .await?;
+        Ok(body.invites)
     }
 }
 
@@ -307,7 +391,9 @@ mod tests {
             .await;
         let verify = server
             .mock_async(|when, then| {
-                when.method(POST).path("/auth/email/verify");
+                when.method(POST).path("/auth/email/verify").json_body(serde_json::json!({
+                    "email": "a@b.co", "code": "123456", "device_name": "cli", "invite_code": "ABCD2345"
+                }));
                 then.status(200).json_body(serde_json::json!({
                     "token": "os_abc",
                     "session": { "id": "ses_1", "expires": 99 },
@@ -323,7 +409,9 @@ mod tests {
                 then.status(200).json_body(serde_json::json!({
                     "kind": "user",
                     "user": { "id": "usr_1", "email": "a@b.co", "created": 1 },
-                    "sessions": [{ "id": "ses_1", "deviceName": "cli", "created": 1, "current": true }]
+                    "sessions": [{ "id": "ses_1", "deviceName": "cli", "created": 1, "current": true }],
+                    "usage": { "vaults": [{ "id": "vault_1", "bytes": 12 }], "total_bytes": 12,
+                               "max_vault_bytes": 1024, "max_vaults": 10 }
                 }));
             })
             .await;
@@ -337,12 +425,16 @@ mod tests {
         let client = AuthClient::new(&server.base_url());
         assert!(client.email_start("a@b.co").await.unwrap().sent);
         let session = client
-            .email_verify("a@b.co", "123456", "cli")
+            .email_verify("a@b.co", "123456", "cli", Some("ABCD2345"))
             .await
             .unwrap();
         assert_eq!(session.token, "os_abc");
         let me_response = client.me("os_abc").await.unwrap();
         assert_eq!(me_response.sessions[0].device_name, "cli");
+        let usage = me_response.usage.unwrap();
+        assert_eq!(usage.total_bytes, 12);
+        assert_eq!(usage.vaults[0].id, "vault_1");
+        assert_eq!(usage.max_vaults, Some(10));
         client.logout("os_abc").await.unwrap();
 
         start.assert_async().await;
@@ -363,7 +455,7 @@ mod tests {
             .await;
         let client = AuthClient::new(&server.base_url());
         let error = client
-            .email_verify("a@b.co", "000000", "cli")
+            .email_verify("a@b.co", "000000", "cli", None)
             .await
             .unwrap_err();
         match error {
@@ -373,5 +465,36 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn invites_round_trip() {
+        let server = MockServer::start_async().await;
+        let create = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/auth/invites")
+                    .header("authorization", "Bearer os_abc");
+                then.status(201).json_body(serde_json::json!({
+                    "invite": { "code": "ABCD2345", "created": 1, "expires": 2, "status": "active", "used_at": null }
+                }));
+            })
+            .await;
+        let list = server
+            .mock_async(|when, then| {
+                when.method(GET).path("/auth/invites");
+                then.status(200).json_body(serde_json::json!({
+                    "invites": [{ "code": "ABCD2345", "created": 1, "expires": 2, "status": "used", "used_at": 3 }]
+                }));
+            })
+            .await;
+        let client = AuthClient::new(&server.base_url());
+        let invite = client.create_invite("os_abc").await.unwrap();
+        assert_eq!(invite.code, "ABCD2345");
+        assert_eq!(invite.status, "active");
+        let invites = client.list_invites("os_abc").await.unwrap();
+        assert_eq!(invites[0].used_at, Some(3));
+        create.assert_async().await;
+        list.assert_async().await;
     }
 }

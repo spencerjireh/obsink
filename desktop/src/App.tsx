@@ -77,9 +77,43 @@ type ConflictPreview = {
 type AddVaultMode = 'create' | 'connect'
 type ResolutionChoice = 'KeepLocal' | 'KeepRemote' | 'KeepBoth'
 
+type UsageInfo = {
+  total_bytes: number
+  max_vault_bytes: number | null
+  max_vaults: number | null
+  vaults: { id: string; bytes: number }[]
+}
+
 type AccountState =
   | { kind: 'signed_out' }
-  | { kind: 'account'; user_id: string; email: string | null; devices: { session_id: string; device_name: string; current: boolean }[] }
+  | {
+      kind: 'account'
+      user_id: string
+      email: string | null
+      devices: { session_id: string; device_name: string; current: boolean }[]
+      usage: UsageInfo | null
+    }
+
+type InviteInfo = { code: string; expires: number }
+
+function formatBytes(value: number): string {
+  if (value < 1024) return `${value} B`
+  const units = ['KB', 'MB', 'GB', 'TB']
+  let size = value / 1024
+  let unit = 0
+  while (size >= 1024 && unit < units.length - 1) {
+    size /= 1024
+    unit += 1
+  }
+  return `${size.toFixed(size < 10 ? 1 : 0)} ${units[unit]}`
+}
+
+function usageLine(usage: UsageInfo | null): string {
+  if (!usage) return ''
+  const vaults = usage.max_vaults === null ? `${usage.vaults.length} vaults` : `${usage.vaults.length}/${usage.max_vaults} vaults`
+  const cap = usage.max_vault_bytes === null ? '' : ` · ${formatBytes(usage.max_vault_bytes)} per vault`
+  return ` · ${formatBytes(usage.total_bytes)} used · ${vaults}${cap}`
+}
 
 type RemoteVault = { id: string; name: string; created: number }
 
@@ -159,7 +193,9 @@ function App() {
   const [account, setAccount] = useState<AccountState | null>(null)
   const [authEmail, setAuthEmail] = useState('')
   const [authCode, setAuthCode] = useState('')
+  const [inviteCode, setInviteCode] = useState('')
   const [codeSent, setCodeSent] = useState(false)
+  const [issuedInvite, setIssuedInvite] = useState<InviteInfo | null>(null)
   const [remoteVaults, setRemoteVaults] = useState<RemoteVault[] | null>(null)
 
   const currentServerUrl = serverUrl.trim()
@@ -210,10 +246,16 @@ function App() {
     setBusy(true)
     setMessage('')
     try {
-      const next = await call<AccountState>('auth_email_verify', { serverUrl: currentServerUrl, email: authEmail, code: authCode })
+      const next = await call<AccountState>('auth_email_verify', {
+        serverUrl: currentServerUrl,
+        email: authEmail,
+        code: authCode,
+        inviteCode: inviteCode.trim() || null,
+      })
       setAccount(next)
       setCodeSent(false)
       setAuthCode('')
+      setInviteCode('')
       rememberServerUrl(currentServerUrl)
       setMessage(next.kind === 'account' ? `Signed in as ${next.email ?? next.user_id}.` : 'Signed in.')
     } catch (error) {
@@ -223,12 +265,36 @@ function App() {
     }
   }
 
+  async function handleCreateInvite() {
+    setBusy(true)
+    setMessage('')
+    try {
+      const invite = await call<InviteInfo>('create_invite', { serverUrl: currentServerUrl })
+      setIssuedInvite(invite)
+    } catch (error) {
+      setMessage(String(error))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function handleCopyInvite() {
+    if (!issuedInvite) return
+    try {
+      await navigator.clipboard.writeText(issuedInvite.code)
+      setMessage('Invite code copied.')
+    } catch (error) {
+      setMessage(String(error))
+    }
+  }
+
   async function handleSignOut() {
     setBusy(true)
     setMessage('')
     try {
       await call('sign_out', { serverUrl: currentServerUrl })
       setAccount({ kind: 'signed_out' })
+      setIssuedInvite(null)
       setRemoteVaults(null)
       setMessage(`Signed out of ${currentServerUrl}.`)
     } catch (error) {
@@ -595,15 +661,33 @@ function App() {
           </div>
 
           {account?.kind === 'account' ? (
-            <div className="account-row">
-              <span>
-                Signed in as <strong>{account.email ?? account.user_id}</strong>
-                {account.devices.length > 1 ? ` · ${account.devices.length} devices` : ''}
-              </span>
-              <button className="button button--ghost" disabled={busy} onClick={handleSignOut} type="button">
-                Sign out
-              </button>
-            </div>
+            <>
+              <div className="account-row">
+                <span>
+                  Signed in as <strong>{account.email ?? account.user_id}</strong>
+                  {account.devices.length > 1 ? ` · ${account.devices.length} devices` : ''}
+                  {usageLine(account.usage)}
+                </span>
+                <span className="choice-row">
+                  <button className="button button--ghost" disabled={busy} onClick={handleCreateInvite} type="button">
+                    Invite someone
+                  </button>
+                  <button className="button button--ghost" disabled={busy} onClick={handleSignOut} type="button">
+                    Sign out
+                  </button>
+                </span>
+              </div>
+              {issuedInvite ? (
+                <div className="invite-box">
+                  <span>
+                    Invite code <code>{issuedInvite.code}</code> · expires {formatUnix(issuedInvite.expires)}
+                  </span>
+                  <button className="button button--ghost" onClick={handleCopyInvite} type="button">
+                    Copy
+                  </button>
+                </div>
+              ) : null}
+            </>
           ) : (
             <div className="form-grid">
               <label>
@@ -613,6 +697,15 @@ function App() {
                   disabled={codeSent}
                   value={authEmail}
                   onChange={(event) => setAuthEmail(event.target.value)}
+                />
+              </label>
+              <label>
+                <span>Invite code (new accounts only)</span>
+                <input
+                  autoCapitalize="characters"
+                  placeholder="optional"
+                  value={inviteCode}
+                  onChange={(event) => setInviteCode(event.target.value)}
                 />
               </label>
               {codeSent ? (

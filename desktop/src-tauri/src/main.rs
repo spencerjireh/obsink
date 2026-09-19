@@ -16,9 +16,9 @@ use tauri::{
 
 use obsink_core::{
     build_working_manifest_for_path, complete_sync, derive_key, derive_keys, diff_local_and_remote,
-    normalize_server_url, prepare_sync, sync_manifest_path, ApiClient, AuthClient, Conflict,
-    ConflictResolution, CreateVaultRequest, KeyBytes, ProgressEvent, ProgressSink, SyncPlan,
-    SyncResult, VaultConfig, VaultSummary,
+    fetch_remote_manifest, normalize_server_url, prepare_sync, sync_manifest_path, ApiClient,
+    AuthClient, Conflict, ConflictResolution, CreateVaultRequest, KeyBytes, ProgressEvent,
+    ProgressSink, SyncPlan, SyncResult, VaultConfig, VaultSummary,
 };
 use serde::{Deserialize, Serialize};
 
@@ -134,7 +134,28 @@ enum AccountState {
         user_id: String,
         email: Option<String>,
         devices: Vec<DeviceInfo>,
+        usage: Option<UsageInfo>,
     },
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct UsageInfo {
+    total_bytes: u64,
+    max_vault_bytes: Option<u64>,
+    max_vaults: Option<u32>,
+    vaults: Vec<VaultUsageInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct VaultUsageInfo {
+    id: String,
+    bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct InviteInfo {
+    code: String,
+    expires: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -173,9 +194,14 @@ async fn auth_email_verify(
     server_url: String,
     email: String,
     code: String,
+    invite_code: Option<String>,
 ) -> Result<AccountState, String> {
+    let invite = invite_code
+        .as_deref()
+        .map(str::trim)
+        .filter(|code| !code.is_empty());
     let session = AuthClient::new(&server_url)
-        .email_verify(email.trim(), code.trim(), &device_name())
+        .email_verify(email.trim(), code.trim(), &device_name(), invite)
         .await
         .map_err(err_string)?;
     save_secret(&bearer_account(&server_url), &session.token).map_err(err_string)?;
@@ -202,6 +228,19 @@ async fn get_account(server_url: String) -> Result<AccountState, String> {
                         current: session.current,
                     })
                     .collect(),
+                usage: me.usage.map(|usage| UsageInfo {
+                    total_bytes: usage.total_bytes,
+                    max_vault_bytes: usage.max_vault_bytes,
+                    max_vaults: usage.max_vaults,
+                    vaults: usage
+                        .vaults
+                        .into_iter()
+                        .map(|vault| VaultUsageInfo {
+                            id: vault.id,
+                            bytes: vault.bytes,
+                        })
+                        .collect(),
+                }),
             }),
             // The operator bearer has no account behind it; the desktop only
             // works with accounts.
@@ -214,6 +253,20 @@ async fn get_account(server_url: String) -> Result<AccountState, String> {
         }
         Err(error) => Err(err_string(error)),
     }
+}
+
+/// Mint an invite code for someone else to create an account on this server.
+#[tauri::command]
+async fn create_invite(server_url: String) -> Result<InviteInfo, String> {
+    let bearer = load_bearer(&server_url)?;
+    let invite = AuthClient::new(&server_url)
+        .create_invite(&bearer)
+        .await
+        .map_err(err_string)?;
+    Ok(InviteInfo {
+        code: invite.code,
+        expires: invite.expires,
+    })
 }
 
 /// Sign out of a server. Vault configs stay; sync will ask for a credential
@@ -384,8 +437,7 @@ async fn get_status() -> Result<SyncStatus, String> {
     let manifest_path = sync_manifest_path(&local_root);
     let keys = derive_keys(&load_key_from_keychain(&vault.id).map_err(err_string)?);
     let vault_config = to_vault_config(vault);
-    let remote_manifest = ApiClient::new(vault_config)
-        .get_manifest(&keys)
+    let remote_manifest = fetch_remote_manifest(&ApiClient::new(vault_config), &local_root, &keys)
         .await
         .map_err(err_string)?;
     let local_manifest = build_working_manifest_for_path(&local_root, &keys).map_err(err_string)?;
@@ -409,10 +461,13 @@ async fn get_manifest_diff(vault_id: Option<String>) -> Result<SyncResult, Strin
     let keys = derive_keys(&load_key_from_keychain(&vault.id).map_err(err_string)?);
     let local_manifest =
         build_working_manifest_for_path(Path::new(&vault.local_path), &keys).map_err(err_string)?;
-    let remote_manifest = ApiClient::new(to_vault_config(&vault))
-        .get_manifest(&keys)
-        .await
-        .map_err(err_string)?;
+    let remote_manifest = fetch_remote_manifest(
+        &ApiClient::new(to_vault_config(&vault)),
+        Path::new(&vault.local_path),
+        &keys,
+    )
+    .await
+    .map_err(err_string)?;
     Ok(diff_local_and_remote(&local_manifest, &remote_manifest))
 }
 
@@ -583,7 +638,9 @@ fn validate_request(request: &AddVaultRequest) -> Result<(), String> {
 async fn validate_passphrase(vault: &StoredVault, key: &KeyBytes) -> Result<(), String> {
     let keys = derive_keys(key);
     let client = ApiClient::new(to_vault_config(vault));
-    let manifest = client.get_manifest(&keys).await.map_err(err_string)?;
+    let manifest = fetch_remote_manifest(&client, Path::new(&vault.local_path), &keys)
+        .await
+        .map_err(err_string)?;
     if let Some((path, _)) = manifest.iter().find(|(_, entry)| !entry.deleted) {
         let blob = client.get_file(path, &keys).await.map_err(err_string)?;
         obsink_core::decrypt(&keys.content_enc, &blob).map_err(err_string)?;
@@ -862,6 +919,7 @@ fn main() {
             add_vault,
             auth_email_start,
             auth_email_verify,
+            create_invite,
             get_account,
             get_auth_capabilities,
             list_remote_vaults,
@@ -1019,6 +1077,10 @@ mod live_tests {
         ];
         for choice in choices {
             // Rebaseline: A's a.md == "REMOTE", then sync so server == local.
+            // Manifest timestamps have one-second resolution; a write in the
+            // same second as the previous upload ties on `modified` and is
+            // classified as a conflict instead of an upload, so step past it.
+            tokio::time::sleep(Duration::from_millis(1100)).await;
             fs::write(dir_a.join(file_rel), "REMOTE").unwrap();
             let _ = sync_vault_inner(Some(vault_id.clone()), &state, &obsink_core::NoProgress)
                 .await
@@ -1140,9 +1202,11 @@ mod live_tests {
     }
 
     /// `#[ignore]`d live test for the account path: email code sign-in, vault
-    /// creation under the account, `get_account`, sign-out. Needs a server
-    /// running with `AUTH_DEV_RETURN_CODE=1` (the local docker compose):
-    ///   OBSINK_TEST_SERVER_URL=http://localhost:8080 \
+    /// creation under the account, `get_account`, invites, sign-out. Needs a
+    /// server running with `AUTH_DEV_RETURN_CODE=1` (the local docker compose).
+    /// On a server that already has accounts, set `OBSINK_TEST_API_KEY` so the
+    /// test can mint the invite its first sign-up needs:
+    ///   OBSINK_TEST_SERVER_URL=http://localhost:8080 OBSINK_TEST_API_KEY=... \
     ///   cargo test -p obsink-desktop account_flow_live -- --ignored --nocapture
     #[ignore]
     #[tokio::test]
@@ -1175,23 +1239,37 @@ mod live_tests {
         .unwrap_err();
         assert!(denied.contains("sign in"), "{denied}");
 
+        // A fresh server lets the first account in without an invite; an
+        // established one needs a code, which the operator bearer can mint.
+        let bootstrap_invite = match std::env::var("OBSINK_TEST_API_KEY") {
+            Ok(api_key) if !api_key.is_empty() => Some(
+                AuthClient::new(&server_url)
+                    .create_invite(&api_key)
+                    .await
+                    .unwrap()
+                    .code,
+            ),
+            _ => None,
+        };
         let email = format!("desktop-{}@example.com", std::process::id());
         let code = auth_email_start(server_url.clone(), email.clone())
             .await
             .unwrap()
             .expect("dev server returns the code inline");
-        let state = auth_email_verify(server_url.clone(), email.clone(), code)
+        let state = auth_email_verify(server_url.clone(), email.clone(), code, bootstrap_invite)
             .await
             .unwrap();
         match &state {
             AccountState::Account {
                 email: got,
                 devices,
+                usage,
                 ..
             } => {
                 assert_eq!(got.as_deref(), Some(email.as_str()));
                 assert_eq!(devices.len(), 1);
                 assert!(devices[0].current);
+                assert!(usage.is_some(), "server reports usage");
             }
             other => panic!("expected account, got {other:?}"),
         }
@@ -1225,6 +1303,28 @@ mod live_tests {
             .await
             .unwrap();
         assert!(response.completed_result.is_some());
+
+        // Invite gating: a second account needs a code minted by the first.
+        let invite = create_invite(server_url.clone()).await.unwrap();
+        assert!(!invite.code.is_empty());
+        let keyring_b = sandbox.join("keyring-b");
+        fs::create_dir_all(&keyring_b).unwrap();
+        std::env::set_var("OBSINK_KEYRING_DIR", &keyring_b);
+        let second = format!("desktop-b-{}@example.com", std::process::id());
+        let code = auth_email_start(server_url.clone(), second.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        let refused = auth_email_verify(server_url.clone(), second.clone(), code.clone(), None)
+            .await
+            .unwrap_err();
+        assert!(refused.contains("invite"), "{refused}");
+        let accepted =
+            auth_email_verify(server_url.clone(), second.clone(), code, Some(invite.code))
+                .await
+                .unwrap();
+        assert!(matches!(accepted, AccountState::Account { .. }));
+        std::env::set_var("OBSINK_KEYRING_DIR", &keyring_dir);
 
         sign_out(server_url.clone()).await.unwrap();
         assert!(matches!(

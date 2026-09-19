@@ -6,8 +6,10 @@ use std::{
 
 use thiserror::Error;
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
-    api_client::{ApiClient, ApiError},
+    api_client::{ApiClient, ApiError, ManifestFetch},
     crypto::{decrypt, derive_keys, encrypt, CryptoError, CryptoKeys, KeyBytes},
     hasher::{build_manifest_from_dir, hash_file, HasherError},
     manifest::{diff_manifests, ManifestDiff},
@@ -19,6 +21,10 @@ use crate::{
 };
 
 const MANIFEST_FILE: &str = ".obsink/manifest.json";
+/// Last server manifest seen plus its ETag, so an unchanged manifest costs a
+/// 304 instead of a full download. Distinct from `MANIFEST_FILE`, which is the
+/// checkpoint of the last *completed* sync.
+const REMOTE_MANIFEST_CACHE_FILE: &str = ".obsink/remote-manifest.json";
 
 #[derive(Debug, Error)]
 pub enum SyncEngineError {
@@ -59,6 +65,70 @@ pub fn sync_manifest_path(local_root: &Path) -> PathBuf {
     local_root.join(MANIFEST_FILE)
 }
 
+pub fn remote_manifest_cache_path(local_root: &Path) -> PathBuf {
+    local_root.join(REMOTE_MANIFEST_CACHE_FILE)
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RemoteManifestCache {
+    etag: Option<String>,
+    manifest: Manifest,
+}
+
+fn load_remote_cache(local_root: &Path) -> Option<RemoteManifestCache> {
+    let bytes = fs::read(remote_manifest_cache_path(local_root)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn save_remote_cache(
+    local_root: &Path,
+    cache: &RemoteManifestCache,
+) -> Result<(), SyncEngineError> {
+    let path = remote_manifest_cache_path(local_root);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_vec(cache)?)?;
+    Ok(())
+}
+
+/// Fetch the server manifest through the on-disk ETag cache: send the cached
+/// ETag, reuse the cached manifest on 304, and refresh the cache on 200. A
+/// missing or corrupt cache falls back to an unconditional fetch.
+pub async fn fetch_remote_manifest(
+    client: &ApiClient,
+    local_root: &Path,
+    keys: &CryptoKeys,
+) -> Result<Manifest, SyncEngineError> {
+    let cached = load_remote_cache(local_root).filter(|cache| cache.etag.is_some());
+    let etag = cached.as_ref().and_then(|cache| cache.etag.as_deref());
+    match client.get_manifest_if_changed(keys, etag).await? {
+        ManifestFetch::NotModified => match cached {
+            Some(cache) => Ok(cache.manifest),
+            // Defensive: a 304 without a cache means the validator came from
+            // nowhere; fetch unconditionally.
+            None => match client.get_manifest_if_changed(keys, None).await? {
+                ManifestFetch::Modified { manifest, .. } => Ok(manifest),
+                ManifestFetch::NotModified => Ok(Manifest::new()),
+            },
+        },
+        ManifestFetch::Modified { manifest, etag } => {
+            if etag.is_some() {
+                if let Err(error) = save_remote_cache(
+                    local_root,
+                    &RemoteManifestCache {
+                        etag,
+                        manifest: manifest.clone(),
+                    },
+                ) {
+                    tracing::warn!(%error, "could not write the remote manifest cache");
+                }
+            }
+            Ok(manifest)
+        }
+    }
+}
+
 pub fn diff_local_and_remote(local: &Manifest, remote: &Manifest) -> ManifestDiff {
     diff_manifests(local, remote)
 }
@@ -80,7 +150,7 @@ pub async fn prepare_sync(
     let client = ApiClient::new(config.clone());
     let local_root = Path::new(&config.local_path);
     let working_manifest = build_working_manifest_for_path(local_root, &keys)?;
-    let remote_manifest = client.get_manifest(&keys).await?;
+    let remote_manifest = fetch_remote_manifest(&client, local_root, &keys).await?;
     let diff = diff_manifests(&working_manifest, &remote_manifest);
 
     progress.report(ProgressEvent::Phase(SyncPhase::Downloading));
@@ -263,7 +333,7 @@ pub async fn complete_sync(
     // past every file that did transfer (the resume point). Skip the re-fetch
     // when a fatal error already proved the network is gone.
     if !failures.iter().any(|failure| failure.fatal) {
-        match client.get_manifest(&keys).await {
+        match fetch_remote_manifest(&client, local_root, &keys).await {
             Ok(remote_manifest) => {
                 save_manifest_to_disk(&sync_manifest_path(local_root), &remote_manifest)?;
             }
@@ -587,7 +657,7 @@ mod tests {
 
     use super::{
         complete_sync, conflict_copy_path, load_manifest_from_disk, prepare_sync,
-        save_manifest_to_disk, sync_manifest_path,
+        remote_manifest_cache_path, save_manifest_to_disk, sync_manifest_path,
     };
     use crate::{
         crypto::{content_hmac, derive_keys, encrypt, encrypt_path, path_token, CryptoKeys},
@@ -1017,5 +1087,98 @@ mod tests {
             "file a"
         );
         assert!(!dir.path().join("b.md").exists());
+    }
+
+    #[tokio::test]
+    async fn second_sync_uses_etag_and_304() {
+        let dir = tempdir().unwrap();
+        let server = MockServer::start_async().await;
+        let key = [7_u8; 32];
+        let keys = derive_keys(&key);
+        let manifest_json = server_manifest(&keys, "note.md", b"remote", 10, false);
+        let encrypted = encrypt(&keys.content_enc, b"remote").unwrap();
+        let token = path_token(&keys.path_token, "note.md");
+
+        let body = manifest_json.clone();
+        let fresh = server
+            .mock_async(move |when, then| {
+                when.method(GET)
+                    .path("/vaults/vault_123/manifest")
+                    .matches(|req| {
+                        !req.headers.as_ref().is_some_and(|headers| {
+                            headers
+                                .iter()
+                                .any(|(name, _)| name.eq_ignore_ascii_case("if-none-match"))
+                        })
+                    });
+                then.status(200)
+                    .header("etag", "\"3\"")
+                    .json_body_obj(&body);
+            })
+            .await;
+        let cached = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/vaults/vault_123/manifest")
+                    .header("if-none-match", "\"3\"");
+                then.status(304).header("etag", "\"3\"");
+            })
+            .await;
+        server
+            .mock_async(move |when, then| {
+                when.method(GET)
+                    .path(format!("/vaults/vault_123/files/{token}"));
+                then.status(200).body(encrypted.clone());
+            })
+            .await;
+
+        let cfg = config(server.base_url(), dir.path().display().to_string());
+        let first = prepare_sync(&cfg, &key, &NoProgress).await.unwrap();
+        assert_eq!(first.download.len(), 1);
+        assert!(remote_manifest_cache_path(dir.path()).exists());
+        let cache: serde_json::Value =
+            serde_json::from_slice(&fs::read(remote_manifest_cache_path(dir.path())).unwrap())
+                .unwrap();
+        assert_eq!(cache["etag"], "\"3\"");
+
+        // Second prepare: the manifest comes from the cache via 304 and the
+        // plan is identical (the downloaded file is now local, so no download).
+        let second = prepare_sync(&cfg, &key, &NoProgress).await.unwrap();
+        assert!(second.download.is_empty() && second.upload.is_empty());
+        fresh.assert_hits_async(1).await;
+        cached.assert_hits_async(1).await;
+    }
+
+    #[tokio::test]
+    async fn cache_ignored_when_corrupt() {
+        let dir = tempdir().unwrap();
+        let server = MockServer::start_async().await;
+        let key = [7_u8; 32];
+        fs::create_dir_all(dir.path().join(".obsink")).unwrap();
+        fs::write(remote_manifest_cache_path(dir.path()), b"{garbage").unwrap();
+
+        let fresh = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/vaults/vault_123/manifest")
+                    .matches(|req| {
+                        !req.headers.as_ref().is_some_and(|headers| {
+                            headers
+                                .iter()
+                                .any(|(name, _)| name.eq_ignore_ascii_case("if-none-match"))
+                        })
+                    });
+                then.status(200).json_body_obj(&serde_json::json!({}));
+            })
+            .await;
+        let cfg = config(server.base_url(), dir.path().display().to_string());
+        let plan = prepare_sync(&cfg, &key, &NoProgress).await.unwrap();
+        assert!(plan.download.is_empty());
+        fresh.assert_hits_async(1).await;
+        // A server without ETags leaves the corrupt file alone (nothing to cache).
+        assert_eq!(
+            fs::read(remote_manifest_cache_path(dir.path())).unwrap(),
+            b"{garbage"
+        );
     }
 }
