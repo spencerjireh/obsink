@@ -127,6 +127,10 @@ iOS uses the system font with Dynamic Type (`.body`, `.caption`,
 | Result row | Upload, Download, DeleteLocal, DeleteRemote | Path in mono, kind as a tag. Lists are grouped `Uploaded` / `Downloaded`. |
 | Form field | default, focused, invalid | Label above the input in muted text; URLs, ids, and codes in mono; passphrase is a secure field; the error sits below the field in `--color-danger`. |
 | Empty state | — | One sentence in muted text that says what will appear and when. Never an illustration. |
+| Device row | current, other | Device name, a `This device` tag on the current session, sign-in date in muted text, and a `Sign out` button. The current row signs this device out; any other row revokes that session on the server. |
+| Invite row | active, used, expired | Code in mono (letter-spaced), a status tag (`Active` success, `Used` muted, `Expired` warning), expiry or use date in muted text; `Copy` on active rows only. |
+| Confirmation | pending, ready, busy | Inline (desktop) or a sheet (iOS), never a native dialog. Title, one sentence of consequence, then `Type <value> to confirm.` with the value in mono; the destructive button is disabled until the typed value matches (the account email, or `delete` for an account without one, or the vault name). `Remove from this device` needs no typed value. |
+| Danger button | idle, disabled | Ghost shape with `--color-danger` text and a translucent danger border; used for `Delete account` and `Delete vault on server`. |
 
 ## 5. Copy
 
@@ -142,9 +146,19 @@ Shared labels. Every platform uses exactly these strings:
 
 | role | label |
 |---|---|
-| sections | `Vaults`, `Status`, `Account`, `Conflicts`, `Failed this sync`, `Last result` |
+| sections | `Vaults`, `Status`, `Account`, `Conflicts`, `Failed this sync`, `Last result`, `Devices`, `Invites`, `Manage vault` |
 | primary actions | `Sync now`, `Apply resolutions` |
-| setup | `Add vault`, `Create vault`, `Connect vault`, `Load vaults`, `Send sign-in code`, `Verify and sign in`, `Change email`, `Invite someone`, `Sign out` |
+| setup | `Add vault`, `Create vault`, `Connect vault`, `Load vaults`, `Send sign-in code`, `Verify and sign in`, `Change email`, `Sign in` |
+| account | `Invite someone`, `Copy`, `Sign out` (per device), `Delete account` |
+| vault actions | `Remove from this device`, `Delete vault on server` (distinct from the conflict choice `Delete on server`) |
+| device tag | `This device` (the same string as the conflict side, on purpose) |
+| invite status | `Active`, `Used`, `Expired` |
+| per-vault usage | `412 MiB of 1 GiB`; `412 MiB` when the server sets no cap |
+| session | `Session expired. Sign in again.` with the action `Sign in` |
+| server without email | `This server has no email sign-in.` |
+| after actions | `Invite code created.`, `Invite code copied.`, `Device signed out.`, `Account deleted.`, `Removed <vault> from this device.`, `Deleted <vault> on the server.` |
+| confirmation prompt | `Type <value> to confirm.` |
+| confirmation copy | delete account: `This deletes your account, every vault it owns on <server>, and every signed-in device. Vault folders on this device stay.`; delete vault: `This deletes <vault> and all of its files on <server>. The folder on this device stays.`; remove: `The vault stays on the server. The key is removed from the keychain, so connecting again needs the passphrase.` |
 | modes | `Create`, `Connect` |
 | conflict sides | `This device`, `Other device` |
 | conflict choices | `Keep local`, `Keep remote`, `Keep both`, `Delete on server`, `Delete here` |
@@ -161,6 +175,14 @@ Empty states:
 - Conflicts: `Conflicts appear here when a sync needs a decision.`
 - Result column: `No entries.`
 - Preview: `Deleted in this version.` / `Empty file.`
+- Devices: `No other devices signed in.` (iOS, where the current device is
+  the picker's context); desktop always lists the current device.
+- Invites: `No invites yet.`
+
+The invite code field appears only when the server reports
+`invite_required` (`GET /`) or has just refused a sign-up without one; in the
+second case it takes focus. Sign-in methods the server does not offer are
+not shown.
 
 ## 6. Platform mapping
 
@@ -170,10 +192,14 @@ Empty states:
   default, dark values under `@media (prefers-color-scheme: dark)`.
   `color-scheme: light dark` so native controls follow.
 - Layout: a 240px sidebar (vault list, `Add vault`, `Account`) and a main
-  pane (active vault name, `Sync now`, status counts, notices, `Last result`,
-  `Conflicts`). Setup (server URL, sign-in, invite, add vault) is a
-  dedicated view that replaces the main pane; the app opens on it when no
-  vault is configured.
+  pane (active vault name with the per-vault usage, `Sync now`, status
+  counts, notices, `Last result`, `Conflicts`, `Manage vault`). Setup
+  (server URL, sign-in, invite, `Devices`, `Invites`, `Delete account`, add
+  vault) is a dedicated view that replaces the main pane; the app opens on
+  it when no vault is configured.
+- Errors reach the UI typed (`CommandError { kind, message, status }`); a
+  401 shows the session notice with `Sign in`, which opens Setup at the
+  account section.
 - Window: default 1000x680, minimum 760x520. Two-column groups stack below
   860px.
 - Menu bar: the template silhouette; menu items `Sync now`, `Show ObSink`,
@@ -195,6 +221,9 @@ Empty states:
 - `Sync now` is a full-width `.borderedProminent` button, amber with ink
   text. There is no `Last result` section on iOS; the status line carries
   the last result.
+- `Devices`, `Invites`, and `Manage vault` are pushed screens
+  (`NavigationLink`) from the root form; typed confirmations are a sheet
+  with a medium detent.
 - Icon: `ios/ObSink/Assets.xcassets/AppIcon.appiconset/AppIcon.png`, a
   1024x1024 opaque RGB PNG (App Store Connect rejects alpha), full bleed;
   the OS applies the mask.
@@ -222,8 +251,14 @@ remote`, `keep both` in that order.
   `addVaultServerURL`, `addVaultAccountText`, `listVaultsButton`,
   `vaultPicker`, `addVaultStatusText`, `addVaultPassphraseField`,
   `addVaultSubmitButton`, `staleBanner`, `conflictRowTitle`,
-  `winnerPicker`, `applyResolutionsButton`; and by these labels: the
-  `Connect` segment, the `Keep local` / `Keep remote` / `Keep both`
-  segments, the status prefixes `Synced ·`, `Added vault`, `1 conflict`,
-  and the banner text `changed on another device`. Renaming any of them
-  means updating the tests and the harness in the same change.
+  `winnerPicker`, `applyResolutionsButton`, `vaultUsageText`,
+  `manageVaultButton`, `removeVaultButton`, `deleteVaultButton`,
+  `devicesLink`, `deviceRow`, `deviceSignOutButton`, `invitesLink`,
+  `inviteRow`, `deleteAccountButton`, `signInButton`, `sessionExpiredText`,
+  `confirmationField`, `confirmDestructiveButton`, `confirmCancelButton`,
+  `addVaultDoneButton`; and by these labels: the `Connect` segment, the
+  `Keep local` / `Keep remote` / `Keep both` segments, the
+  `Remove from this device` confirmation button, the status prefixes
+  `Synced ·`, `Added vault`, `1 conflict`, and the banner text
+  `changed on another device`. Renaming any of them means updating the
+  tests and the harness in the same change.
