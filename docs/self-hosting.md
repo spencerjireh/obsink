@@ -60,12 +60,10 @@ audience is the ObSink app's bundle id, which the server verifies against Apple'
 1. In Coolify, add a resource of type **Docker Compose** pointing at this repository (branch
    `main`) with the compose file `docker-compose.coolify.yml`. Coolify builds `server/Dockerfile`
    on the host (a Rust release build, several minutes the first time) and runs Postgres
-   alongside it. To deploy the prebuilt `ghcr.io/spencerjireh/obsink-server` image instead,
-   swap `build:` for `image:` in the compose file; the GHCR package must then be **public**
-   (GitHub → Packages → `obsink-server` → Package settings → Change visibility; new packages
-   start private and the API cannot change that) or the host needs `docker login ghcr.io`.
+   alongside it. Every deploy rebuilds the image from the branch, so an upgrade is a redeploy.
 2. Set the environment variables in Coolify:
-   - `OBSINK_SERVER_KEY` — run `docker run --rm ghcr.io/spencerjireh/obsink-server keygen` and
+   - `OBSINK_SERVER_KEY` — run `cargo run -p obsink-server -- keygen` in a checkout (or
+     `docker compose run --rm --no-deps server keygen` once the local stack image is built) and
      paste the output. Store it somewhere safe.
    - `OBSINK_API_KEY` — `openssl rand -hex 32`.
    - `POSTGRES_PASSWORD` — `openssl rand -hex 24`.
@@ -123,7 +121,8 @@ knows an email address.
   `OBSINK_SERVER_KEY`. Blobs are useless without the database (which maps them to vaults) and both
   are useless without the key. Vault contents stay unreadable without each vault's passphrase in
   any case.
-- **Upgrade** by pulling a newer image and redeploying; migrations run at startup
+- **Upgrade** by redeploying in Coolify: it pulls `main` and rebuilds `server/Dockerfile` from
+  source; migrations run at startup
   (`OBSINK_MIGRATE_ON_START=1`). `obsink-server migrate` applies them by hand.
 - **Retention** runs at startup and daily; `obsink-server retention` runs one pass and prints what
   it removed.
