@@ -52,6 +52,7 @@ targets:
         CODE_SIGN_ENTITLEMENTS: ObSink/ObSink.entitlements
         ENABLE_USER_SCRIPT_SANDBOXING: NO
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
       configs:
         # Debug adds the File Provider testing-mode entitlement so simulator
         # runs can force-enable the domain (see SyncModel.registerFileProviderDomain).
