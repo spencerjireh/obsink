@@ -153,6 +153,30 @@ final class SyncE2ETests: XCTestCase {
         syncAndWait(app)
     }
 
+    /// Remove from this device (OBS-100): the vault leaves the picker; the
+    /// harness then checks that its cache directory and item database are
+    /// gone from the app-group container.
+    func testRemoveVaultFromDevice() throws {
+        let app = launchSeeded()
+        let manage = anyElement(app, "manageVaultButton")
+        XCTAssertTrue(manage.waitForExistence(timeout: 10), "Manage vault link missing")
+        manage.tap()
+        let remove = app.buttons["removeVaultButton"]
+        XCTAssertTrue(remove.waitForExistence(timeout: 10), "Remove button missing")
+        // SwiftUI Form buttons with a role report themselves non-hittable to
+        // XCUITest on iOS 26 even when visible; a coordinate tap lands anyway.
+        sleep(1)
+        remove.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+        // The confirmation dialog (an action sheet on iPhone) carries a
+        // destructive button with the same label.
+        let confirm = app.sheets.buttons["Remove from this device"].firstMatch
+        XCTAssertTrue(confirm.waitForExistence(timeout: 10), "confirmation dialog never appeared")
+        confirm.tap()
+        let empty = app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH 'No vault yet'")).firstMatch
+        XCTAssertTrue(empty.waitForExistence(timeout: 30), "vault still configured after removal")
+        XCTAssertFalse(anyElement(app, "activeVaultPicker").exists)
+    }
+
     /// Stale-vault warning on open (OBS-33): server is ahead, banner appears
     /// without syncing.
     func testStaleBanner() throws {

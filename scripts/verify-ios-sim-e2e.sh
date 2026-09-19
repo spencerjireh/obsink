@@ -256,6 +256,25 @@ else
     fail "OBS-34: app sync failed"
 fi
 
+# ===== OBS-100: Remove from this device =====
+# The vault leaves the app; its cache directory, item database, and File
+# Provider location go with it. The server copy stays (the cleanup below
+# deletes it).
+step "OBS-100: remove the vault from the device"
+if run_test testRemoveVaultFromDevice; then
+    APP_GROUP="$(app_vault_dir)"
+    LEFT=""
+    [ -e "$APP_GROUP/Vault/$VAULT_ID" ] && LEFT="$LEFT Vault/$VAULT_ID"
+    [ -e "$APP_GROUP/items-$VAULT_ID.sqlite" ] && LEFT="$LEFT items-$VAULT_ID.sqlite"
+    if [ -z "$LEFT" ]; then
+        pass "OBS-100: vault removed from the device (cache dir and item DB gone)"
+    else
+        fail "OBS-100: leftovers after removal:$LEFT"
+    fi
+else
+    fail "OBS-100: remove-vault UI phase failed"
+fi
+
 # Remove this run's vault so the operator vault list does not grow per run.
 if [ -n "${VAULT_ID:-}" ]; then
     curl -s -o /dev/null -w "cleanup: DELETE vault $VAULT_ID -> %{http_code}\n" -X DELETE \
