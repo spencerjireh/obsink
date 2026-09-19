@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ObSink mark: the closed loop. Full-bleed 1024 viewBox; iOS uses it as-is,
+  scripts/gen-icons.sh adds the macOS tile margin. Colours are the brand
+  constants in DESIGN.md (ink, amber, paper).
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <rect width="1024" height="1024" fill="#15141B"/>
+  <!-- Mark geometry is drawn on a 1024 grid and scaled so the ring spans ~70% of the icon. -->
+  <g transform="translate(512 512) scale(1.28) translate(-512 -512)">
+  <g fill="none" stroke="#E8A84A" stroke-width="60">
+    <path d="M295.5 387A250 250 0 0 1 728.5 387"/>
+    <path d="M728.5 637A250 250 0 0 1 295.5 637"/>
+  </g>
+  <g fill="#E8A84A">
+    <polygon points="500,206 500,318 592,262" transform="rotate(60 512 512)"/>
+    <polygon points="500,206 500,318 592,262" transform="rotate(240 512 512)"/>
+  </g>
+  <circle cx="512" cy="512" r="150" fill="#F2EFE6"/>
+  <circle cx="512" cy="488" r="40" fill="#15141B"/>
+  <rect x="494" y="500" width="36" height="100" rx="18" fill="#15141B"/>
+  </g>
+</svg>
