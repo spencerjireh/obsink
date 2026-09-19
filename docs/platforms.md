@@ -48,6 +48,10 @@ npm run tauri dev        # run against your server (docker compose up -d for a l
 npm run tauri build      # produce a .app/.dmg
 ```
 
+App, dock, and menu-bar icons are generated from `design/icon.svg` and
+`design/tray.svg` by `scripts/gen-icons.sh` (see `DESIGN.md`); rerun it after
+editing either SVG and commit the rasters.
+
 Vault Setup is one flow: enter the server URL, sign in with an email code (plus an invite code for a new account on an established server), then create or connect a vault. The account row shows the signed-in email, device count, storage usage, an **Invite someone** button (mints a code you can copy), and Sign out. Connect lists the account's vaults in a dropdown. `~/.obsink/app.json` holds vault URLs/paths only; bearers live in the macOS Keychain (`bearer:<server url>`; `OBSINK_KEYRING_DIR` file fallback for tests). The `#[ignore]`d `live_tests::account_flow_live` covers sign-in, invite gating, and sign-out against a server started with `AUTH_DEV_RETURN_CODE=1` (the local compose stack).
 
 Behavior:
