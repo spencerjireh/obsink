@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify-version:
+    name: verify version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Tag matches Cargo.toml, package.json, and tauri.conf.json
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          cargo=$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version = "\(.*\)"$/\1/p;}' Cargo.toml)
+          pkg=$(jq -r .version desktop/package.json)
+          tauri=$(jq -r .version desktop/src-tauri/tauri.conf.json)
+          echo "tag=$tag Cargo.toml=$cargo package.json=$pkg tauri.conf.json=$tauri"
+          if [ "$tag" != "$cargo" ] || [ "$tag" != "$pkg" ] || [ "$tag" != "$tauri" ]; then
+            echo "::error::version mismatch: tag v$tag, Cargo.toml $cargo, package.json $pkg, tauri.conf.json $tauri"
+            exit 1
+          fi
+
+  cli-macos-arm64:
+    name: CLI (aarch64-apple-darwin)
+    needs: verify-version
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - name: Build the CLI (keychain enabled through obsink-core)
+        run: cargo build --release -p obsink --locked
+      - name: Smoke test
+        run: |
+          target/release/obsink --version
+          [ "$(target/release/obsink --version)" = "obsink ${GITHUB_REF_NAME#v}" ]
+      - name: Package
+        run: |
+          name="obsink-${GITHUB_REF_NAME}-aarch64-apple-darwin"
+          mkdir -p dist
+          tar -C target/release -czf "dist/${name}.tar.gz" obsink
+          (cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256" && cat "${name}.tar.gz.sha256")
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/obsink-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz
+            dist/obsink-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz.sha256
