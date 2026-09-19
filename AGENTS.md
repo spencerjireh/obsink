@@ -4,14 +4,15 @@ Standing rules for any coding agent working in this repo. These override your
 defaults. When a rule here conflicts with something you'd normally do, follow
 this file. When this file conflicts with `spec.md`, ask.
 
-ObSink is a free, end-to-end encrypted sync engine for
-[Obsidian](https://obsidian.md) vaults, usable either **self-hosted** (your own
-Cloudflare Worker + `API_KEY`) or on **ObSink Cloud** (the operator-hosted
-Worker with self-serve accounts: email one-time code, Sign in with Apple on
-iOS). A shared Rust core drives a CLI, a Tauri desktop app (macOS), and an iOS
-client; a Cloudflare Worker (TS) + R2 + KV is the backend. **`spec.md` is the spec source
-of truth** — read it before your first task. Architecture/wire-format details
-live in `docs/architecture.md`; per-platform status in `docs/platforms.md`.
+ObSink is a free, self-hosted, end-to-end encrypted sync engine for
+[Obsidian](https://obsidian.md) vaults. A shared Rust core drives a CLI, a
+Tauri desktop app (macOS), and an iOS client; the backend is a Rust server
+(`server/`, axum + Postgres + an encrypted blob volume) that operators run with
+`docker compose up` behind their own TLS proxy. Accounts are invite-only
+(email one-time code everywhere, Sign in with Apple on iOS). **`spec.md` is the
+spec source of truth** — read it before your first task. Architecture/wire-format
+details live in `docs/architecture.md`; per-platform status in `docs/platforms.md`;
+deployment in `docs/self-hosting.md`.
 
 ## Tech (pinned versions)
 
@@ -19,15 +20,23 @@ live in `docs/architecture.md`; per-platform status in `docs/platforms.md`.
   `desktop/src-tauri`, `mobile`). Core deps: `aes-gcm` 0.10, `argon2` 0.5,
   `hkdf` 0.12, `hmac` 0.12, `sha2` 0.10, `reqwest` 0.12 (rustls-tls),
   `tokio` 1, `tracing` 0.1.
-- **Worker** — Cloudflare Workers, `wrangler` 4.11, TypeScript 5.8,
-  Vitest 3.2. Bindings: R2 (`obsink-files`), KV (`META`), secrets `API_KEY`
-  (operator bearer) and `RESEND_API_KEY` (email sign-in), vars
-  `APPLE_CLIENT_IDS` / `MAIL_FROM` / `MAX_VAULTS_PER_USER` / `MAX_VAULT_BYTES`,
-  two cron triggers. Accounts + hosted mode: `docs/hosted.md`, spec §4.1.
+- **Server** — `server/` crate (`obsink-server`): `axum` 0.8 (HTTP +
+  multipart), `tokio`, `tower-http` (tracing), `sqlx` 0.8 (Postgres, runtime
+  queries, embedded migrations), `lettre` 0.11 (SMTP one-time codes),
+  `jsonwebtoken` 9 (Apple identity tokens), `reqwest` (JWKS fetch,
+  healthcheck), `subtle` (constant-time operator key compare), `rand`/`uuid`
+  (tokens, ids), `walkdir` (retention), `clap` (subcommands); envelope crypto
+  uses the same `aes-gcm`/`hkdf`/`hmac`/`sha2` versions as core. Dev:
+  `tempfile`, `rsa` (forges Apple tokens in tests). Env vars are listed in
+  `server/src/config.rs`; deployment in `docs/self-hosting.md`; API in spec §4.
 - **Desktop** — Tauri v2 (`@tauri-apps` 2.0), React 18.3, Vite 5.4, TypeScript 5.6.
 - **iOS** — Swift/SwiftUI + File Provider extension; Rust via **UniFFI 0.28**
   (`mobile/` crate). Project generated with XcodeGen (`ios/project.yml`).
-- **Infra** — Terraform (`infra/terraform/`) for R2 + KV.
+- **Infra** — `server/Dockerfile` (cargo-chef, distroless), `docker-compose.yml`
+  (local: server built from the checkout, Postgres 16, Mailpit) and
+  `docker-compose.coolify.yml` (production: `ghcr.io/spencerjireh/obsink-server`,
+  Postgres). TLS is the operator's proxy (Coolify Traefik). Windows, Linux, and
+  Android clients are out of scope.
 
 ## Project structure
 
@@ -36,15 +45,15 @@ obsink/
   AGENTS.md              # this file (canonical — CLAUDE.md points here)
   CLAUDE.md              # one-line pointer to AGENTS.md
   spec.md                # spec source of truth
-  core/                  # Rust sync engine: crypto, hasher, manifest, api_client, sync_engine
+  core/                  # Rust sync engine: crypto, hasher, manifest, api_client, auth, sync_engine
   cli/                   # `obsink` CLI (reference client)
-  worker/                # Cloudflare Worker (TS): storage, manifest, conflict gating, cron
+  server/                # obsink-server (axum): accounts, vaults, files, batch, retention; Dockerfile
   desktop/               # Tauri v2 + React app (src-tauri/ + src/)
   mobile/                # UniFFI facade over core (staticlib/cdylib for iOS)
   ios/                   # Xcode project: ObSink app + FileProvider ext + Tests (XcodeGen)
-  infra/terraform/       # R2 bucket + KV namespace provisioning
-  scripts/               # render-worker-config, build-ios, verify-* deploy scripts
-  docs/                  # self-hosting, deploy, architecture, platforms, troubleshooting
+  docker-compose.yml     # local stack; docker-compose.coolify.yml for production
+  scripts/               # build-ios, release-ios, verify-* harnesses
+  docs/                  # self-hosting, architecture, platforms, troubleshooting
 ```
 
 ## Hard rules (non-negotiables)
@@ -61,17 +70,20 @@ obsink/
    button triggers the full pull→diff→download→resolve→upload cycle. Do not add
    auto-sync.
 3. **Conflict-aware — never silently overwrite.** `PUT`/`DELETE` require
-   `X-Parent-Hash`; on mismatch the Worker returns `409` and the client surfaces
-   the conflict to the UI (keep local / keep remote / keep both). See spec §5.
+   `X-Parent-Hash`; on mismatch the server returns `409` and the client surfaces
+   the conflict to the UI (keep local / keep remote / keep both). The check runs
+   in one Postgres transaction that locks the vault row. See spec §5.
 4. **One key per vault.** AES-256-GCM with a random 96-bit nonce per file; blob
    = `[12-byte nonce][ciphertext][16-byte tag]`. Argon2id parameters are
    64 MiB / 3 / 1 (exceeds OWASP 2024) — do not weaken.
 5. **No key recovery.** Lost passphrase = lost data. This is deliberate for v1;
    do not add recovery without an explicit decision.
-6. **50 MB upload limit.** The Worker rejects larger files; the batch endpoint
-   excludes large files (they go through individual `PUT`s).
-7. **Tests stay green.** `cargo test --workspace` for Rust; `npm test` +
-   `npm run typecheck` in `worker/`. Run them before considering work done.
+6. **50 MB upload limit.** The server rejects larger files (`413`); a
+   per-account byte budget answers `507`, which the sync engine treats as fatal.
+7. **Tests stay green.** `cargo test --workspace` (server integration tests
+   skip without `DATABASE_URL`; run them against Postgres before touching
+   `server/`) and `npm run build` in `desktop/`. Run them before considering
+   work done.
 8. **No new dependencies without a one-line justification.** The core crypto
    stack (aes-gcm, argon2, hkdf, hmac, sha2) is fixed — do not swap it out.
 
@@ -81,8 +93,13 @@ obsink/
 # Rust core + CLI tests
 cargo test --workspace
 
-# Worker (TS): typecheck + Vitest
-(cd worker && npm ci && npm test && npm run typecheck)
+# Server integration tests need Postgres (any throwaway instance):
+docker run -d --name obsink-test-pg -e POSTGRES_PASSWORD=postgres -p 5433:5432 postgres:16-alpine
+DATABASE_URL=postgres://postgres:postgres@localhost:5433/postgres OBSINK_TEST_REQUIRE_DB=1 cargo test -p obsink-server
+
+# Local server stack (server built from this checkout + Postgres + Mailpit on :8025)
+docker compose up -d            # OBSINK_PORT=18080 if 8080 is taken
+docker compose exec server obsink-server invite
 
 # Desktop (build the web bundle, then check the Tauri Rust)
 (cd desktop && npm ci && npm run build && cargo check -p obsink-desktop)
@@ -90,41 +107,39 @@ cargo test --workspace
 # Build iOS: device+simulator staticlibs, UniFFI bindings, xcframework, XcodeGen
 scripts/build-ios.sh
 
-# Run the CLI against your deployed Worker (logs to stderr)
+# Run the CLI against a server (logs to stderr)
 RUST_LOG=obsink_core=debug cargo run -p obsink -- sync
 
-# Deploy the Worker (requires wrangler auth + rendered wrangler.toml)
-(cd worker && npm run deploy)
+# Contract + two-device checks against a running server (uses .env)
+scripts/verify-server-deploy.sh && scripts/verify-cli-deployed-sync.sh
 ```
 
 ## Local credentials (gitignored)
 
-The deployed test Worker and its client bearer live in a **gitignored** `.env`
-at the repo root (never commit it; `.gitignore` covers `.env`/`.env.*`/`worker/.dev.vars`).
-Source it for the CLI and the `scripts/verify-*` harnesses:
+The server URL and operator bearer used by the CLI and the `scripts/verify-*`
+harnesses live in a **gitignored** `.env` at the repo root (copy
+`.env.example`; `.gitignore` covers `.env`/`.env.*`). Source it:
 
 ```bash
 set -a; . ./.env; set +a
 RUST_LOG=obsink_core=debug cargo run -p obsink -- sync
 ```
 
-- `WORKER_URL` — `https://obsink-worker.spencer-080.workers.dev` (account
-  `Spencer` / `080eb52a3c7398cf1e99d39f2c664bc8`).
-- `WORKER_API_KEY` — the Worker's `API_KEY` secret (the *operator* bearer;
-  rotated 2026-07-30). Cloudflare secrets are write-only, so this is the only
-  copy. Since P7 this Worker is also **ObSink Cloud**: accounts get their own
-  session bearers and vault lists; the operator key only sees the legacy
-  `vaults` list. Never hand `WORKER_API_KEY` to a tester — they sign up.
-- `RESEND_API_KEY` — Resend key for hosted email sign-in (shared with the
-  restaurant project; verified domain `resend.spencerjireh.com`, Worker var
-  `MAIL_FROM` set to `login@` on it). Set on the Worker 2026-08-26.
+- `OBSINK_SERVER_URL` — the server to test against (`http://localhost:8080`
+  for the local compose stack; the Coolify domain for production).
+- `OBSINK_API_KEY` — the operator bearer; the same value is the server's
+  `OBSINK_API_KEY` env var. Never hand it to a tester — they sign up with an
+  invite (`obsink invite`).
+- `DEVELOPMENT_TEAM`, `ASC_KEY_ID`, `ASC_ISSUER_ID`, `ASC_KEY_PATH` — Apple
+  signing and App Store Connect for `scripts/build-ios.sh` / `release-ios.sh`.
 - Clients store bearers in the OS keychain (service `obsink`, account
-  `bearer:<worker url>`), never in `config.toml` / `app.json` / UserDefaults.
+  `bearer:<server url>`), never in `config.toml` / `app.json` / UserDefaults.
+- Production secrets (`OBSINK_SERVER_KEY`, `POSTGRES_PASSWORD`, `SMTP_*`) live
+  only in Coolify's environment. Back up `OBSINK_SERVER_KEY`: without it the
+  server's metadata is unreadable.
 
-The Cloudflare **account API token** used for `wrangler`/deploys is **not**
-stored here — create one in the dashboard on demand and revoke it after. A
-`#[ignore]`d live desktop test reads `OBSINK_TEST_WORKER_URL` /
-`OBSINK_TEST_API_KEY` (see `docs/platforms.md`).
+The Cloudflare Worker, R2 bucket, KV namespace, and Resend key from before the
+P8 pivot are decommissioned; nothing in the repo references them.
 
 ## Workflow expectations
 
@@ -141,9 +156,10 @@ stored here — create one in the dashboard on demand and revoke it after. A
 Status, tasks, decisions, and session logs live in the Plane project **OBS**
 ("ObSink"), reachable via the plane MCP tools. Conventions:
 
-- `spec.md` phases **P1–P7** are Plane *modules*; module status tracks phase
-  progression (P1/P2/P3 completed; P4/P6/P7 in-progress; P5 backlog). P7 =
-  accounts & hosted backend (OBS-76..80).
+- `spec.md` phases are Plane *modules*; module status tracks phase
+  progression (P1/P2/P3/P7 completed; P4/P6/P8 in-progress; P5 cancelled). P8 =
+  the self-hosted server pivot (OBS-82..89); P7 (Cloudflare accounts) is
+  superseded by it.
 - Work items are session-sized; move to **In Progress** when starting, comment
   outcomes (e.g. test output or a deploy URL), then mark **Done**. Reference the
   item in commits: `P4: file-provider enumerateChanges (OBS-12)`.

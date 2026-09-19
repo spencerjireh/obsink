@@ -1,95 +1,138 @@
 # Self-Hosting Guide
 
-ObSink runs entirely on your own Cloudflare account. This guide takes you from zero to a deployed Worker that the CLI, desktop app, and iOS app can sync against.
-
-> Don't want to run anything? Every client also offers **ObSink Cloud** — the operator-hosted Worker with self-serve accounts. Pick "ObSink Cloud" at setup and sign in with your email (or Sign in with Apple on iOS). Operators: see [hosted.md](hosted.md).
+ObSink's backend is one Rust binary (`obsink-server`) plus Postgres, run with Docker Compose. This
+guide takes you from zero to a server that the CLI, desktop app, and iOS app can sync against.
 
 You need:
 
-- A Cloudflare account (the free plan is enough to start; R2 requires adding a payment method but has a generous free tier).
-- [Node.js](https://nodejs.org) 20+ and [Rust](https://rustup.rs) (stable).
-- The [Wrangler](https://developers.cloudflare.com/workers/wrangler/) CLI (installed via the worker's dev dependencies).
+- A host with Docker and Docker Compose v2 (a small VPS, a NAS, a home server).
+- A domain and TLS. The server speaks plain HTTP on port 8080; put a reverse proxy in front
+  (Coolify's Traefik, Caddy, nginx, or Tailscale). iOS refuses plain HTTP to a public host.
+- Optional: an SMTP account for email sign-in codes. Without SMTP, iOS users sign in with Apple
+  and desktop/CLI users need a dev-only flag (see "Without SMTP").
 
-## 1. Authenticate Wrangler
-
-```bash
-cd worker
-npm ci
-npx wrangler login          # opens a browser for OAuth
-npx wrangler whoami         # confirm your account + permissions
-```
-
-You need `workers` and `workers_kv` write permissions; R2 must be enabled on the account.
-
-## 2. Create the storage primitives
-
-ObSink stores encrypted blobs in **R2** and manifests/metadata in **KV**.
+## 1. Try it locally
 
 ```bash
-# From the worker/ directory
-npx wrangler kv namespace create META       # note the printed namespace id
-npx wrangler r2 bucket create obsink-files
+git clone https://github.com/spencerjireh/obsink && cd obsink
+docker compose up -d                 # builds the server, starts Postgres and Mailpit
+curl -s localhost:8080/              # {"service":"obsink","auth":{...},"invite_required":false}
 ```
 
-> You can also provision these with Terraform — see [deploy.md](deploy.md). Terraform needs a `CLOUDFLARE_API_TOKEN`; the Wrangler OAuth login above does not, which is why the CLI path is simplest for a first deploy.
+The local stack sets `AUTH_DEV_RETURN_CODE=1` so sign-in codes come back in the API response, and
+routes mail to Mailpit at <http://localhost:8025>. Set `OBSINK_PORT=18080` if 8080 is taken.
 
-## 3. Render the Worker config
-
-`worker/wrangler.toml` is generated (and git-ignored) so resource IDs never land in version control:
+Sign in from the CLI and create a vault:
 
 ```bash
-# From the repo root
-WORKER_NAME=obsink-worker \
-KV_NAMESPACE_ID=<the id from step 2> \
-R2_BUCKET_NAME=obsink-files \
-bash scripts/render-worker-config.sh worker/wrangler.toml
+cargo run -p obsink -- login --server-url http://localhost:8080 --email you@example.com
+cargo run -p obsink -- init --server-url http://localhost:8080 --vault-name notes \
+  --directory ~/Obsidian/notes --passphrase "correct horse battery staple"
 ```
 
-## 4. Deploy the Worker
+## 2. Configuration
+
+Every setting is an environment variable. Defaults are in `server/src/config.rs`.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `DATABASE_URL` | required | Postgres connection string |
+| `OBSINK_DATA_DIR` | `/data` | Blob volume; also holds `server.key` when the key is not set |
+| `OBSINK_SERVER_KEY` | generated | 32-byte base64 envelope key (`obsink-server keygen`). **Back it up**: metadata is unreadable without it |
+| `OBSINK_API_KEY` | unset | Operator bearer for the admin CLI and `scripts/verify-*`. Unset disables it |
+| `SMTP_HOST`, `SMTP_PORT` (587), `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM`, `SMTP_TLS` (`starttls`\|`tls`\|`none`) | unset | Email one-time codes. Unset = email sign-in disabled |
+| `APPLE_CLIENT_IDS` | `com.obsink.ios` | Accepted audiences for Sign in with Apple; empty disables it |
+| `AUTH_DEV_RETURN_CODE` | unset | `1` returns the email code in the API response. **Never in production** |
+| `MAX_VAULTS_PER_USER` | `10` | Per-account vault cap |
+| `MAX_VAULT_BYTES` | `1073741824` | Per-vault byte budget for accounts (`507` when exceeded) |
+| `MAX_FILE_BYTES` | `52428800` | Hard per-file cap (`413`) |
+| `MAX_BATCH_BYTES` | `134217728` | Whole-request cap for `/batch` |
+| `RETENTION_INTERVAL_SECS` | `86400` | Version/trash pruning cadence |
+| `OBSINK_MIGRATE_ON_START` | `1` | Apply migrations at startup |
+| `OBSINK_LISTEN` | `0.0.0.0:8080` | Bind address |
+| `RUST_LOG` | `obsink_server=info,tower_http=info` | Log filter |
+
+Sign in with Apple works on any server without Apple-side configuration: the identity token's
+audience is the ObSink app's bundle id, which the server verifies against Apple's public keys.
+
+## 3. Deploy with Coolify
+
+1. In Coolify, add a resource of type **Docker Compose** pointing at this repository (branch
+   `main`) with the compose file `docker-compose.coolify.yml`. It pulls
+   `ghcr.io/spencerjireh/obsink-server:latest` (built by the `Server image` workflow) and runs
+   Postgres alongside it.
+2. Set the environment variables in Coolify:
+   - `OBSINK_SERVER_KEY` — run `docker run --rm ghcr.io/spencerjireh/obsink-server keygen` and
+     paste the output. Store it somewhere safe.
+   - `OBSINK_API_KEY` — `openssl rand -hex 32`.
+   - `POSTGRES_PASSWORD` — `openssl rand -hex 24`.
+   - `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM`, `SMTP_TLS` — from your
+     mail provider.
+3. Assign a domain to the `server` service (port 8080). Coolify's Traefik issues the certificate.
+4. Deploy. Coolify creates the two named volumes (`obsink-data`, `obsink-pg`); mark them persistent
+   in the resource settings so redeploys keep them.
+5. Check `https://your-domain/healthz` returns `{"ok":true}` and `https://your-domain/` lists the
+   sign-in methods you configured.
+
+Any other compose host works the same way: copy `docker-compose.coolify.yml`, provide the same
+environment, and route your proxy to port 8080 of the `server` container.
+
+## 4. First account and invites
+
+The first sign-up on a fresh server needs no invite. After that every new account must present an
+invite code; existing accounts sign in freely.
 
 ```bash
-cd worker
-npx wrangler deploy
+# You, on the first device (CLI shown; the desktop and iOS apps have the same flow)
+obsink login --server-url https://your-domain --email you@example.com
+
+# Mint codes for others (any signed-in user can; codes are single-use, valid 7 days)
+obsink invite --server-url https://your-domain
+# or from the host, without a session:
+docker compose -f docker-compose.coolify.yml exec server obsink-server invite --count 3
 ```
 
-Wrangler prints your Worker URL, e.g. `https://obsink-worker.<subdomain>.workers.dev`. Save it.
+Friends enter the code in the "Invite code" field when they sign in for the first time.
 
-## 5. Set the API key secret
+## 5. Verify
 
-Every request must carry `Authorization: Bearer <API_KEY>`. Generate a strong key and store it as a Worker secret:
+With `.env` holding `OBSINK_SERVER_URL` and `OBSINK_API_KEY` (see `.env.example`):
 
 ```bash
-API_KEY="$(openssl rand -hex 32)"
-echo "$API_KEY"                                   # save this — clients need it
-printf '%s' "$API_KEY" | npx wrangler secret put API_KEY
+set -a; . ./.env; set +a
+scripts/verify-server-deploy.sh        # contract: vaults, manifest ETag, conflict 409, batch, invites
+scripts/verify-cli-deployed-sync.sh    # two CLI "devices" sync and resolve a conflict
 ```
 
-Treat this key like a password. Rotate it any time by running `wrangler secret put API_KEY` again (all clients must update). Clients keep it in the OS keychain (CLI: `obsink connect --worker-url <url> --api-key <key> …` remembers it for that URL).
+Both create and delete their own vaults under the operator principal.
 
-Optional: a self-hosted Worker can also offer **accounts** (email one-time code, Sign in with Apple) so family or team members get their own vault lists instead of sharing your key. Set `RESEND_API_KEY` (and `APPLE_CLIENT_IDS` in `wrangler.toml`) as described in [hosted.md](hosted.md); the `API_KEY` keeps working alongside.
+## 6. Without SMTP
 
-## 6. Verify the deployment
+If you cannot send mail, iOS users still have Sign in with Apple. For desktop and CLI, run a
+one-off local stack with `AUTH_DEV_RETURN_CODE=1` (as `docker-compose.yml` does) so the code is
+printed instead of mailed, or mint sessions through an invite from a device that can sign in.
+Do not enable `AUTH_DEV_RETURN_CODE` on an internet-facing server: it hands the code to anyone who
+knows an email address.
 
-Two scripts exercise the live endpoint end-to-end:
+## 7. Backups and upgrades
 
-```bash
-export WORKER_URL="https://obsink-worker.<subdomain>.workers.dev"
-export WORKER_API_KEY="$API_KEY"
-
-./scripts/verify-worker-deploy.sh        # all endpoints, incl. a real 409, batch, delete
-./scripts/verify-cli-deployed-sync.sh    # two-device CLI sync + an interactively resolved conflict
-```
-
-Both should print `... verification passed`.
+- **Back up** the Postgres database (`pg_dump`) and the `/data` volume together, plus
+  `OBSINK_SERVER_KEY`. Blobs are useless without the database (which maps them to vaults) and both
+  are useless without the key. Vault contents stay unreadable without each vault's passphrase in
+  any case.
+- **Upgrade** by pulling a newer image and redeploying; migrations run at startup
+  (`OBSINK_MIGRATE_ON_START=1`). `obsink-server migrate` applies them by hand.
+- **Retention** runs at startup and daily; `obsink-server retention` runs one pass and prints what
+  it removed.
 
 ## What gets stored where
 
-- **R2 (`obsink-files`)** — encrypted file blobs, keyed by an opaque per-path token (`<vaultId>/<token>`); plus `_versions/` and `_trash/` prefixes for retained history.
-- **KV (`META`)** — the operator's vault list (`vaults`), per-account vault lists (`vaults:<userId>`), one manifest per vault (`manifest:<vaultId>`), and — when accounts are enabled — user/session records (hashed tokens, no passwords; see [architecture.md](architecture.md)). Manifests are keyed by path token and contain keyed hashes + the encrypted real path (`encPath`).
+- Postgres: accounts (sealed email/Apple subject), sessions (token hashes), invites, vault rows,
+  and one manifest row per file (path token, keyed content hash, size, mtime, tombstone flag,
+  encrypted real path).
+- `/data/blobs/live/<vault>/…`: current blobs. `/data/blobs/_versions/…` and
+  `/data/blobs/_trash/…`: history, pruned by retention.
+- `/data/server.key`: the envelope key, only when `OBSINK_SERVER_KEY` is unset.
 
-The server never sees plaintext paths, file contents, or content-derived hashes. See [architecture.md](architecture.md) for the crypto details.
-
-## Maintenance
-
-- **Version/trash pruning** runs automatically via the Worker's two Cron Triggers (configured in `wrangler.toml`): versions are trimmed to the newest 10 per file and 14 days; trash is purged after 30 days.
-- **Resetting a vault** for testing: delete its `manifest:<vaultId>` KV key and the `vaults` key, and remove the corresponding R2 objects. (The wire format is versioned via `PROTOCOL_VERSION`; a format change invalidates old manifests.)
+Everything a client uploads is already AES-256-GCM ciphertext under the vault key; the server wraps
+it once more with its own key and never sees plaintext (spec §6).

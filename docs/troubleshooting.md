@@ -10,11 +10,17 @@ RUST_LOG=obsink_core=debug obsink sync   # logs go to stderr
 
 ## Authentication
 
-**`401 unauthorized` / `unexpected status 401`**
-The API key the client sends doesn't match the Worker's `API_KEY` secret. Confirm the key, and re-set it with `wrangler secret put API_KEY` if unsure. Every request needs `Authorization: Bearer <key>`.
+**`401 unauthorized` / `unauthorized: sign in again`**
+The session was revoked (Sign out on another device, account deleted) or expired (180 days), or the operator bearer does not match the server's `OBSINK_API_KEY`. Run `obsink login --server-url <url>` again; the desktop and iOS apps show "Signed out" and offer sign-in.
+
+**`403 an invite code is required to create an account`**
+The server already has accounts, so a new one needs an invite. Ask any existing user for `obsink invite` (or the operator for `obsink-server invite`) and pass it with `--invite-code` / the Invite code field. `invite code is invalid, used, or expired` means the code was spent or is older than 7 days.
 
 **`404 vault not found`**
-The vault ID isn't in the Worker's `vaults` KV entry. It may have been wiped, or you're pointed at the wrong Worker URL. List vaults: `curl -H "Authorization: Bearer $KEY" $WORKER_URL/vaults`.
+The vault belongs to a different account (each principal sees only its own vaults), was deleted, or you are pointed at the wrong server URL. List vaults: `obsink vaults --server-url <url>`.
+
+**`503 email sign-in is not configured on this server`**
+The operator has not set `SMTP_*`. Use Sign in with Apple on iOS, or ask the operator to configure SMTP (see [self-hosting.md](self-hosting.md)).
 
 ## Decryption / passphrase
 
@@ -43,20 +49,29 @@ Another device wrote the same file between your `prepare_sync` and `complete_syn
 ## Network
 
 **Sync hangs then errors**
-Requests time out after 30s and transient failures (timeouts, connection drops) retry 3× with backoff. A persistent failure means the Worker is unreachable or the URL is wrong. Check `curl -fsS $WORKER_URL/vaults -H "Authorization: Bearer $KEY"`.
+Requests time out after 30s and transient failures (timeouts, connection drops) retry 3× with backoff. A persistent failure means the server is unreachable or the URL is wrong. Check `curl -fsS $OBSINK_SERVER_URL/healthz` and `curl -fsS $OBSINK_SERVER_URL/vaults -H "Authorization: Bearer $OBSINK_API_KEY"`.
 
 **Uploads succeed but a later sync re-uploads the same file**
 Usually a clock/mtime issue or a `.obsink/manifest.json` that didn't persist. Confirm the local manifest is being written (it lives at `<vault>/.obsink/manifest.json`) and that the directory is writable.
 
+**Sync sees no remote changes that you know exist**
+The client caches the last server manifest with its ETag in `<vault>/.obsink/remote-manifest.json` and asks the server "changed since?". The server answers from its own revision counter, so a stale answer means the two are out of step (a restored database backup, for example). Delete `.obsink/remote-manifest.json` and sync again.
+
+**`507 vault storage limit reached`**
+The account's per-vault byte budget (`MAX_VAULT_BYTES`, default 1 GiB) is full. The sync stops (this is fatal, not per-file). Free space by deleting files and syncing, or ask the operator to raise the limit. `obsink whoami` shows usage.
+
 ## Storage / server
 
-**Old files still appear in R2 after deleting a vault**
-Deleting a vault's KV entries removes it logically; orphaned R2 blobs become unreachable (file reads require the vault to exist). Wrangler can't bulk-list R2 objects, so residual encrypted blobs may remain — they're inert. Delete by exact key with `wrangler r2 object delete obsink-files/<key>` if you want them gone.
+**The server will not start: `OBSINK_SERVER_KEY: expected 32 bytes`**
+The key must be 32 bytes, base64. Generate one with `obsink-server keygen`. If you lose the key that sealed an existing database, its metadata (emails, vault names, session names) and blobs are unreadable; restore the key from your backup.
+
+**Blob directories remain after deleting a vault**
+Vault deletion removes the rows and then the directories; if the process died in between, the daily retention pass removes directories whose vault row is gone. Run `obsink-server retention` to do it now (`docker compose exec server obsink-server retention`).
 
 **Versions or trash growing unexpectedly**
-Pruning runs on Cron Triggers (`_versions/`: newest 10 per file / 14 days; `_trash/`: 30 days). If they're not running, confirm the `[triggers] crons` block is present in `wrangler.toml` and was included in the last `wrangler deploy`.
+Pruning runs in-process at startup and every `RETENTION_INTERVAL_SECS` (`_versions/`: newest 10 per file / 14 days; `_trash/`: 30 days). Check the server log for `retention pass complete`; run a pass by hand with `obsink-server retention`.
 
 ## Wire-format mismatch
 
 **After upgrading, an existing vault won't sync or paths look wrong**
-The manifest wire format is versioned (`PROTOCOL_VERSION`). A format change (e.g. the v2 HMAC-hash + encrypted-path migration) invalidates old manifests. Re-initialize the vault: wipe its KV manifest and R2 objects, then `init`/`connect` fresh.
+The manifest wire format is versioned (`PROTOCOL_VERSION`). A format change (e.g. the v2 HMAC-hash + encrypted-path migration) invalidates old manifests. Re-initialize the vault: delete it on the server (`DELETE /vaults/:id`, or from the app), then `init`/`connect` fresh.

@@ -62,7 +62,7 @@ pub fn content_hmac(mac_key: &KeyBytes, bytes: &[u8]) -> String {
     hex::encode(mac.finalize().into_bytes())
 }
 
-/// Deterministic per-path token used as the manifest key, R2 object key, and
+/// Deterministic per-path token used as the manifest key, server blob key, and
 /// URL segment. Deterministic so independent devices agree on the same token
 /// for the same path (which is what makes manifest diffing work).
 pub fn path_token(token_key: &KeyBytes, path: &str) -> String {
