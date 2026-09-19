@@ -248,6 +248,29 @@ function App() {
     }
   }
 
+  // Returns whether it succeeded so the confirmation form knows to close.
+  async function handleDeleteAccount(): Promise<boolean> {
+    setBusy(true)
+    setMessage('')
+    try {
+      await call('delete_account', { serverUrl: currentServerUrl })
+      setAccount({ kind: 'signed_out' })
+      setInvites([])
+      setRemoteVaults(null)
+      setSyncResult(null)
+      setConflicts([])
+      setChoices({})
+      await refresh()
+      setMessage('Account deleted.')
+      return true
+    } catch (error) {
+      fail(error)
+      return false
+    } finally {
+      setBusy(false)
+    }
+  }
+
   async function handleLoadRemoteVaults() {
     setBusy(true)
     setMessage('')
@@ -553,6 +576,7 @@ function App() {
             onCopyInvite: handleCopyInvite,
             onRevokeDevice: handleRevokeDevice,
             onSignOut: handleSignOut,
+            onDeleteAccount: handleDeleteAccount,
           }}
           addVault={{
             form,

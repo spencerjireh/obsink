@@ -1,7 +1,8 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { AccountState, AuthCapabilities, InviteInfo } from '../types'
 import { usageLine } from '../lib/format'
 import { DEFAULT_SERVER_URL } from '../lib/server-url'
+import { ConfirmForm } from './ConfirmForm'
 import { DeviceList } from './DeviceList'
 import { EmptyState } from './EmptyState'
 import { InviteList } from './InviteList'
@@ -33,6 +34,7 @@ type Props = {
   onCopyInvite: (code: string) => void
   onRevokeDevice: (sessionId: string) => void
   onSignOut: () => void
+  onDeleteAccount: () => Promise<boolean>
 }
 
 export function AccountSection({
@@ -59,7 +61,9 @@ export function AccountSection({
   onCopyInvite,
   onRevokeDevice,
   onSignOut,
+  onDeleteAccount,
 }: Props) {
+  const [confirmingDelete, setConfirmingDelete] = useState(false)
   const noServer = serverUrl.trim() === DEFAULT_SERVER_URL
   const inviteRef = useRef<HTMLInputElement>(null)
 
@@ -106,8 +110,28 @@ export function AccountSection({
               >
                 Invite someone
               </button>
+              <button
+                className="button button--danger"
+                disabled={busy || confirmingDelete}
+                onClick={() => setConfirmingDelete(true)}
+                type="button"
+              >
+                Delete account
+              </button>
             </span>
           </div>
+          {confirmingDelete ? (
+            <ConfirmForm
+              title="Delete account"
+              description={`This deletes your account, every vault it owns on ${serverUrl.trim()}, and every signed-in device. Vault folders on this device stay.`}
+              expected={account.email ?? 'delete'}
+              caseInsensitive
+              confirmLabel="Delete account"
+              busy={busy}
+              onConfirm={onDeleteAccount}
+              onCancel={() => setConfirmingDelete(false)}
+            />
+          ) : null}
           <DeviceList
             devices={account.devices}
             busy={busy}
