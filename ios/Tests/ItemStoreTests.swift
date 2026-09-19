@@ -248,4 +248,22 @@ final class ItemStoreTests: XCTestCase {
         try FileManager.default.removeItem(at: copy)
         XCTAssertTrue(FileManager.default.fileExists(atPath: source.path))
     }
+
+    // OBS-100: removing a vault closes its cached store; a later `store(for:)`
+    // opens a fresh one instead of reusing a closed queue.
+    func testForgetClosesAndReopens() throws {
+        let id = "vault_forget_\(UUID().uuidString)"
+        let first = ItemStore.store(for: id)
+        XCTAssertEqual(try first.pendingCount(), 0)
+
+        ItemStore.forget(vaultID: id)
+        XCTAssertThrowsError(try first.pendingCount(), "the closed queue rejects work")
+
+        let second = ItemStore.store(for: id)
+        XCTAssertEqual(try second.pendingCount(), 0)
+        ItemStore.forget(vaultID: id)
+        for suffix in ["", "-wal", "-shm"] {
+            try? FileManager.default.removeItem(atPath: ItemStore.defaultDatabaseURL(vaultID: id).path + suffix)
+        }
+    }
 }

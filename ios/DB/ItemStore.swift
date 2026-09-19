@@ -23,6 +23,15 @@ final class ItemStore {
     private static var stores: [String: ItemStore] = [:]
     private static let storesLock = NSLock()
 
+    /// Close and drop the cached store for a vault that is being removed, so
+    /// the database file can be deleted and a later re-add opens a fresh one.
+    static func forget(vaultID: String) {
+        storesLock.lock()
+        let store = stores.removeValue(forKey: vaultID)
+        storesLock.unlock()
+        try? store?.dbQueue.close()
+    }
+
     private let dbQueue: DatabaseQueue
 
     /// Open (or create) the store at `databaseURL`. Tests pass a temp URL.

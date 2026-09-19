@@ -55,7 +55,8 @@ targets:
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
       configs:
         # Debug adds the File Provider testing-mode entitlement so simulator
-        # runs can force-enable the domain (see SyncModel.registerFileProviderDomain).
+        # runs can force-enable the domain (see SyncModel.fpDomain(for:) and
+        # syncFileProviderDomains()).
         Debug:
           CODE_SIGN_ENTITLEMENTS: ObSink/ObSinkDebug.entitlements
 
