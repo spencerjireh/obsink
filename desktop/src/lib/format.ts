@@ -1,4 +1,4 @@
-import type { SyncPhase, SyncResult, UsageInfo } from '../types'
+import type { InviteStatus, SyncPhase, SyncResult, UsageInfo } from '../types'
 
 export function formatBytes(value: number): string {
   if (value < 1024) return `${value} B`
@@ -48,4 +48,15 @@ export function phaseLabel(phase: SyncPhase): string {
 
 export function plural(count: number, noun: string): string {
   return `${count} ${noun}${count === 1 ? '' : 's'}`
+}
+
+export function inviteStatusLabel(status: InviteStatus): string {
+  switch (status) {
+    case 'active':
+      return 'Active'
+    case 'used':
+      return 'Used'
+    case 'expired':
+      return 'Expired'
+  }
 }

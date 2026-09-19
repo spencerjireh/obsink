@@ -62,7 +62,7 @@ function App() {
   const [authCode, setAuthCode] = useState('')
   const [inviteCode, setInviteCode] = useState('')
   const [codeSent, setCodeSent] = useState(false)
-  const [issuedInvite, setIssuedInvite] = useState<InviteInfo | null>(null)
+  const [invites, setInvites] = useState<InviteInfo[]>([])
   // What `GET /` says about this server; null until the URL has been checked.
   const [capabilities, setCapabilities] = useState<AuthCapabilities | null>(null)
   // The server refused a sign-up without an invite: show the field even when
@@ -96,7 +96,18 @@ function App() {
       setAccount(next)
       if (next.kind === 'account') {
         setSessionExpired(false)
+        await refreshInvites(url)
+      } else {
+        setInvites([])
       }
+    } catch (error) {
+      fail(error)
+    }
+  }
+
+  async function refreshInvites(url: string) {
+    try {
+      setInvites(await call<InviteInfo[]>('list_invites', { serverUrl: url }))
     } catch (error) {
       fail(error)
     }
@@ -187,8 +198,9 @@ function App() {
     setBusy(true)
     setMessage('')
     try {
-      const invite = await call<InviteInfo>('create_invite', { serverUrl: currentServerUrl })
-      setIssuedInvite(invite)
+      await call<InviteInfo>('create_invite', { serverUrl: currentServerUrl })
+      await refreshInvites(currentServerUrl)
+      setMessage('Invite code created.')
     } catch (error) {
       fail(error)
     } finally {
@@ -196,13 +208,27 @@ function App() {
     }
   }
 
-  async function handleCopyInvite() {
-    if (!issuedInvite) return
+  async function handleCopyInvite(code: string) {
     try {
-      await navigator.clipboard.writeText(issuedInvite.code)
+      await navigator.clipboard.writeText(code)
       setMessage('Invite code copied.')
     } catch (error) {
       fail(error)
+    }
+  }
+
+  async function handleRevokeDevice(sessionId: string) {
+    setBusy(true)
+    setMessage('')
+    try {
+      setAccount(
+        await call<AccountState>('revoke_session', { serverUrl: currentServerUrl, sessionId }),
+      )
+      setMessage('Device signed out.')
+    } catch (error) {
+      fail(error)
+    } finally {
+      setBusy(false)
     }
   }
 
@@ -212,7 +238,7 @@ function App() {
     try {
       await call('sign_out', { serverUrl: currentServerUrl })
       setAccount({ kind: 'signed_out' })
-      setIssuedInvite(null)
+      setInvites([])
       setRemoteVaults(null)
       setMessage(`Signed out of ${currentServerUrl}.`)
     } catch (error) {
@@ -510,7 +536,7 @@ function App() {
             authCode,
             inviteCode,
             codeSent,
-            issuedInvite,
+            invites,
             busy,
             capabilities,
             inviteRequired: (capabilities?.invite_required ?? false) || inviteForced,
@@ -525,6 +551,7 @@ function App() {
             onChangeEmail: () => setCodeSent(false),
             onCreateInvite: handleCreateInvite,
             onCopyInvite: handleCopyInvite,
+            onRevokeDevice: handleRevokeDevice,
             onSignOut: handleSignOut,
           }}
           addVault={{

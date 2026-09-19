@@ -96,17 +96,32 @@ export type UsageInfo = {
   vaults: { id: string; bytes: number }[]
 }
 
+export type DeviceInfo = {
+  session_id: string
+  device_name: string
+  created: number
+  current: boolean
+}
+
 export type AccountState =
   | { kind: 'signed_out' }
   | {
       kind: 'account'
       user_id: string
       email: string | null
-      devices: { session_id: string; device_name: string; current: boolean }[]
+      devices: DeviceInfo[]
       usage: UsageInfo | null
     }
 
-export type InviteInfo = { code: string; expires: number }
+export type InviteStatus = 'active' | 'used' | 'expired'
+
+export type InviteInfo = {
+  code: string
+  created: number
+  expires: number
+  status: InviteStatus
+  used_at: number | null
+}
 
 // `GET /` on the server: which sign-in methods exist and whether a new
 // account needs an invite code.

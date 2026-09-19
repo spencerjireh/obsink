@@ -1,8 +1,10 @@
 import { useEffect, useRef } from 'react'
 import type { AccountState, AuthCapabilities, InviteInfo } from '../types'
-import { formatUnix, usageLine } from '../lib/format'
+import { usageLine } from '../lib/format'
 import { DEFAULT_SERVER_URL } from '../lib/server-url'
+import { DeviceList } from './DeviceList'
 import { EmptyState } from './EmptyState'
+import { InviteList } from './InviteList'
 
 type Props = {
   serverUrl: string
@@ -11,7 +13,7 @@ type Props = {
   authCode: string
   inviteCode: string
   codeSent: boolean
-  issuedInvite: InviteInfo | null
+  invites: InviteInfo[]
   busy: boolean
   capabilities: AuthCapabilities | null
   // Show the invite field: the server needs one for new accounts, or it
@@ -28,7 +30,8 @@ type Props = {
   onVerifyCode: () => void
   onChangeEmail: () => void
   onCreateInvite: () => void
-  onCopyInvite: () => void
+  onCopyInvite: (code: string) => void
+  onRevokeDevice: (sessionId: string) => void
   onSignOut: () => void
 }
 
@@ -39,7 +42,7 @@ export function AccountSection({
   authCode,
   inviteCode,
   codeSent,
-  issuedInvite,
+  invites,
   busy,
   capabilities,
   inviteRequired,
@@ -54,6 +57,7 @@ export function AccountSection({
   onChangeEmail,
   onCreateInvite,
   onCopyInvite,
+  onRevokeDevice,
   onSignOut,
 }: Props) {
   const noServer = serverUrl.trim() === DEFAULT_SERVER_URL
@@ -91,7 +95,6 @@ export function AccountSection({
           <div className="account-row">
             <span>
               Signed in as <strong>{account.email ?? account.user_id}</strong>
-              {account.devices.length > 1 ? ` · ${account.devices.length} devices` : ''}
               {usageLine(account.usage)}
             </span>
             <span className="choice-row">
@@ -103,27 +106,15 @@ export function AccountSection({
               >
                 Invite someone
               </button>
-              <button
-                className="button button--ghost"
-                disabled={busy}
-                onClick={onSignOut}
-                type="button"
-              >
-                Sign out
-              </button>
             </span>
           </div>
-          {issuedInvite ? (
-            <div className="invite-box">
-              <span>
-                Invite code <code>{issuedInvite.code}</code> · expires{' '}
-                {formatUnix(issuedInvite.expires)}
-              </span>
-              <button className="button button--ghost" onClick={onCopyInvite} type="button">
-                Copy
-              </button>
-            </div>
-          ) : null}
+          <DeviceList
+            devices={account.devices}
+            busy={busy}
+            onSignOut={onSignOut}
+            onRevoke={onRevokeDevice}
+          />
+          <InviteList invites={invites} busy={busy} onCopy={onCopyInvite} />
         </>
       ) : capabilities && !capabilities.email ? (
         <EmptyState>This server has no email sign-in.</EmptyState>

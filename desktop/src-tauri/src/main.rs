@@ -182,7 +182,23 @@ struct VaultUsageInfo {
 #[derive(Debug, Clone, Serialize)]
 struct InviteInfo {
     code: String,
+    created: u64,
     expires: u64,
+    /// `active`, `used`, or `expired` (the server decides).
+    status: String,
+    used_at: Option<u64>,
+}
+
+impl From<obsink_core::Invite> for InviteInfo {
+    fn from(invite: obsink_core::Invite) -> Self {
+        Self {
+            code: invite.code,
+            created: invite.created,
+            expires: invite.expires,
+            status: invite.status,
+            used_at: invite.used_at,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -293,10 +309,35 @@ async fn create_invite(server_url: String) -> Result<InviteInfo, CommandError> {
         AuthClient::new(&server_url).create_invite(&bearer),
     )
     .await?;
-    Ok(InviteInfo {
-        code: invite.code,
-        expires: invite.expires,
-    })
+    Ok(invite.into())
+}
+
+/// Every invite this account minted, newest first, with its status.
+#[tauri::command]
+async fn list_invites(server_url: String) -> Result<Vec<InviteInfo>, CommandError> {
+    let bearer = load_bearer(&server_url)?;
+    let invites = bearer_call(
+        &server_url,
+        AuthClient::new(&server_url).list_invites(&bearer),
+    )
+    .await?;
+    Ok(invites.into_iter().map(InviteInfo::from).collect())
+}
+
+/// Sign out another device of the same account. Returns the refreshed
+/// account so the UI gets the new device list in one round trip.
+#[tauri::command]
+async fn revoke_session(
+    server_url: String,
+    session_id: String,
+) -> Result<AccountState, CommandError> {
+    let bearer = load_bearer(&server_url)?;
+    bearer_call(
+        &server_url,
+        AuthClient::new(&server_url).revoke_session(&bearer, &session_id),
+    )
+    .await?;
+    get_account(server_url).await
 }
 
 /// Sign out of a server. Vault configs stay; sync will ask for a credential
@@ -1044,6 +1085,8 @@ fn main() {
             auth_email_start,
             auth_email_verify,
             create_invite,
+            list_invites,
+            revoke_session,
             get_account,
             get_auth_capabilities,
             list_remote_vaults,
