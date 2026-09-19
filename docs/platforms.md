@@ -70,8 +70,10 @@ The desktop command layer (the exact Tauri commands the UI invokes) is covered b
 ```bash
 OBSINK_TEST_SERVER_URL=http://localhost:8080 \
 OBSINK_TEST_API_KEY=dev-operator-key OBSINK_TEST_PASSPHRASE=... \
-cargo test -p obsink-desktop live_tests -- --ignored --nocapture
+cargo test -p obsink-desktop live_tests -- --ignored --nocapture --test-threads=1
 ```
+
+Both tests sandbox `HOME`, so they run one at a time. `account_flow_live` signs the same address in twice and waits out the server's 60 s email cooldown, so expect about a minute.
 
 `desktop_flows_live` seeds the operator bearer into the file keyring the way a sign-in would; `account_flow_live` signs in with the email code and, on a server that already has accounts, mints the invite it needs with `OBSINK_TEST_API_KEY`.
 

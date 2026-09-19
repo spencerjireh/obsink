@@ -456,30 +456,38 @@ fn set_active_vault(vault_id: String) -> Result<LocalVaultSummary, CommandError>
 }
 
 /// Forget a vault on this device only. Refused while a sync on it runs.
+fn remove_vault_inner(vault_id: &str, state: &AppState) -> Result<(), CommandError> {
+    let _guard = InFlightGuard::acquire(state, vault_id)?;
+    forget_vault(vault_id)?;
+    set_pending_plan(state, vault_id, None)
+}
+
 #[tauri::command]
 fn remove_vault(vault_id: String, state: tauri::State<'_, AppState>) -> Result<(), CommandError> {
-    let _guard = InFlightGuard::acquire(&state, &vault_id)?;
-    forget_vault(&vault_id)?;
-    set_pending_plan(&state, &vault_id, None)
+    remove_vault_inner(&vault_id, &state)
 }
 
 /// Delete a vault and all its files on the server, then forget it here. A
 /// 404 (already gone) is reported as-is; "Remove from this device" is the
 /// way out in that case.
-#[tauri::command]
-async fn delete_remote_vault(
-    vault_id: String,
-    state: tauri::State<'_, AppState>,
-) -> Result<(), CommandError> {
-    let vault = selected_vault(Some(vault_id.clone()))?;
-    let _guard = InFlightGuard::acquire(&state, &vault.id)?;
+async fn delete_remote_vault_inner(vault_id: &str, state: &AppState) -> Result<(), CommandError> {
+    let vault = selected_vault(Some(vault_id.to_string()))?;
+    let _guard = InFlightGuard::acquire(state, &vault.id)?;
     bearer_call(
         &vault.server_url,
         ApiClient::new(to_vault_config(&vault)).delete_vault(),
     )
     .await?;
     forget_vault(&vault.id)?;
-    set_pending_plan(&state, &vault.id, None)
+    set_pending_plan(state, &vault.id, None)
+}
+
+#[tauri::command]
+async fn delete_remote_vault(
+    vault_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), CommandError> {
+    delete_remote_vault_inner(&vault_id, &state).await
 }
 
 #[tauri::command]
@@ -1564,11 +1572,166 @@ mod live_tests {
         assert_eq!(refused.kind, ErrorKind::Server, "{refused}");
         assert_eq!(refused.status, Some(403), "{refused}");
         assert!(refused.message.contains("invite"), "{refused}");
-        let accepted =
-            auth_email_verify(server_url.clone(), second.clone(), code, Some(invite.code))
-                .await
-                .unwrap();
+        let accepted = auth_email_verify(
+            server_url.clone(),
+            second.clone(),
+            code,
+            Some(invite.code.clone()),
+        )
+        .await
+        .unwrap();
         assert!(matches!(accepted, AccountState::Account { .. }));
+        std::env::set_var("OBSINK_KEYRING_DIR", &keyring_dir);
+
+        // Capabilities: with an account on the server, new sign-ups need an
+        // invite, and the invite list shows the redeemed code as used.
+        let caps = get_auth_capabilities(server_url.clone()).await.unwrap();
+        assert!(caps.email && caps.invite_required, "{caps:?}");
+        let invites = list_invites(server_url.clone()).await.unwrap();
+        let used = invites
+            .iter()
+            .find(|item| item.code == invite.code)
+            .expect("minted invite is listed");
+        assert_eq!(used.status, "used");
+        assert!(used.used_at.is_some());
+        let fresh = create_invite(server_url.clone()).await.unwrap();
+        assert_eq!(fresh.status, "active");
+        assert!(list_invites(server_url.clone())
+            .await
+            .unwrap()
+            .iter()
+            .any(|item| item.code == fresh.code && item.status == "active"));
+
+        // Devices: a second session of account A, revoked from the first.
+        let token_a = load_secret(&bearer_account(&server_url)).unwrap();
+        let keyring_a2 = sandbox.join("keyring-a2");
+        fs::create_dir_all(&keyring_a2).unwrap();
+        std::env::set_var("OBSINK_KEYRING_DIR", &keyring_a2);
+        let code = start_code_after_cooldown(&server_url, &email).await;
+        auth_email_verify(server_url.clone(), email.clone(), code, None)
+            .await
+            .unwrap();
+        std::env::set_var("OBSINK_KEYRING_DIR", &keyring_dir);
+        let (own_session, other_session) = match get_account(server_url.clone()).await.unwrap() {
+            AccountState::Account { devices, .. } => {
+                assert_eq!(devices.len(), 2, "{devices:?}");
+                assert_eq!(devices.iter().filter(|device| device.current).count(), 1);
+                let pick = |current: bool| {
+                    devices
+                        .iter()
+                        .find(|device| device.current == current)
+                        .unwrap()
+                        .session_id
+                        .clone()
+                };
+                (pick(true), pick(false))
+            }
+            other => panic!("expected account, got {other:?}"),
+        };
+        match revoke_session(server_url.clone(), other_session)
+            .await
+            .unwrap()
+        {
+            AccountState::Account { devices, .. } => assert_eq!(devices.len(), 1),
+            other => panic!("expected account, got {other:?}"),
+        }
+        // The revoked session is signed out, and its 401 forgets the bearer.
+        std::env::set_var("OBSINK_KEYRING_DIR", &keyring_a2);
+        assert!(matches!(
+            get_account(server_url.clone()).await.unwrap(),
+            AccountState::SignedOut
+        ));
+        assert!(load_secret(&bearer_account(&server_url)).is_err());
+        // Another account cannot revoke A's session: the server says 404.
+        std::env::set_var("OBSINK_KEYRING_DIR", &keyring_b);
+        let cross = revoke_session(server_url.clone(), own_session)
+            .await
+            .unwrap_err();
+        assert_eq!(cross.kind, ErrorKind::Server, "{cross}");
+        assert_eq!(cross.status, Some(404), "{cross}");
+        std::env::set_var("OBSINK_KEYRING_DIR", &keyring_dir);
+
+        // A bogus bearer on a vault command: Unauthorized, bearer forgotten.
+        save_secret(&bearer_account(&server_url), "os_bogus").unwrap();
+        let err = sync_vault_inner(Some(summary.id.clone()), &state, &obsink_core::NoProgress)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Unauthorized, "{err}");
+        assert!(load_secret(&bearer_account(&server_url)).is_err());
+        save_secret(&bearer_account(&server_url), &token_a).unwrap();
+
+        // Remove from this device: config and key go, files stay, the other
+        // vault becomes active.
+        let dir2 = sandbox.join("vault2");
+        fs::create_dir_all(&dir2).unwrap();
+        let second_vault = add_vault(AddVaultRequest {
+            mode: AddVaultMode::Create,
+            server_url: server_url.clone(),
+            local_path: dir2.to_string_lossy().into_owned(),
+            vault_name: "desktop-second-vault".to_string(),
+            vault_id: String::new(),
+            passphrase: "pw".to_string(),
+        })
+        .await
+        .unwrap();
+        assert!(second_vault.active);
+        remove_vault_inner(&second_vault.id, &state).unwrap();
+        let remaining = get_vaults().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert!(remaining[0].active && remaining[0].id == summary.id);
+        assert!(load_key_from_keychain(&second_vault.id).is_err());
+        assert!(dir2.exists());
+        assert!(list_remote_vaults(server_url.clone())
+            .await
+            .unwrap()
+            .iter()
+            .any(|vault| vault.id == second_vault.id));
+
+        // Delete on server: gone from the account, folder intact.
+        delete_remote_vault_inner(&summary.id, &state)
+            .await
+            .unwrap();
+        assert!(get_vaults().unwrap().is_empty());
+        assert!(load_key_from_keychain(&summary.id).is_err());
+        assert!(!list_remote_vaults(server_url.clone())
+            .await
+            .unwrap()
+            .iter()
+            .any(|vault| vault.id == summary.id));
+        assert!(dir.join("note.md").exists());
+        let err = delete_remote_vault_inner(&summary.id, &state)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Other, "not configured: {err}");
+
+        // Delete account B: signed out, bearer gone, account unknown.
+        std::env::set_var("OBSINK_KEYRING_DIR", &keyring_b);
+        let dir_b = sandbox.join("vault-b");
+        fs::create_dir_all(&dir_b).unwrap();
+        add_vault(AddVaultRequest {
+            mode: AddVaultMode::Create,
+            server_url: server_url.clone(),
+            local_path: dir_b.to_string_lossy().into_owned(),
+            vault_name: "desktop-b-vault".to_string(),
+            vault_id: String::new(),
+            passphrase: "pw".to_string(),
+        })
+        .await
+        .unwrap();
+        let token_b = load_secret(&bearer_account(&server_url)).unwrap();
+        delete_account(server_url.clone()).await.unwrap();
+        assert!(matches!(
+            get_account(server_url.clone()).await.unwrap(),
+            AccountState::SignedOut
+        ));
+        assert!(load_secret(&bearer_account(&server_url)).is_err());
+        assert!(get_vaults().unwrap().is_empty());
+        // The old session is dead on the server too.
+        let gone = AuthClient::new(&server_url).me(&token_b).await.unwrap_err();
+        assert!(
+            matches!(gone, AuthError::Server { status, .. } if status.as_u16() == 401),
+            "{gone}"
+        );
         std::env::set_var("OBSINK_KEYRING_DIR", &keyring_dir);
 
         sign_out(server_url.clone()).await.unwrap();
@@ -1576,13 +1739,69 @@ mod live_tests {
             get_account(server_url.clone()).await.unwrap(),
             AccountState::SignedOut
         ));
-        let err = sync_vault_inner(Some(summary.id.clone()), &state, &obsink_core::NoProgress)
-            .await
-            .unwrap_err();
-        assert_eq!(err.kind, ErrorKind::Unauthorized, "{err}");
 
         println!("ACCOUNT FLOW VERIFIED: vault={}", summary.id);
         let _ = fs::remove_dir_all(&sandbox);
+    }
+
+    /// No server: `forget_vault` keeps the others, reassigns the active id,
+    /// and drops the key; `forget_vaults_for_server` is per server.
+    #[tokio::test]
+    async fn forget_vault_updates_config_and_keyring() {
+        let sandbox = PathBuf::from(format!("/tmp/obsink-desktop-forget-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&sandbox);
+        fs::create_dir_all(sandbox.join("keyring")).unwrap();
+        std::env::set_var("HOME", &sandbox);
+        std::env::set_var("OBSINK_KEYRING_DIR", sandbox.join("keyring"));
+
+        for (id, url) in [
+            ("vault_a", "https://one.example"),
+            ("vault_b", "https://one.example"),
+            ("vault_c", "https://two.example"),
+        ] {
+            upsert_vault(StoredVault {
+                id: id.to_string(),
+                name: id.to_string(),
+                server_url: url.to_string(),
+                local_path: sandbox.join(id).to_string_lossy().into_owned(),
+            })
+            .unwrap();
+            save_key_to_keychain(id, &[7_u8; 32]).unwrap();
+        }
+        set_active_vault("vault_a".to_string()).unwrap();
+
+        forget_vault("vault_a").unwrap();
+        let config = load_app_config().unwrap();
+        assert_eq!(config.active_vault_id.as_deref(), Some("vault_b"));
+        assert_eq!(config.vaults.len(), 2);
+        assert!(load_key_from_keychain("vault_a").is_err());
+        assert!(load_key_from_keychain("vault_b").is_ok());
+
+        forget_vaults_for_server("https://ONE.example/").unwrap();
+        let config = load_app_config().unwrap();
+        assert_eq!(config.vaults.len(), 1);
+        assert_eq!(config.vaults[0].id, "vault_c");
+        assert_eq!(config.active_vault_id.as_deref(), Some("vault_c"));
+        assert!(load_key_from_keychain("vault_c").is_ok());
+
+        forget_vault("vault_c").unwrap();
+        assert!(load_app_config().unwrap().active_vault_id.is_none());
+        let _ = fs::remove_dir_all(&sandbox);
+    }
+
+    /// `POST /auth/email/start` refuses a second code within 60 s; a live
+    /// test that signs the same address in twice waits it out.
+    async fn start_code_after_cooldown(server_url: &str, email: &str) -> String {
+        for _ in 0..40 {
+            match auth_email_start(server_url.to_string(), email.to_string()).await {
+                Ok(code) => return code.expect("dev server returns the code inline"),
+                Err(error) if error.status == Some(429) => {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+                Err(error) => panic!("{error}"),
+            }
+        }
+        panic!("email cooldown never cleared");
     }
 
     fn env_or_panic(key: &str) -> String {
