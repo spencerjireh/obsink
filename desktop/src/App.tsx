@@ -179,10 +179,12 @@ function App() {
         inviteCode: inviteCode.trim() || null,
       })
       setAccount(next)
+      setSessionExpired(false)
       setCodeSent(false)
       setAuthCode('')
       setInviteCode('')
       rememberServerUrl(currentServerUrl)
+      void refreshInvites(currentServerUrl)
       setMessage(
         next.kind === 'account' ? `Signed in as ${next.email ?? next.user_id}.` : 'Signed in.',
       )
@@ -426,6 +428,8 @@ function App() {
     const failures = response.completed_result?.failures.length ?? 0
     setMessage(failures === 0 ? doneMessage : `Sync finished with ${plural(failures, 'failure')}.`)
     await refresh()
+    // Usage in the header moves with what was just uploaded.
+    void refreshAccount(currentServerUrl)
   }
 
   async function handleSync() {
@@ -571,6 +575,8 @@ function App() {
   function openSetup(section: SetupSection) {
     setSetupFocus({ section, at: Date.now() })
     setView('setup')
+    // Devices and invites change from other devices; show the current list.
+    void refreshAccount(currentServerUrl)
   }
 
   return (
