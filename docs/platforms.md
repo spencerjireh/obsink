@@ -52,12 +52,14 @@ App, dock, and menu-bar icons are generated from `design/icon.svg` and
 `design/tray.svg` by `scripts/gen-icons.sh` (see `DESIGN.md`); rerun it after
 editing either SVG and commit the rasters.
 
-Vault Setup is one flow: enter the server URL, sign in with an email code (plus an invite code for a new account on an established server), then create or connect a vault. The account row shows the signed-in email, device count, storage usage, an **Invite someone** button (mints a code you can copy), and Sign out. Connect lists the account's vaults in a dropdown. `~/.obsink/app.json` holds vault URLs/paths only; bearers live in the macOS Keychain (`bearer:<server url>`; `OBSINK_KEYRING_DIR` file fallback for tests). The `#[ignore]`d `live_tests::account_flow_live` covers sign-in, invite gating, and sign-out against a server started with `AUTH_DEV_RETURN_CODE=1` (the local compose stack).
+The window is a sidebar plus a main pane. The sidebar lists the configured vaults (the active one is highlighted); **Add vault** and **Account** open the Setup view, which the app also opens on first launch when no vault is configured. Setup is one flow: enter the server URL, sign in with an email code (plus an invite code for a new account on an established server), then create or connect a vault. The account row shows the signed-in email, device count, storage usage, an **Invite someone** button (mints a code you can copy), and Sign out. Connect lists the account's vaults in a dropdown. `~/.obsink/app.json` holds vault URLs/paths only; bearers live in the macOS Keychain (`bearer:<server url>`; `OBSINK_KEYRING_DIR` file fallback for tests). The `#[ignore]`d `live_tests::account_flow_live` covers sign-in, invite gating, and sign-out against a server started with `AUTH_DEV_RETURN_CODE=1` (the local compose stack).
+
+The main pane shows the active vault, **Sync now**, the pending upload/download/conflict counts, notices (progress, stale remote changes, failed files), the last result, and conflicts with a side-by-side **This device** / **Other device** preview. Colours follow the system appearance (light and dark); labels and tokens are in `DESIGN.md`.
 
 Behavior:
-- Tray icon with **Sync Now / Show ObSink / Quit**; left-click surfaces the window.
+- Tray icon with **Sync now / Show ObSink / Quit ObSink**; left-click surfaces the window.
 - Closing the window **hides to the tray** so background state persists (menu-bar app).
-- Configure a vault in the UI (server URL, sign-in, create/connect, passphrase, local folder), then Sync. Conflicts open a side-by-side preview before you choose a winner.
+- The tray's Sync now is ignored while conflicts are waiting for a decision.
 
 Point Obsidian at the vault's local folder — it opens as a normal vault with no plugin.
 
