@@ -97,13 +97,22 @@ final class SyncModel: ObservableObject {
     @Published var serverURL: String = "https://"
     @Published var vaultID: String = ""
     @Published var passphrase: String = ""
-    /// Email of the account behind the active vault (nil when signed out).
-    @Published var accountEmail: String?
-    /// Storage usage reported by the server for the signed-in account.
-    @Published var accountUsage: MobileUsage?
+    /// The account behind the active vault's server (`GET /auth/me`); nil
+    /// when signed out or when the bearer is the operator key.
+    @Published var account: MobileAccount?
+    /// Invites this account minted, newest first.
+    @Published var invites: [MobileInvite] = []
     /// The most recently minted invite code, shown until dismissed.
     @Published var issuedInvite: MobileInvite?
     @Published var hasBearer: Bool = false
+    /// A bearer call came back 401: the bearer is gone and the account section
+    /// offers `Sign in`.
+    @Published var sessionExpired: Bool = false
+    /// One-off failure of an account or vault action (revoke, delete, remove).
+    @Published var alert: AppAlert?
+
+    var accountEmail: String? { account?.email }
+    var accountUsage: MobileUsage? { account?.usage }
 
     @Published var status: String = "Not synced"
     @Published var busy: Bool = false
@@ -162,6 +171,7 @@ final class SyncModel: ObservableObject {
         refreshPending()
         refreshStoredKey()
         syncFileProviderDomains()
+        finishPendingRemovals()
     }
 
     var activeEntry: VaultEntry? {
@@ -184,23 +194,46 @@ final class SyncModel: ObservableObject {
         }
         passphrase = ""
         hasBearer = KeychainStore.loadBearer(serverURL: serverURL) != nil
-        accountEmail = nil
-        accountUsage = nil
+        account = nil
+        invites = []
         issuedInvite = nil
         refreshAccount()
     }
 
-    /// Resolve the account behind the active vault (for the "signed in as"
-    /// line). The operator bearer has no account; the line stays generic.
+    /// Resolve the account behind the active vault. The operator bearer has
+    /// no account (the facade reports `Sync`), so the section stays generic;
+    /// a 401 means the session is gone.
     func refreshAccount() {
         guard let token = KeychainStore.loadBearer(serverURL: serverURL) else { return }
         let url = serverURL
         Task.detached { [weak self] in
-            let account = try? authMe(serverUrl: url, token: token)
+            let result = Result { try authMe(serverUrl: url, token: token) }
             await MainActor.run { [weak self] in
                 guard let self, self.serverURL == url else { return }
-                self.accountEmail = account?.email
-                self.accountUsage = account?.usage
+                switch result {
+                case .success(let account):
+                    self.account = account
+                    self.sessionExpired = false
+                    self.refreshInvites()
+                case .failure(let error) where error.isUnauthorized:
+                    self.handleUnauthorized()
+                case .failure:
+                    self.account = nil
+                }
+            }
+        }
+    }
+
+    /// Invites this account minted (`GET /auth/invites`). Failures keep the
+    /// old list: the operator bearer can list too, so this rarely fails.
+    func refreshInvites() {
+        guard let token = KeychainStore.loadBearer(serverURL: serverURL) else { return }
+        let url = serverURL
+        Task.detached { [weak self] in
+            guard let invites = try? authListInvites(serverUrl: url, token: token) else { return }
+            await MainActor.run { [weak self] in
+                guard let self, self.serverURL == url else { return }
+                self.invites = invites
             }
         }
     }
@@ -212,18 +245,222 @@ final class SyncModel: ObservableObject {
         Task.detached { [weak self] in
             do {
                 let invite = try authCreateInvite(serverUrl: url, token: token)
-                await MainActor.run { [weak self] in self?.issuedInvite = invite }
+                await MainActor.run { [weak self] in
+                    self?.issuedInvite = invite
+                    self?.refreshInvites()
+                }
             } catch {
-                await MainActor.run { [weak self] in self?.status = "Invite failed: \(error.localizedDescription)" }
+                await self?.actionFailed("Invite someone", error)
             }
         }
     }
 
-    /// "12 MB used · 2 of 10 vaults · 1 GB per vault", or nil when unknown.
+    /// Sign out another device of this account (`DELETE /auth/sessions/:id`).
+    func revokeSession(_ sessionID: String) {
+        guard let token = KeychainStore.loadBearer(serverURL: serverURL) else { return }
+        let url = serverURL
+        busy = true
+        Task.detached { [weak self] in
+            do {
+                try authRevokeSession(serverUrl: url, token: token, sessionId: sessionID)
+                await MainActor.run { [weak self] in
+                    self?.busy = false
+                    self?.status = "Device signed out"
+                    self?.refreshAccount()
+                }
+            } catch {
+                await self?.actionFailed("Sign out", error)
+            }
+        }
+    }
+
+    /// Delete the account and everything it owns on the server, then forget
+    /// the bearer and every vault on that server here (App Store 5.1.1(v)).
+    /// Vault files on this device go with the vaults (they are the server's
+    /// copies; the user asked for the account to be gone).
+    func deleteAccount() {
+        guard let token = KeychainStore.loadBearer(serverURL: serverURL) else { return }
+        let url = serverURL
+        busy = true
+        Task.detached { [weak self] in
+            let result = Result { try authDeleteAccount(serverUrl: url, token: token) }
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                switch result {
+                case .success:
+                    break
+                case .failure(let error) where error.isUnauthorized:
+                    // Already gone on the server; finish the local part.
+                    break
+                case .failure(let error):
+                    self.actionFailed("Delete account", error)
+                    return
+                }
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    let onServer = self.entries.filter {
+                        KeychainStore.canonicalServerURL($0.serverURL) == KeychainStore.canonicalServerURL(url)
+                    }
+                    for entry in onServer {
+                        await self.removeVaultLocally(entry.vaultID)
+                    }
+                    KeychainStore.deleteBearer(serverURL: url)
+                    self.account = nil
+                    self.invites = []
+                    self.issuedInvite = nil
+                    self.hasBearer = false
+                    self.sessionExpired = false
+                    self.busy = false
+                    self.status = "Account deleted"
+                }
+            }
+        }
+    }
+
+    /// Delete a vault on the server (`DELETE /vaults/:id`), then forget it here.
+    func deleteVaultOnServer(_ vaultID: String) {
+        guard let entry = entries.first(where: { $0.vaultID == vaultID }),
+              let token = KeychainStore.loadBearer(serverURL: entry.serverURL) else { return }
+        busy = true
+        Task.detached { [weak self] in
+            do {
+                try deleteVault(serverUrl: entry.serverURL, apiKey: token, vaultId: vaultID)
+                await MainActor.run { [weak self] in
+                    Task { @MainActor [weak self] in
+                        await self?.removeVaultLocally(vaultID)
+                        self?.busy = false
+                        self?.status = "Deleted \(entry.name) on the server"
+                    }
+                }
+            } catch {
+                await self?.actionFailed("Delete vault on server", error)
+            }
+        }
+    }
+
+    /// Forget a vault on this device: entry, File Provider domain, cache
+    /// directory, item database, and key. The vault stays on the server;
+    /// connecting again needs the passphrase. A marker in UserDefaults makes
+    /// the teardown resumable if the app dies half-way.
+    func removeVaultLocally(_ vaultID: String) async {
+        guard let entry = entries.first(where: { $0.vaultID == vaultID }) else { return }
+        markRemoval(vaultID, pending: true)
+        entries.removeAll { $0.vaultID == vaultID }
+        if activeVaultID == vaultID {
+            activeVaultID = entries.first?.vaultID ?? ""
+            client = nil
+            conflicts = []
+            choices = [:]
+            previews = [:]
+            failures = []
+            staleDownloads = 0
+        }
+        Self.saveEntries(entries, active: activeVaultID, to: defaults)
+        loadActiveIntoFields()
+        await Self.tearDownStorage(for: entry)
+        markRemoval(vaultID, pending: false)
+        refreshPending()
+        refreshStoredKey()
+        status = "Removed \(entry.name) from this device"
+    }
+
+    private static func tearDownStorage(for entry: VaultEntry) async {
+        // The domain first: removing it stops the extension's enumerators
+        // before their files disappear. Errors are logged; the launch-time
+        // reconcile drops any domain whose entry is gone.
+        let domain = fpDomain(for: entry)
+        let removal: Error? = await withCheckedContinuation { continuation in
+            NSFileProviderManager.remove(domain, mode: .removeAll) { _, error in
+                continuation.resume(returning: error)
+            }
+        }
+        if let removal {
+            NSLog("ObSink: File Provider domain removal for \(entry.vaultID): \(removal.localizedDescription)")
+        }
+        ItemStore.forget(vaultID: entry.vaultID)
+        let fm = FileManager.default
+        try? fm.removeItem(at: FileProviderPaths.vaultsBase.appendingPathComponent(entry.vaultID, isDirectory: true))
+        let db = ItemStore.defaultDatabaseURL(vaultID: entry.vaultID)
+        for suffix in ["", "-wal", "-shm"] {
+            try? fm.removeItem(at: URL(fileURLWithPath: db.path + suffix))
+        }
+        KeychainStore.delete(account: entry.vaultID)
+    }
+
+    private static let pendingRemovalsKey = "pendingVaultRemovals"
+
+    private func markRemoval(_ vaultID: String, pending: Bool) {
+        var ids = Set(defaults.stringArray(forKey: Self.pendingRemovalsKey) ?? [])
+        if pending { ids.insert(vaultID) } else { ids.remove(vaultID) }
+        defaults.set(Array(ids), forKey: Self.pendingRemovalsKey)
+    }
+
+    /// Finish removals a previous run started: the entry is already gone, so
+    /// only the on-disk and keychain parts remain.
+    private func finishPendingRemovals() {
+        let ids = defaults.stringArray(forKey: Self.pendingRemovalsKey) ?? []
+        guard !ids.isEmpty else { return }
+        Task { @MainActor [weak self] in
+            for id in ids {
+                await Self.tearDownStorage(for: VaultEntry(serverURL: "", vaultID: id, name: ""))
+                self?.markRemoval(id, pending: false)
+            }
+        }
+    }
+
+    /// A bearer call returned 401: the session is gone (revoked, expired,
+    /// account deleted). Forget the bearer; the account section offers
+    /// `Sign in`.
+    func handleUnauthorized() {
+        KeychainStore.deleteBearer(serverURL: serverURL)
+        hasBearer = false
+        sessionExpired = true
+        account = nil
+        invites = []
+        issuedInvite = nil
+    }
+
+    /// After the sign-in sheet closes: pick up a new bearer, if any.
+    func reloadBearerState() {
+        hasBearer = KeychainStore.loadBearer(serverURL: serverURL) != nil
+        if hasBearer {
+            sessionExpired = false
+            refreshAccount()
+            checkStale()
+        }
+    }
+
+    private func actionFailed(_ action: String, _ error: Error) {
+        busy = false
+        if error.isUnauthorized {
+            handleUnauthorized()
+            status = "Error: \(MobileError.sessionExpiredMessage)"
+        } else {
+            alert = AppAlert(title: action, message: error.obsinkMessage)
+        }
+    }
+
+    /// `412 MiB of 1 GiB` for one vault, `412 MiB` when the server sets no
+    /// cap; nil until the account is known.
+    func vaultUsageText(for vaultID: String) -> String? {
+        guard !vaultID.isEmpty, let usage = accountUsage else { return nil }
+        let bytes = usage.vaults.first { $0.id == vaultID }?.bytes ?? 0
+        let used = Self.binaryFormatter.string(fromByteCount: Int64(bytes))
+        guard let cap = usage.maxVaultBytes else { return used }
+        return "\(used) of \(Self.binaryFormatter.string(fromByteCount: Int64(cap)))"
+    }
+
+    /// Binary units (`MiB`), as DESIGN.md §5 requires.
+    static let binaryFormatter: ByteCountFormatter = {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .binary
+        return formatter
+    }()
+
+    /// "12 MiB used · 2 of 10 vaults · 1 GiB per vault", or nil when unknown.
     var usageText: String? {
         guard let usage = accountUsage else { return nil }
-        let formatter = ByteCountFormatter()
-        formatter.countStyle = .file
+        let formatter = Self.binaryFormatter
         var parts = [formatter.string(fromByteCount: Int64(usage.totalBytes)) + " used"]
         if let maxVaults = usage.maxVaults {
             parts.append("\(usage.vaults.count) of \(maxVaults) vaults")
@@ -244,10 +481,11 @@ final class SyncModel: ObservableObject {
             Task.detached { try? authLogout(serverUrl: url, token: token) }
         }
         KeychainStore.deleteBearer(serverURL: url)
-        accountEmail = nil
-        accountUsage = nil
+        account = nil
+        invites = []
         issuedInvite = nil
         hasBearer = false
+        sessionExpired = false
         status = "Signed out"
     }
 
@@ -565,17 +803,26 @@ final class SyncModel: ObservableObject {
             // Retry a couple of times: a transient network error on open would
             // otherwise silently suppress the warning until the next foreground.
             var pending: UInt32 = 0
+            var unauthorized = false
             for attempt in 1...3 {
                 do {
                     pending = try VaultClient(config: config, key: key).vaultStatus().pendingDownloads
                     break
                 } catch {
-                    NSLog("ObSink: stale check attempt %d failed: %@", attempt, error.localizedDescription)
+                    if error.isUnauthorized {
+                        unauthorized = true
+                        break
+                    }
+                    NSLog("ObSink: stale check attempt %d failed: %@", attempt, error.obsinkMessage)
                     try? await Task.sleep(nanoseconds: 2_000_000_000)
                 }
             }
             await MainActor.run { [weak self] in
                 guard let self, !self.busy else { return }
+                if unauthorized {
+                    self.handleUnauthorized()
+                    return
+                }
                 self.staleDownloads = Int(pending)
             }
         }
@@ -584,6 +831,16 @@ final class SyncModel: ObservableObject {
     private func fail(_ error: Error) {
         busy = false
         progress = nil
-        status = "Error: \(error.localizedDescription)"
+        if error.isUnauthorized {
+            handleUnauthorized()
+        }
+        status = "Error: \(error.obsinkMessage)"
     }
+}
+
+/// A failed account or vault action, shown as an alert.
+struct AppAlert: Identifiable {
+    let id = UUID()
+    let title: String
+    let message: String
 }
