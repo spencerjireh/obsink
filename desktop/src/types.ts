@@ -48,13 +48,33 @@ export type Progress = {
   path: string | null
 }
 
+// Rust `VaultState`: what one vault row shows.
+export type VaultState =
+  | { kind: 'up_to_date' }
+  | { kind: 'pending'; uploads: number; downloads: number }
+  | { kind: 'conflicts'; count: number }
+  | { kind: 'syncing' }
+  | { kind: 'error'; error_kind: CommandErrorKind; message: string }
+  | { kind: 'foreign' }
+  | { kind: 'no_key' }
+
+export type VaultStateInfo = {
+  id: string
+  name: string
+  local_path: string
+  server_url: string
+  state: VaultState
+  last_synced: number | null
+}
+
+// `sync://progress` payload: the core event tagged with its vault.
+export type ProgressEnvelope = { vault_id: string; event: ProgressEvent }
+
+// Pending counts for the status tiles, derived from a `VaultState`.
 export type SyncStatus = {
-  active_vault_id: string | null
-  configured_vaults: number
   pending_uploads: number
   pending_downloads: number
   pending_conflicts: number
-  last_sync_manifest_path: string | null
 }
 
 export type LocalVault = {

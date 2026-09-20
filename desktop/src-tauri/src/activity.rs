@@ -179,7 +179,6 @@ pub fn record_error(vault_id: &str, message: &str) -> io::Result<()> {
     save(vault_id, &log)
 }
 
-#[allow(dead_code)] // read by get_vault_states in the next commit
 pub fn last_synced(vault_id: &str) -> Option<u64> {
     load(vault_id).last_synced
 }
