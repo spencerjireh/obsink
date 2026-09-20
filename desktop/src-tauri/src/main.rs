@@ -17,10 +17,9 @@ use tauri::{
 use obsink_core::{
     complete_sync, derive_key, derive_keys, diff_local_and_remote, fetch_remote_manifest,
     keychain::{delete_secret, load_secret, save_secret},
-    load_local_state, normalize_server_url, prepare_sync, sync_manifest_path, write_atomic,
-    ApiClient, ApiError, AuthClient, AuthError, Conflict, ConflictResolution, CreateVaultRequest,
-    KeyBytes, ProgressEvent, ProgressSink, SyncEngineError, SyncPlan, SyncResult, VaultConfig,
-    VaultSummary,
+    load_local_state, normalize_server_url, prepare_sync, write_atomic, ApiClient, ApiError,
+    AuthClient, AuthError, Conflict, ConflictResolution, CreateVaultRequest, KeyBytes,
+    ProgressEvent, ProgressSink, SyncEngineError, SyncPlan, SyncResult, VaultConfig, VaultSummary,
 };
 use serde::{Deserialize, Serialize};
 
@@ -70,18 +69,47 @@ impl Drop for InFlightGuard<'_> {
 }
 
 /// Bridges core sync progress events to the frontend via the Tauri event bus.
-/// Events flow as `sync://progress` (payload = the core `ProgressEvent`),
-/// consumed by the React UI's live progress line.
+/// Events flow as `sync://progress` (payload = [`ProgressEnvelope`]) so a
+/// window that shows several vaults can attribute each line.
 #[derive(Clone)]
 struct TauriProgressSink {
     app: AppHandle,
+    vault_id: String,
+}
+
+#[derive(Clone, Serialize)]
+struct ProgressEnvelope<'a> {
+    vault_id: &'a str,
+    event: ProgressEvent,
 }
 
 impl ProgressSink for TauriProgressSink {
     fn report(&self, event: ProgressEvent) {
         // Best-effort: a listener that has unmounted shouldn't fail the sync.
-        let _ = self.app.emit("sync://progress", event);
+        let _ = self.app.emit(
+            "sync://progress",
+            ProgressEnvelope {
+                vault_id: &self.vault_id,
+                event,
+            },
+        );
     }
+}
+
+/// Something about a vault or the account changed (sync finished, vault
+/// added or removed, signed in or out). Every window re-reads its state.
+#[derive(Clone, Serialize)]
+struct StateChanged {
+    vault_id: Option<String>,
+}
+
+fn emit_state_changed(app: &AppHandle, vault_id: Option<&str>) {
+    let _ = app.emit(
+        "state://changed",
+        StateChanged {
+            vault_id: vault_id.map(str::to_string),
+        },
+    );
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -275,6 +303,17 @@ async fn auth_email_verify(
     email: String,
     code: String,
     invite_code: Option<String>,
+    app: AppHandle,
+) -> Result<AccountState, CommandError> {
+    let result = auth_email_verify_inner(email, code, invite_code).await;
+    emit_state_changed(&app, None);
+    result
+}
+
+async fn auth_email_verify_inner(
+    email: String,
+    code: String,
+    invite_code: Option<String>,
 ) -> Result<AccountState, CommandError> {
     let server_url = default_server_url();
     let invite = invite_code
@@ -382,7 +421,13 @@ async fn revoke_session(session_id: String) -> Result<AccountState, CommandError
 /// Sign out of a server. Vault configs stay; sync will ask for a credential
 /// again.
 #[tauri::command]
-async fn sign_out() -> Result<(), CommandError> {
+async fn sign_out(app: AppHandle) -> Result<(), CommandError> {
+    let result = sign_out_inner().await;
+    emit_state_changed(&app, None);
+    result
+}
+
+async fn sign_out_inner() -> Result<(), CommandError> {
     let server_url = default_server_url();
     let account = bearer_account(&server_url);
     if let Ok(bearer) = load_secret(&account) {
@@ -397,7 +442,13 @@ async fn sign_out() -> Result<(), CommandError> {
 /// bearer and every vault configured for that server. Vault folders on disk
 /// stay: the files are the user's, and nothing here can recover a key.
 #[tauri::command]
-async fn delete_account() -> Result<(), CommandError> {
+async fn delete_account(app: AppHandle) -> Result<(), CommandError> {
+    let result = delete_account_inner().await;
+    emit_state_changed(&app, None);
+    result
+}
+
+async fn delete_account_inner() -> Result<(), CommandError> {
     let server_url = default_server_url();
     let bearer = load_bearer(&server_url)?;
     bearer_call(
@@ -440,14 +491,37 @@ struct AddVaultRequest {
     passphrase: String,
 }
 
+/// What one vault row shows. Computed on demand; nothing here is cached.
 #[derive(Debug, Clone, Serialize)]
-struct SyncStatus {
-    active_vault_id: Option<String>,
-    configured_vaults: usize,
-    pending_uploads: usize,
-    pending_downloads: usize,
-    pending_conflicts: usize,
-    last_sync_manifest_path: Option<String>,
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum VaultState {
+    UpToDate,
+    Pending {
+        uploads: usize,
+        downloads: usize,
+    },
+    Conflicts {
+        count: usize,
+    },
+    Syncing,
+    Error {
+        error_kind: ErrorKind,
+        message: String,
+    },
+    /// Configured against another server; read-only here.
+    Foreign,
+    /// No key in the keychain: connect again with the passphrase.
+    NoKey,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct VaultStateInfo {
+    id: String,
+    name: String,
+    local_path: String,
+    server_url: String,
+    state: VaultState,
+    last_synced: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -480,22 +554,6 @@ fn get_vaults() -> Result<Vec<LocalVaultSummary>, CommandError> {
         .collect())
 }
 
-#[tauri::command]
-fn set_active_vault(vault_id: String) -> Result<LocalVaultSummary, CommandError> {
-    let mut config = load_app_config()?;
-    let vault = config
-        .vaults
-        .iter()
-        .find(|vault| vault.id == vault_id)
-        .cloned()
-        .ok_or_else(|| format!("vault {} not configured locally", vault_id))?;
-
-    config.active_vault_id = Some(vault.id.clone());
-    save_app_config(&config)?;
-
-    Ok(LocalVaultSummary::from_stored(&vault, true))
-}
-
 /// Forget a vault on this device only. Refused while a sync on it runs.
 fn remove_vault_inner(vault_id: &str, state: &AppState) -> Result<(), CommandError> {
     let _guard = InFlightGuard::acquire(state, vault_id)?;
@@ -504,8 +562,14 @@ fn remove_vault_inner(vault_id: &str, state: &AppState) -> Result<(), CommandErr
 }
 
 #[tauri::command]
-fn remove_vault(vault_id: String, state: tauri::State<'_, AppState>) -> Result<(), CommandError> {
-    remove_vault_inner(&vault_id, &state)
+fn remove_vault(
+    vault_id: String,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<(), CommandError> {
+    let result = remove_vault_inner(&vault_id, &state);
+    emit_state_changed(&app, Some(&vault_id));
+    result
 }
 
 /// Delete a vault and all its files on the server, then forget it here. A
@@ -527,12 +591,24 @@ async fn delete_remote_vault_inner(vault_id: &str, state: &AppState) -> Result<(
 async fn delete_remote_vault(
     vault_id: String,
     state: tauri::State<'_, AppState>,
+    app: AppHandle,
 ) -> Result<(), CommandError> {
-    delete_remote_vault_inner(&vault_id, &state).await
+    let result = delete_remote_vault_inner(&vault_id, &state).await;
+    emit_state_changed(&app, Some(&vault_id));
+    result
 }
 
 #[tauri::command]
-async fn add_vault(request: AddVaultRequest) -> Result<LocalVaultSummary, CommandError> {
+async fn add_vault(
+    request: AddVaultRequest,
+    app: AppHandle,
+) -> Result<LocalVaultSummary, CommandError> {
+    let result = add_vault_inner(request).await;
+    emit_state_changed(&app, result.as_ref().ok().map(|vault| vault.id.as_str()));
+    result
+}
+
+async fn add_vault_inner(request: AddVaultRequest) -> Result<LocalVaultSummary, CommandError> {
     validate_request(&request)?;
     let server_url = default_server_url();
     let bearer = load_bearer(&server_url)?;
@@ -581,56 +657,14 @@ async fn add_vault(request: AddVaultRequest) -> Result<LocalVaultSummary, Comman
     Ok(LocalVaultSummary::from_stored(&stored, true))
 }
 
-#[tauri::command]
-async fn get_status() -> Result<SyncStatus, CommandError> {
-    let config = load_app_config()?;
-    let Some(vault) = active_vault(&config) else {
-        return Ok(SyncStatus {
-            active_vault_id: None,
-            configured_vaults: config.vaults.len(),
-            pending_uploads: 0,
-            pending_downloads: 0,
-            pending_conflicts: 0,
-            last_sync_manifest_path: None,
-        });
-    };
-
-    let local_root = PathBuf::from(&vault.local_path);
-    let manifest_path = sync_manifest_path(&local_root);
+/// The pending diff for one vault, without transferring anything.
+async fn vault_diff(vault: &StoredVault) -> Result<SyncResult, CommandError> {
     let keys = derive_keys(&load_key_from_keychain(&vault.id)?);
-    let vault_config = to_vault_config(vault);
+    let local_root = Path::new(&vault.local_path);
+    let local = load_local_state(local_root, &keys)?;
     let remote_manifest = bearer_call(
         &vault.server_url,
-        fetch_remote_manifest(&ApiClient::new(vault_config), &local_root, &keys),
-    )
-    .await?;
-    let local = load_local_state(&local_root, &keys)?;
-    let diff = diff_local_and_remote(&local.base, &local.working, &remote_manifest);
-
-    Ok(SyncStatus {
-        active_vault_id: Some(vault.id.clone()),
-        configured_vaults: config.vaults.len(),
-        pending_uploads: diff.upload.len(),
-        pending_downloads: diff.download.len(),
-        pending_conflicts: diff.conflicts.len(),
-        last_sync_manifest_path: manifest_path
-            .exists()
-            .then(|| manifest_path.display().to_string()),
-    })
-}
-
-#[tauri::command]
-async fn get_manifest_diff(vault_id: Option<String>) -> Result<SyncResult, CommandError> {
-    let vault = own_vault(vault_id)?;
-    let keys = derive_keys(&load_key_from_keychain(&vault.id)?);
-    let local = load_local_state(Path::new(&vault.local_path), &keys)?;
-    let remote_manifest = bearer_call(
-        &vault.server_url,
-        fetch_remote_manifest(
-            &ApiClient::new(to_vault_config(&vault)),
-            Path::new(&vault.local_path),
-            &keys,
-        ),
+        fetch_remote_manifest(&ApiClient::new(to_vault_config(vault)), local_root, &keys),
     )
     .await?;
     Ok(diff_local_and_remote(
@@ -638,6 +672,94 @@ async fn get_manifest_diff(vault_id: Option<String>) -> Result<SyncResult, Comma
         &local.working,
         &remote_manifest,
     ))
+}
+
+/// The state of one vault, never an error: a vault that cannot be checked
+/// reports why.
+async fn vault_state(vault: &StoredVault, state: &AppState) -> VaultState {
+    if is_foreign(vault) {
+        return VaultState::Foreign;
+    }
+    let in_flight = state
+        .in_flight
+        .lock()
+        .map(|set| set.contains(&vault.id))
+        .unwrap_or(false);
+    if in_flight {
+        return VaultState::Syncing;
+    }
+    let pending = state
+        .pending_plans
+        .lock()
+        .ok()
+        .and_then(|plans| plans.get(&vault.id).map(|plan| plan.conflicts.len()))
+        .unwrap_or(0);
+    if pending > 0 {
+        return VaultState::Conflicts { count: pending };
+    }
+    if load_key_from_keychain(&vault.id).is_err() {
+        return VaultState::NoKey;
+    }
+    match vault_diff(vault).await {
+        Ok(diff) if !diff.conflicts.is_empty() => VaultState::Conflicts {
+            count: diff.conflicts.len(),
+        },
+        Ok(diff) if !diff.upload.is_empty() || !diff.download.is_empty() => VaultState::Pending {
+            uploads: diff.upload.len(),
+            downloads: diff.download.len(),
+        },
+        Ok(_) => VaultState::UpToDate,
+        Err(error) => VaultState::Error {
+            error_kind: error.kind,
+            message: error.message,
+        },
+    }
+}
+
+/// Every configured vault with its state, in config order. Vaults are
+/// checked one after another; an unchanged vault costs one conditional GET
+/// (the remote manifest cache answers 304).
+async fn get_vault_states_inner(state: &AppState) -> Result<Vec<VaultStateInfo>, CommandError> {
+    let config = load_app_config()?;
+    let mut states = Vec::with_capacity(config.vaults.len());
+    for vault in &config.vaults {
+        states.push(VaultStateInfo {
+            id: vault.id.clone(),
+            name: vault.name.clone(),
+            local_path: vault.local_path.clone(),
+            server_url: vault.server_url.clone(),
+            state: vault_state(vault, state).await,
+            last_synced: activity::last_synced(&vault.id),
+        });
+    }
+    Ok(states)
+}
+
+#[tauri::command]
+async fn get_vault_states(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<VaultStateInfo>, CommandError> {
+    get_vault_states_inner(&state).await
+}
+
+/// Reveal the vault folder in Finder.
+#[tauri::command]
+fn open_vault_folder(vault_id: String) -> Result<(), CommandError> {
+    let vault = selected_vault(Some(vault_id))?;
+    let status = Command::new("open").arg(&vault.local_path).status()?;
+    if !status.success() {
+        return Err(CommandError::other(format!(
+            "Could not open {}.",
+            vault.local_path
+        )));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_manifest_diff(vault_id: Option<String>) -> Result<SyncResult, CommandError> {
+    let vault = own_vault(vault_id)?;
+    vault_diff(&vault).await
 }
 
 async fn sync_vault_inner(
@@ -739,8 +861,14 @@ async fn sync_vault(
     state: tauri::State<'_, AppState>,
     app: AppHandle,
 ) -> Result<SyncCommandResponse, CommandError> {
-    let sink = TauriProgressSink { app };
-    sync_vault_inner(vault_id, &state, &sink).await
+    let vault_id = selected_vault(vault_id)?.id;
+    let sink = TauriProgressSink {
+        app: app.clone(),
+        vault_id: vault_id.clone(),
+    };
+    let result = sync_vault_inner(Some(vault_id.clone()), &state, &sink).await;
+    emit_state_changed(&app, Some(&vault_id));
+    result
 }
 
 async fn resolve_conflict_inner(
@@ -788,8 +916,13 @@ async fn resolve_conflict(
     state: tauri::State<'_, AppState>,
     app: AppHandle,
 ) -> Result<SyncCommandResponse, CommandError> {
-    let sink = TauriProgressSink { app };
-    resolve_conflict_inner(vault_id, resolutions, &state, &sink).await
+    let sink = TauriProgressSink {
+        app: app.clone(),
+        vault_id: vault_id.clone(),
+    };
+    let result = resolve_conflict_inner(vault_id.clone(), resolutions, &state, &sink).await;
+    emit_state_changed(&app, Some(&vault_id));
+    result
 }
 
 async fn get_conflict_preview_inner(
@@ -893,13 +1026,6 @@ fn selected_vault(vault_id: Option<String>) -> Result<StoredVault, io::Error> {
         .into_iter()
         .find(|vault| vault.id == desired_id)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "vault not configured locally"))
-}
-
-fn active_vault(config: &StoredAppConfig) -> Option<&StoredVault> {
-    config
-        .active_vault_id
-        .as_ref()
-        .and_then(|vault_id| config.vaults.iter().find(|vault| vault.id == *vault_id))
 }
 
 /// Bearer comes from the keychain; if it is missing the request goes out
@@ -1261,12 +1387,12 @@ fn main() {
             sign_out,
             get_conflict_preview,
             get_manifest_diff,
-            get_status,
+            get_vault_states,
+            open_vault_folder,
             get_vaults,
             resolve_conflict,
             remove_vault,
             delete_remote_vault,
-            set_active_vault,
             sync_vault,
         ])
         .setup(|app| {
@@ -1302,7 +1428,7 @@ mod live_tests {
     };
 
     /// `#[ignore]`d live integration test: drives the real desktop command
-    /// functions (add_vault / set_active_vault / get_status / sync_vault_inner /
+    /// functions (add_vault / get_vault_states / sync_vault_inner /
     /// get_conflict_preview_inner / resolve_conflict_inner) end-to-end against a
     /// running server, using the operator bearer. Run with:
     ///   OBSINK_TEST_SERVER_URL=... OBSINK_TEST_API_KEY=... \
@@ -1339,7 +1465,7 @@ mod live_tests {
         let file_rel = "notes/a.md";
 
         // ===== OBS-3: add (Create) + upload + cross-device download =====
-        let summary = add_vault(AddVaultRequest {
+        let summary = add_vault_inner(AddVaultRequest {
             mode: AddVaultMode::Create,
             local_path: dir_a.to_string_lossy().into_owned(),
             vault_name: "obsink-desktop-verify".to_string(),
@@ -1368,7 +1494,7 @@ mod live_tests {
         );
 
         // Connect device B (same passphrase -> same key) and pull.
-        add_vault(AddVaultRequest {
+        add_vault_inner(AddVaultRequest {
             mode: AddVaultMode::Connect,
             local_path: dir_b.to_string_lossy().into_owned(),
             vault_name: String::new(),
@@ -1399,11 +1525,30 @@ mod live_tests {
             .unwrap();
         // Repoint the active local folder at A (which is now behind the server).
         connect_local(&vault_id, &passphrase, &dir_a).await;
-        let status = get_status().await.unwrap();
-        assert_eq!(status.active_vault_id.as_deref(), Some(vault_id.as_str()));
+        let states = get_vault_states_inner(&state).await.unwrap();
+        let mine = states.iter().find(|s| s.id == vault_id).unwrap();
         assert!(
-            status.pending_downloads >= 1,
-            "OBS-5: expected remote changes pending (b.md) -> banner source"
+            matches!(mine.state, VaultState::Pending { downloads, .. } if downloads >= 1),
+            "OBS-5: expected remote changes pending (b.md) -> banner source, got {:?}",
+            mine.state
+        );
+        assert!(
+            mine.last_synced.is_some(),
+            "last_synced set by the sync above"
+        );
+        let activity = list_activity(Some(vault_id.clone()), None).unwrap();
+        assert!(
+            activity
+                .iter()
+                .any(|e| e.kind == activity::ActivityKind::Synced),
+            "activity log holds the Synced summary"
+        );
+        assert!(
+            activity
+                .iter()
+                .any(|e| e.kind == activity::ActivityKind::Uploaded
+                    && e.path.as_deref() == Some(file_rel)),
+            "activity log holds the upload of {file_rel}"
         );
 
         // ===== OBS-4: conflict resolution — all three choices =====
@@ -1507,7 +1652,7 @@ mod live_tests {
         }
 
         // ===== OBS-6: multiple-vault switching =====
-        let s2 = add_vault(AddVaultRequest {
+        let s2 = add_vault_inner(AddVaultRequest {
             mode: AddVaultMode::Create,
             local_path: dir_c.to_string_lossy().into_owned(),
             vault_name: "obsink-desktop-verify-2".to_string(),
@@ -1526,17 +1671,29 @@ mod live_tests {
             "OBS-6: two vaults configured"
         );
 
-        // Switch active back to vault 1; keychain lookup must follow the active id.
-        let active = set_active_vault(vault_id.clone()).unwrap();
-        assert!(active.active);
-        assert_eq!(active.id, vault_id);
-        let st = get_status().await.unwrap();
-        assert_eq!(
-            st.active_vault_id.as_deref(),
-            Some(vault_id.as_str()),
-            "OBS-6: active vault switched"
-        );
-        println!("OBS-6: multi-vault switching verified");
+        // Both vaults report a state; a vault pointed at another server is
+        // read-only and never contacted.
+        let states = get_vault_states_inner(&state).await.unwrap();
+        assert_eq!(states.len(), 2, "OBS-6: two vault states");
+        assert!(states
+            .iter()
+            .all(|s| !matches!(s.state, VaultState::Error { .. })));
+        let mut config = load_app_config().unwrap();
+        config
+            .vaults
+            .iter_mut()
+            .find(|v| v.id == vault_id_2)
+            .unwrap()
+            .server_url = "https://elsewhere.example".to_string();
+        save_app_config(&config).unwrap();
+        let states = get_vault_states_inner(&state).await.unwrap();
+        let foreign = states.iter().find(|s| s.id == vault_id_2).unwrap();
+        assert!(matches!(foreign.state, VaultState::Foreign));
+        let refused = sync_vault_inner(Some(vault_id_2.clone()), &state, &obsink_core::NoProgress)
+            .await
+            .unwrap_err();
+        assert!(refused.message.contains("another server"));
+        println!("OBS-6: multi-vault states verified");
 
         println!("ALL DESKTOP FLOWS VERIFIED: vaults={vault_id}, {vault_id_2}");
         let _ = fs::remove_dir_all(&sandbox);
@@ -1569,7 +1726,7 @@ mod live_tests {
             AccountState::SignedOut
         ));
         // Without a credential, adding a vault must fail with a sign-in hint.
-        let denied = add_vault(AddVaultRequest {
+        let denied = add_vault_inner(AddVaultRequest {
             mode: AddVaultMode::Create,
             local_path: dir.to_string_lossy().into_owned(),
             vault_name: "denied".to_string(),
@@ -1597,7 +1754,7 @@ mod live_tests {
             .await
             .unwrap()
             .expect("dev server returns the code inline");
-        let state = auth_email_verify(email.clone(), code, bootstrap_invite)
+        let state = auth_email_verify_inner(email.clone(), code, bootstrap_invite)
             .await
             .unwrap();
         match &state {
@@ -1621,7 +1778,7 @@ mod live_tests {
         .unwrap()
         .is_empty());
 
-        let summary = add_vault(AddVaultRequest {
+        let summary = add_vault_inner(AddVaultRequest {
             mode: AddVaultMode::Create,
             local_path: dir.to_string_lossy().into_owned(),
             vault_name: "desktop-account-vault".to_string(),
@@ -1652,13 +1809,13 @@ mod live_tests {
         std::env::set_var("OBSINK_KEYRING_DIR", &keyring_b);
         let second = format!("desktop-b-{}@example.com", std::process::id());
         let code = auth_email_start(second.clone()).await.unwrap().unwrap();
-        let refused = auth_email_verify(second.clone(), code.clone(), None)
+        let refused = auth_email_verify_inner(second.clone(), code.clone(), None)
             .await
             .unwrap_err();
         assert_eq!(refused.kind, ErrorKind::Server, "{refused}");
         assert_eq!(refused.status, Some(403), "{refused}");
         assert!(refused.message.contains("invite"), "{refused}");
-        let accepted = auth_email_verify(second.clone(), code, Some(invite.code.clone()))
+        let accepted = auth_email_verify_inner(second.clone(), code, Some(invite.code.clone()))
             .await
             .unwrap();
         assert!(matches!(accepted, AccountState::Account { .. }));
@@ -1689,7 +1846,9 @@ mod live_tests {
         fs::create_dir_all(&keyring_a2).unwrap();
         std::env::set_var("OBSINK_KEYRING_DIR", &keyring_a2);
         let code = start_code_after_cooldown(&email).await;
-        auth_email_verify(email.clone(), code, None).await.unwrap();
+        auth_email_verify_inner(email.clone(), code, None)
+            .await
+            .unwrap();
         std::env::set_var("OBSINK_KEYRING_DIR", &keyring_dir);
         let (own_session, other_session) = match get_account().await.unwrap() {
             AccountState::Account { devices, .. } => {
@@ -1738,7 +1897,7 @@ mod live_tests {
         // vault becomes active.
         let dir2 = sandbox.join("vault2");
         fs::create_dir_all(&dir2).unwrap();
-        let second_vault = add_vault(AddVaultRequest {
+        let second_vault = add_vault_inner(AddVaultRequest {
             mode: AddVaultMode::Create,
             local_path: dir2.to_string_lossy().into_owned(),
             vault_name: "desktop-second-vault".to_string(),
@@ -1781,7 +1940,7 @@ mod live_tests {
         std::env::set_var("OBSINK_KEYRING_DIR", &keyring_b);
         let dir_b = sandbox.join("vault-b");
         fs::create_dir_all(&dir_b).unwrap();
-        add_vault(AddVaultRequest {
+        add_vault_inner(AddVaultRequest {
             mode: AddVaultMode::Create,
             local_path: dir_b.to_string_lossy().into_owned(),
             vault_name: "desktop-b-vault".to_string(),
@@ -1791,7 +1950,7 @@ mod live_tests {
         .await
         .unwrap();
         let token_b = load_secret(&bearer_account(&server_url)).unwrap();
-        delete_account().await.unwrap();
+        delete_account_inner().await.unwrap();
         assert!(matches!(
             get_account().await.unwrap(),
             AccountState::SignedOut
@@ -1806,7 +1965,7 @@ mod live_tests {
         );
         std::env::set_var("OBSINK_KEYRING_DIR", &keyring_dir);
 
-        sign_out().await.unwrap();
+        sign_out_inner().await.unwrap();
         assert!(matches!(
             get_account().await.unwrap(),
             AccountState::SignedOut
@@ -1841,7 +2000,9 @@ mod live_tests {
             .unwrap();
             save_key_to_keychain(id, &[7_u8; 32]).unwrap();
         }
-        set_active_vault("vault_a".to_string()).unwrap();
+        let mut config = load_app_config().unwrap();
+        config.active_vault_id = Some("vault_a".to_string());
+        save_app_config(&config).unwrap();
 
         forget_vault("vault_a").unwrap();
         let config = load_app_config().unwrap();
@@ -1882,7 +2043,7 @@ mod live_tests {
     }
 
     async fn connect_local(vault_id: &str, passphrase: &str, local_path: &Path) {
-        add_vault(AddVaultRequest {
+        add_vault_inner(AddVaultRequest {
             mode: AddVaultMode::Connect,
             local_path: local_path.to_string_lossy().into_owned(),
             vault_name: String::new(),

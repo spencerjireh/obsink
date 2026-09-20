@@ -9,7 +9,7 @@ import type {
   InviteInfo,
   LocalVault,
   Progress,
-  ProgressEvent,
+  ProgressEnvelope,
   RemoteVault,
   ResolutionChoice,
   SetupFocus,
@@ -17,6 +17,7 @@ import type {
   SyncResponse,
   SyncResult,
   SyncStatus,
+  VaultStateInfo,
   VaultUsage,
   View,
 } from './types'
@@ -28,8 +29,21 @@ import { MainPane } from './components/MainPane'
 import { SetupView } from './components/SetupView'
 import { Sidebar } from './components/Sidebar'
 
+// The status tiles show pending counts; a vault that cannot be checked shows
+// zeros (the notice explains why).
+function statusCounts(info: VaultStateInfo): SyncStatus {
+  const state = info.state
+  return {
+    pending_uploads: state.kind === 'pending' ? state.uploads : 0,
+    pending_downloads: state.kind === 'pending' ? state.downloads : 0,
+    pending_conflicts: state.kind === 'conflicts' ? state.count : 0,
+  }
+}
+
 function App() {
   const [vaults, setVaults] = useState<LocalVault[]>([])
+  // The vault the main pane shows; the config's active id is the fallback.
+  const [selectedVaultId, setSelectedVaultId] = useState<string | null>(null)
   const [status, setStatus] = useState<SyncStatus | null>(null)
   const [form, setForm] = useState<AddVaultForm>(emptyForm)
   const [message, setMessage] = useState<string>('')
@@ -281,13 +295,17 @@ function App() {
   }, [activeVault, account, currentServerUrl])
 
   async function refresh() {
-    const [nextVaults, nextStatus] = await Promise.all([
+    const [configured, states] = await Promise.all([
       call<LocalVault[]>('get_vaults'),
-      call<SyncStatus>('get_status'),
+      call<VaultStateInfo[]>('get_vault_states'),
     ])
+    const nextVaults = configured.some((vault) => vault.id === selectedVaultId)
+      ? configured.map((vault) => ({ ...vault, active: vault.id === selectedVaultId }))
+      : configured
 
     const nextActiveVault = nextVaults.find((vault) => vault.active) ?? null
-    if (nextActiveVault) {
+    const info = states.find((entry) => entry.id === nextActiveVault?.id) ?? null
+    if (nextActiveVault && info && info.state.kind !== 'foreign' && info.state.kind !== 'no_key') {
       const diff = await call<SyncResult>('get_manifest_diff', { vaultId: nextActiveVault.id })
       setStaleRemoteChanges(countRemoteChanges(diff))
     } else {
@@ -295,7 +313,7 @@ function App() {
     }
 
     setVaults(nextVaults)
-    setStatus(nextStatus)
+    setStatus(info ? statusCounts(info) : null)
     // With nothing configured there is nothing to show but setup.
     if (nextVaults.length === 0) {
       setView('setup')
@@ -304,6 +322,7 @@ function App() {
 
   useEffect(() => {
     refresh().catch(fail)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   useEffect(() => {
@@ -431,8 +450,8 @@ function App() {
   conflictsPendingRef.current = conflicts.length > 0
 
   useEffect(() => {
-    const unlisten = listen<ProgressEvent>('sync://progress', (event) => {
-      const ev = event.payload
+    const unlisten = listen<ProgressEnvelope>('sync://progress', (event) => {
+      const ev = event.payload.event
       if ('Phase' in ev) {
         setProgress({ phase: ev.Phase, current: 0, total: 0, path: null })
       } else if ('FileStarted' in ev) {
@@ -500,7 +519,8 @@ function App() {
     setMessage('')
 
     try {
-      await call<LocalVault>('set_active_vault', { vaultId })
+      setSelectedVaultId(vaultId)
+      setVaults((current) => current.map((vault) => ({ ...vault, active: vault.id === vaultId })))
       clearVaultState()
       await refresh()
     } catch (error) {
