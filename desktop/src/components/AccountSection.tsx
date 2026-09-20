@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import type { AccountState, AuthCapabilities, InviteInfo } from '../types'
 import { usageLine } from '../lib/format'
-import { DEFAULT_SERVER_URL } from '../lib/server-url'
 import { ConfirmForm } from './ConfirmForm'
 import { DeviceList } from './DeviceList'
 import { EmptyState } from './EmptyState'
@@ -22,8 +21,6 @@ type Props = {
   inviteRequired: boolean
   // Bumped when the field should take focus (after that refusal).
   inviteFocusAt: number
-  onServerUrlChange: (value: string) => void
-  onServerUrlBlur: () => void
   onAuthEmailChange: (value: string) => void
   onAuthCodeChange: (value: string) => void
   onInviteCodeChange: (value: string) => void
@@ -49,8 +46,6 @@ export function AccountSection({
   capabilities,
   inviteRequired,
   inviteFocusAt,
-  onServerUrlChange,
-  onServerUrlBlur,
   onAuthEmailChange,
   onAuthCodeChange,
   onInviteCodeChange,
@@ -64,7 +59,6 @@ export function AccountSection({
   onDeleteAccount,
 }: Props) {
   const [confirmingDelete, setConfirmingDelete] = useState(false)
-  const noServer = serverUrl.trim() === DEFAULT_SERVER_URL
   const inviteRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
@@ -77,21 +71,6 @@ export function AccountSection({
     <section className="section" id="setup-account" aria-labelledby="account-heading">
       <div className="section__heading">
         <h2 id="account-heading">Account</h2>
-      </div>
-
-      <div className="form-grid">
-        <label>
-          <span>Server URL</span>
-          <input
-            className="mono"
-            autoCapitalize="off"
-            autoCorrect="off"
-            spellCheck={false}
-            value={serverUrl}
-            onBlur={onServerUrlBlur}
-            onChange={(event) => onServerUrlChange(event.target.value)}
-          />
-        </label>
       </div>
 
       {account?.kind === 'account' ? (
@@ -200,7 +179,7 @@ export function AccountSection({
             ) : (
               <button
                 className="button button--primary"
-                disabled={busy || !authEmail.includes('@') || noServer}
+                disabled={busy || !authEmail.includes('@')}
                 onClick={onSendCode}
                 type="button"
               >
