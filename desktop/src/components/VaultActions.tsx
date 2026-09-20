@@ -1,17 +1,19 @@
 import { useState } from 'react'
-import type { LocalVault } from '../types'
 import { ConfirmForm } from './ConfirmForm'
 
 type Props = {
-  vault: LocalVault
+  vault: { id: string; name: string; server_url: string }
   busy: boolean
+  // A vault this device cannot talk to (another server, no key) can only be
+  // removed here.
+  removeOnly?: boolean
   onRemove: () => Promise<boolean>
   onDeleteRemote: () => Promise<boolean>
 }
 
 // Mounted with `key={vault.id}` so an open confirmation never outlives the
 // vault it was asked about.
-export function VaultActions({ vault, busy, onRemove, onDeleteRemote }: Props) {
+export function VaultActions({ vault, busy, removeOnly = false, onRemove, onDeleteRemote }: Props) {
   const [confirming, setConfirming] = useState<'remove' | 'delete' | null>(null)
 
   return (
@@ -28,14 +30,16 @@ export function VaultActions({ vault, busy, onRemove, onDeleteRemote }: Props) {
         >
           Remove from this device
         </button>
-        <button
-          className="button button--danger"
-          disabled={busy || confirming !== null}
-          onClick={() => setConfirming('delete')}
-          type="button"
-        >
-          Delete vault on server
-        </button>
+        {removeOnly ? null : (
+          <button
+            className="button button--danger"
+            disabled={busy || confirming !== null}
+            onClick={() => setConfirming('delete')}
+            type="button"
+          >
+            Delete vault on server
+          </button>
+        )}
       </div>
       {confirming === 'remove' ? (
         <ConfirmForm
