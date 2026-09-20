@@ -20,7 +20,9 @@ export function stateText(info: VaultStateInfo): string {
     case 'syncing':
       return 'Syncing…'
     case 'error':
-      return state.error_kind === 'network' ? 'Offline' : `Error: ${state.message}`
+      if (state.error_kind === 'network') return 'Offline'
+      if (state.error_kind === 'unauthorized') return 'Session expired'
+      return `Error: ${state.message}`
     case 'foreign':
       return 'On another server'
     case 'no_key':

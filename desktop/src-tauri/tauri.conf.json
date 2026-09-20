@@ -5,7 +5,10 @@
   "identifier": "com.obsink.desktop",
   "bundle": {
     "active": true,
-    "targets": ["app", "dmg"],
+    "targets": [
+      "app",
+      "dmg"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -23,13 +26,31 @@
   "app": {
     "windows": [
       {
+        "label": "popover",
         "title": "ObSink",
-        "label": "main",
-        "width": 1000,
-        "height": 680,
+        "width": 360,
+        "height": 480,
+        "resizable": false,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": false,
+        "focus": false,
+        "minimizable": false,
+        "maximizable": false,
+        "closable": false,
+        "acceptFirstMouse": true,
+        "shadow": true
+      },
+      {
+        "label": "settings",
+        "title": "ObSink settings",
+        "width": 900,
+        "height": 620,
         "minWidth": 760,
         "minHeight": 520,
-        "resizable": true
+        "resizable": true,
+        "visible": false
       }
     ],
     "security": {

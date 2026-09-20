@@ -52,7 +52,7 @@ export type Progress = {
 export type VaultState =
   | { kind: 'up_to_date' }
   | { kind: 'pending'; uploads: number; downloads: number }
-  | { kind: 'conflicts'; count: number }
+  | { kind: 'conflicts'; count: number; awaiting_resolution: boolean }
   | { kind: 'syncing' }
   | { kind: 'error'; error_kind: CommandErrorKind; message: string }
   | { kind: 'foreign' }

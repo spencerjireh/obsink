@@ -69,6 +69,7 @@ export function SettingsApp() {
               setAdding(false)
               setMessage('')
             }}
+            onAdded={(vaultId) => setSelectedId(vaultId)}
             onAdd={() => {
               setAdding(true)
               setMessage('')

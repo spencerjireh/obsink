@@ -17,6 +17,8 @@ type Props = {
   notify: (message: string) => void
   onError: (error: unknown) => void
   onSelect: (vaultId: string) => void
+  // A vault was configured; the add flow stays open on its done card.
+  onAdded: (vaultId: string) => void
   onAdd: () => void
   onCloseAdd: () => void
   onSignIn: () => void
@@ -33,6 +35,7 @@ export function VaultsTab({
   notify,
   onError,
   onSelect,
+  onAdded,
   onAdd,
   onCloseAdd,
   onSignIn,
@@ -75,7 +78,7 @@ export function VaultsTab({
             message={message}
             notify={notify}
             onError={onError}
-            onAdded={(vault) => onSelect(vault.id)}
+            onAdded={(vault) => onAdded(vault.id)}
             onClose={onCloseAdd}
           />
         ) : selected ? (
