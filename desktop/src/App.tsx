@@ -24,12 +24,6 @@ import { call } from './lib/tauri'
 import { isInviteRequired, isUnauthorized, SESSION_EXPIRED, toCommandError } from './lib/errors'
 import { emptyForm } from './lib/conflicts'
 import { countRemoteChanges, plural } from './lib/format'
-import {
-  DEFAULT_SERVER_URL,
-  normalizeServerUrl,
-  rememberServerUrl,
-  rememberedServerUrl,
-} from './lib/server-url'
 import { MainPane } from './components/MainPane'
 import { SetupView } from './components/SetupView'
 import { Sidebar } from './components/Sidebar'
@@ -59,10 +53,10 @@ function App() {
   const busyRef = useRef(false)
   const conflictsPendingRef = useRef(false)
 
-  // One server per setup flow: enter the URL, sign in, then create or
-  // connect a vault. The bearer lives in the keychain, keyed by server URL,
-  // so sign-in happens once per machine.
-  const [serverUrl, setServerUrl] = useState(rememberedServerUrl)
+  // The one server this build talks to (baked in; never edited here). The
+  // bearer lives in the keychain, keyed by server URL, so sign-in happens
+  // once per machine.
+  const [serverUrl, setServerUrl] = useState('')
   const [account, setAccount] = useState<AccountState | null>(null)
   const [authEmail, setAuthEmail] = useState('')
   const [authCode, setAuthCode] = useState('')
@@ -92,17 +86,13 @@ function App() {
     }
   }
 
-  async function refreshAccount(url: string) {
-    if (!url || url === DEFAULT_SERVER_URL) {
-      setAccount(null)
-      return
-    }
+  async function refreshAccount() {
     try {
-      const next = await call<AccountState>('get_account', { serverUrl: url })
+      const next = await call<AccountState>('get_account')
       setAccount(next)
       if (next.kind === 'account') {
         setSessionExpired(false)
-        await refreshInvites(url)
+        await refreshInvites()
       } else {
         setInvites([])
       }
@@ -111,21 +101,17 @@ function App() {
     }
   }
 
-  async function refreshInvites(url: string) {
+  async function refreshInvites() {
     try {
-      setInvites(await call<InviteInfo[]>('list_invites', { serverUrl: url }))
+      setInvites(await call<InviteInfo[]>('list_invites'))
     } catch (error) {
       fail(error)
     }
   }
 
-  async function refreshCapabilities(url: string) {
-    if (!url || url === DEFAULT_SERVER_URL) {
-      setCapabilities(null)
-      return
-    }
+  async function refreshCapabilities() {
     try {
-      setCapabilities(await call<AuthCapabilities>('get_auth_capabilities', { serverUrl: url }))
+      setCapabilities(await call<AuthCapabilities>('get_auth_capabilities'))
     } catch (error) {
       setCapabilities(null)
       fail(error)
@@ -133,27 +119,17 @@ function App() {
   }
 
   useEffect(() => {
-    void refreshAccount(currentServerUrl)
-    void refreshCapabilities(currentServerUrl)
+    void call<string>('get_server_url').then(setServerUrl)
+    void refreshAccount()
+    void refreshCapabilities()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
-
-  function handleServerUrlBlur() {
-    setRemoteVaults(null)
-    setCodeSent(false)
-    setInviteForced(false)
-    void refreshAccount(currentServerUrl)
-    void refreshCapabilities(currentServerUrl)
-  }
 
   async function handleSendCode() {
     setBusy(true)
     setMessage('')
     try {
-      const devCode = await call<string | null>('auth_email_start', {
-        serverUrl: currentServerUrl,
-        email: authEmail,
-      })
+      const devCode = await call<string | null>('auth_email_start', { email: authEmail })
       setCodeSent(true)
       if (devCode) {
         setAuthCode(devCode)
@@ -173,7 +149,6 @@ function App() {
     setMessage('')
     try {
       const next = await call<AccountState>('auth_email_verify', {
-        serverUrl: currentServerUrl,
         email: authEmail,
         code: authCode,
         inviteCode: inviteCode.trim() || null,
@@ -183,8 +158,7 @@ function App() {
       setCodeSent(false)
       setAuthCode('')
       setInviteCode('')
-      rememberServerUrl(currentServerUrl)
-      void refreshInvites(currentServerUrl)
+      void refreshInvites()
       setMessage(
         next.kind === 'account' ? `Signed in as ${next.email ?? next.user_id}.` : 'Signed in.',
       )
@@ -206,8 +180,8 @@ function App() {
     setBusy(true)
     setMessage('')
     try {
-      await call<InviteInfo>('create_invite', { serverUrl: currentServerUrl })
-      await refreshInvites(currentServerUrl)
+      await call<InviteInfo>('create_invite')
+      await refreshInvites()
       setMessage('Invite code created.')
     } catch (error) {
       fail(error)
@@ -229,9 +203,7 @@ function App() {
     setBusy(true)
     setMessage('')
     try {
-      setAccount(
-        await call<AccountState>('revoke_session', { serverUrl: currentServerUrl, sessionId }),
-      )
+      setAccount(await call<AccountState>('revoke_session', { sessionId }))
       setMessage('Device signed out.')
     } catch (error) {
       fail(error)
@@ -244,7 +216,7 @@ function App() {
     setBusy(true)
     setMessage('')
     try {
-      await call('sign_out', { serverUrl: currentServerUrl })
+      await call('sign_out')
       setAccount({ kind: 'signed_out' })
       setInvites([])
       setRemoteVaults(null)
@@ -261,7 +233,7 @@ function App() {
     setBusy(true)
     setMessage('')
     try {
-      await call('delete_account', { serverUrl: currentServerUrl })
+      await call('delete_account')
       setAccount({ kind: 'signed_out' })
       setInvites([])
       setRemoteVaults(null)
@@ -283,7 +255,7 @@ function App() {
     setBusy(true)
     setMessage('')
     try {
-      const list = await call<RemoteVault[]>('list_remote_vaults', { serverUrl: currentServerUrl })
+      const list = await call<RemoteVault[]>('list_remote_vaults')
       setRemoteVaults(list)
       if (list.length === 0) {
         setMessage('No vaults on this server yet. Switch to Create.')
@@ -303,7 +275,7 @@ function App() {
   // server shows none.
   const activeVaultUsage = useMemo<VaultUsage | null>(() => {
     if (!activeVault || account?.kind !== 'account' || !account.usage) return null
-    if (normalizeServerUrl(currentServerUrl) !== activeVault.server_url) return null
+    if (currentServerUrl !== activeVault.server_url) return null
     const entry = account.usage.vaults.find((vault) => vault.id === activeVault.id)
     return { bytes: entry?.bytes ?? 0, max: account.usage.max_vault_bytes }
   }, [activeVault, account, currentServerUrl])
@@ -391,14 +363,13 @@ function App() {
     try {
       const request = {
         ...form,
-        server_url: currentServerUrl,
       }
       const saved = await call<LocalVault>('add_vault', { request })
       setMessage(`Configured ${saved.name}.`)
       setForm(emptyForm)
       setRemoteVaults(null)
       await refresh()
-      await refreshAccount(currentServerUrl)
+      await refreshAccount()
       setView('vault')
     } catch (error) {
       fail(error)
@@ -429,7 +400,7 @@ function App() {
     setMessage(failures === 0 ? doneMessage : `Sync finished with ${plural(failures, 'failure')}.`)
     await refresh()
     // Usage in the header moves with what was just uploaded.
-    void refreshAccount(currentServerUrl)
+    void refreshAccount()
   }
 
   async function handleSync() {
@@ -554,7 +525,7 @@ function App() {
       await call(command, { vaultId })
       clearVaultState()
       await refresh()
-      await refreshAccount(currentServerUrl)
+      await refreshAccount()
       setMessage(done)
       return true
     } catch (error) {
@@ -576,7 +547,7 @@ function App() {
     setSetupFocus({ section, at: Date.now() })
     setView('setup')
     // Devices and invites change from other devices; show the current list.
-    void refreshAccount(currentServerUrl)
+    void refreshAccount()
   }
 
   return (
@@ -607,8 +578,6 @@ function App() {
             capabilities,
             inviteRequired: (capabilities?.invite_required ?? false) || inviteForced,
             inviteFocusAt,
-            onServerUrlChange: setServerUrl,
-            onServerUrlBlur: handleServerUrlBlur,
             onAuthEmailChange: setAuthEmail,
             onAuthCodeChange: setAuthCode,
             onInviteCodeChange: setInviteCode,

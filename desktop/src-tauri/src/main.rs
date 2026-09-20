@@ -118,6 +118,42 @@ impl LocalVaultSummary {
     }
 }
 
+/// The public server every build talks to unless `OBSINK_SERVER_URL` says
+/// otherwise at build time (self-hosters) or at launch (tests, harnesses).
+const FALLBACK_SERVER_URL: &str = "https://obsink.spencerjireh.com";
+
+/// The one server this app talks to. The UI never shows or edits it.
+fn default_server_url() -> String {
+    let raw = std::env::var("OBSINK_SERVER_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| option_env!("OBSINK_SERVER_URL").map(str::to_string))
+        .unwrap_or_else(|| FALLBACK_SERVER_URL.to_string());
+    normalize_server_url(&raw)
+}
+
+#[tauri::command]
+fn get_server_url() -> String {
+    default_server_url()
+}
+
+/// A vault configured against another server (an older build, a moved
+/// `.env`). It is shown read-only; only "Remove from this device" applies.
+fn is_foreign(vault: &StoredVault) -> bool {
+    vault.server_url != default_server_url()
+}
+
+/// The configured vault, refused when it belongs to another server.
+fn own_vault(vault_id: Option<String>) -> Result<StoredVault, CommandError> {
+    let vault = selected_vault(vault_id)?;
+    if is_foreign(&vault) {
+        return Err(CommandError::other(
+            "Vault is on another server. Remove it from this device.",
+        ));
+    }
+    Ok(vault)
+}
+
 fn bearer_account(server_url: &str) -> String {
     format!("bearer:{}", normalize_server_url(server_url))
 }
@@ -210,7 +246,8 @@ struct DeviceInfo {
 }
 
 #[tauri::command]
-async fn get_auth_capabilities(server_url: String) -> Result<AuthCapabilities, CommandError> {
+async fn get_auth_capabilities() -> Result<AuthCapabilities, CommandError> {
+    let server_url = default_server_url();
     let caps = AuthClient::new(&server_url).capabilities().await?;
     Ok(AuthCapabilities {
         email: caps.auth.email,
@@ -222,10 +259,8 @@ async fn get_auth_capabilities(server_url: String) -> Result<AuthCapabilities, C
 /// Send a one-time code. Returns the code itself only against a dev server
 /// (`AUTH_DEV_RETURN_CODE=1`) so harnesses can complete the flow.
 #[tauri::command]
-async fn auth_email_start(
-    server_url: String,
-    email: String,
-) -> Result<Option<String>, CommandError> {
+async fn auth_email_start(email: String) -> Result<Option<String>, CommandError> {
+    let server_url = default_server_url();
     let result = AuthClient::new(&server_url)
         .email_start(email.trim())
         .await?;
@@ -234,11 +269,11 @@ async fn auth_email_start(
 
 #[tauri::command]
 async fn auth_email_verify(
-    server_url: String,
     email: String,
     code: String,
     invite_code: Option<String>,
 ) -> Result<AccountState, CommandError> {
+    let server_url = default_server_url();
     let invite = invite_code
         .as_deref()
         .map(str::trim)
@@ -247,11 +282,12 @@ async fn auth_email_verify(
         .email_verify(email.trim(), code.trim(), &device_name(), invite)
         .await?;
     save_secret(&bearer_account(&server_url), &session.token)?;
-    get_account(server_url).await
+    get_account().await
 }
 
 #[tauri::command]
-async fn get_account(server_url: String) -> Result<AccountState, CommandError> {
+async fn get_account() -> Result<AccountState, CommandError> {
+    let server_url = default_server_url();
     let Ok(bearer) = load_secret(&bearer_account(&server_url)) else {
         return Ok(AccountState::SignedOut);
     };
@@ -302,7 +338,8 @@ async fn get_account(server_url: String) -> Result<AccountState, CommandError> {
 
 /// Mint an invite code for someone else to create an account on this server.
 #[tauri::command]
-async fn create_invite(server_url: String) -> Result<InviteInfo, CommandError> {
+async fn create_invite() -> Result<InviteInfo, CommandError> {
+    let server_url = default_server_url();
     let bearer = load_bearer(&server_url)?;
     let invite = bearer_call(
         &server_url,
@@ -314,7 +351,8 @@ async fn create_invite(server_url: String) -> Result<InviteInfo, CommandError> {
 
 /// Every invite this account minted, newest first, with its status.
 #[tauri::command]
-async fn list_invites(server_url: String) -> Result<Vec<InviteInfo>, CommandError> {
+async fn list_invites() -> Result<Vec<InviteInfo>, CommandError> {
+    let server_url = default_server_url();
     let bearer = load_bearer(&server_url)?;
     let invites = bearer_call(
         &server_url,
@@ -327,23 +365,22 @@ async fn list_invites(server_url: String) -> Result<Vec<InviteInfo>, CommandErro
 /// Sign out another device of the same account. Returns the refreshed
 /// account so the UI gets the new device list in one round trip.
 #[tauri::command]
-async fn revoke_session(
-    server_url: String,
-    session_id: String,
-) -> Result<AccountState, CommandError> {
+async fn revoke_session(session_id: String) -> Result<AccountState, CommandError> {
+    let server_url = default_server_url();
     let bearer = load_bearer(&server_url)?;
     bearer_call(
         &server_url,
         AuthClient::new(&server_url).revoke_session(&bearer, &session_id),
     )
     .await?;
-    get_account(server_url).await
+    get_account().await
 }
 
 /// Sign out of a server. Vault configs stay; sync will ask for a credential
 /// again.
 #[tauri::command]
-async fn sign_out(server_url: String) -> Result<(), CommandError> {
+async fn sign_out() -> Result<(), CommandError> {
+    let server_url = default_server_url();
     let account = bearer_account(&server_url);
     if let Ok(bearer) = load_secret(&account) {
         // Best effort: the local credential goes away regardless.
@@ -357,7 +394,8 @@ async fn sign_out(server_url: String) -> Result<(), CommandError> {
 /// bearer and every vault configured for that server. Vault folders on disk
 /// stay: the files are the user's, and nothing here can recover a key.
 #[tauri::command]
-async fn delete_account(server_url: String) -> Result<(), CommandError> {
+async fn delete_account() -> Result<(), CommandError> {
+    let server_url = default_server_url();
     let bearer = load_bearer(&server_url)?;
     bearer_call(
         &server_url,
@@ -371,7 +409,8 @@ async fn delete_account(server_url: String) -> Result<(), CommandError> {
 
 /// Vaults the current credential can see on a server (for the Connect picker).
 #[tauri::command]
-async fn list_remote_vaults(server_url: String) -> Result<Vec<VaultSummary>, CommandError> {
+async fn list_remote_vaults() -> Result<Vec<VaultSummary>, CommandError> {
+    let server_url = default_server_url();
     let bearer = load_bearer(&server_url)?;
     let client = ApiClient::new(VaultConfig {
         server_url: normalize_server_url(&server_url),
@@ -392,7 +431,6 @@ enum AddVaultMode {
 #[derive(Debug, Clone, Deserialize)]
 struct AddVaultRequest {
     mode: AddVaultMode,
-    server_url: String,
     local_path: String,
     vault_name: String,
     vault_id: String,
@@ -471,7 +509,7 @@ fn remove_vault(vault_id: String, state: tauri::State<'_, AppState>) -> Result<(
 /// 404 (already gone) is reported as-is; "Remove from this device" is the
 /// way out in that case.
 async fn delete_remote_vault_inner(vault_id: &str, state: &AppState) -> Result<(), CommandError> {
-    let vault = selected_vault(Some(vault_id.to_string()))?;
+    let vault = own_vault(Some(vault_id.to_string()))?;
     let _guard = InFlightGuard::acquire(state, &vault.id)?;
     bearer_call(
         &vault.server_url,
@@ -493,7 +531,7 @@ async fn delete_remote_vault(
 #[tauri::command]
 async fn add_vault(request: AddVaultRequest) -> Result<LocalVaultSummary, CommandError> {
     validate_request(&request)?;
-    let server_url = normalize_server_url(&request.server_url);
+    let server_url = default_server_url();
     let bearer = load_bearer(&server_url)?;
 
     let client = ApiClient::new(VaultConfig {
@@ -580,7 +618,7 @@ async fn get_status() -> Result<SyncStatus, CommandError> {
 
 #[tauri::command]
 async fn get_manifest_diff(vault_id: Option<String>) -> Result<SyncResult, CommandError> {
-    let vault = selected_vault(vault_id)?;
+    let vault = own_vault(vault_id)?;
     let keys = derive_keys(&load_key_from_keychain(&vault.id)?);
     let local = load_local_state(Path::new(&vault.local_path), &keys)?;
     let remote_manifest = bearer_call(
@@ -604,7 +642,7 @@ async fn sync_vault_inner(
     state: &AppState,
     progress: &dyn ProgressSink,
 ) -> Result<SyncCommandResponse, CommandError> {
-    let vault = selected_vault(vault_id)?;
+    let vault = own_vault(vault_id)?;
     let _guard = InFlightGuard::acquire(state, &vault.id)?;
     let key = load_key_from_keychain(&vault.id)?;
     // A fresh cycle supersedes any plan left over from an earlier one.
@@ -685,7 +723,7 @@ async fn resolve_conflict_inner(
     state: &AppState,
     progress: &dyn ProgressSink,
 ) -> Result<SyncCommandResponse, CommandError> {
-    let vault = selected_vault(Some(vault_id.clone()))?;
+    let vault = own_vault(Some(vault_id.clone()))?;
     let _guard = InFlightGuard::acquire(state, &vault.id)?;
     // The plan stays in place until the round succeeds, so a failed attempt
     // (network, keychain) can be retried without a fresh sync.
@@ -728,7 +766,7 @@ async fn get_conflict_preview_inner(
     path: String,
     state: &AppState,
 ) -> Result<ConflictPreview, CommandError> {
-    let vault = selected_vault(Some(vault_id.clone()))?;
+    let vault = own_vault(Some(vault_id.clone()))?;
     let conflict = {
         let pending_plans = state
             .pending_plans
@@ -781,9 +819,6 @@ async fn get_conflict_preview(
 }
 
 fn validate_request(request: &AddVaultRequest) -> Result<(), CommandError> {
-    if request.server_url.trim().is_empty() {
-        return Err("server URL is required".into());
-    }
     if request.local_path.trim().is_empty() {
         return Err("local vault path is required".into());
     }
@@ -1170,6 +1205,7 @@ fn main() {
             delete_account,
             get_account,
             get_auth_capabilities,
+            get_server_url,
             list_remote_vaults,
             sign_out,
             get_conflict_preview,
@@ -1238,6 +1274,7 @@ mod live_tests {
         let keyring_dir = sandbox.join("keyring");
         fs::create_dir_all(&keyring_dir).unwrap();
         std::env::set_var("OBSINK_KEYRING_DIR", &keyring_dir);
+        std::env::set_var("OBSINK_SERVER_URL", &server_url);
         // The desktop has no API-key entry any more; seed the operator bearer
         // the way a sign-in would.
         save_secret(&bearer_account(&server_url), &api_key).unwrap();
@@ -1248,7 +1285,6 @@ mod live_tests {
         // ===== OBS-3: add (Create) + upload + cross-device download =====
         let summary = add_vault(AddVaultRequest {
             mode: AddVaultMode::Create,
-            server_url: server_url.clone(),
             local_path: dir_a.to_string_lossy().into_owned(),
             vault_name: "obsink-desktop-verify".to_string(),
             vault_id: String::new(),
@@ -1278,7 +1314,6 @@ mod live_tests {
         // Connect device B (same passphrase -> same key) and pull.
         add_vault(AddVaultRequest {
             mode: AddVaultMode::Connect,
-            server_url: server_url.clone(),
             local_path: dir_b.to_string_lossy().into_owned(),
             vault_name: String::new(),
             vault_id: vault_id.clone(),
@@ -1307,7 +1342,7 @@ mod live_tests {
             .await
             .unwrap();
         // Repoint the active local folder at A (which is now behind the server).
-        connect_local(&server_url, &vault_id, &passphrase, &dir_a).await;
+        connect_local(&vault_id, &passphrase, &dir_a).await;
         let status = get_status().await.unwrap();
         assert_eq!(status.active_vault_id.as_deref(), Some(vault_id.as_str()));
         assert!(
@@ -1418,7 +1453,6 @@ mod live_tests {
         // ===== OBS-6: multiple-vault switching =====
         let s2 = add_vault(AddVaultRequest {
             mode: AddVaultMode::Create,
-            server_url: server_url.clone(),
             local_path: dir_c.to_string_lossy().into_owned(),
             vault_name: "obsink-desktop-verify-2".to_string(),
             vault_id: String::new(),
@@ -1472,15 +1506,15 @@ mod live_tests {
         let keyring_dir = sandbox.join("keyring");
         fs::create_dir_all(&keyring_dir).unwrap();
         std::env::set_var("OBSINK_KEYRING_DIR", &keyring_dir);
+        std::env::set_var("OBSINK_SERVER_URL", &server_url);
 
         assert!(matches!(
-            get_account(server_url.clone()).await.unwrap(),
+            get_account().await.unwrap(),
             AccountState::SignedOut
         ));
         // Without a credential, adding a vault must fail with a sign-in hint.
         let denied = add_vault(AddVaultRequest {
             mode: AddVaultMode::Create,
-            server_url: server_url.clone(),
             local_path: dir.to_string_lossy().into_owned(),
             vault_name: "denied".to_string(),
             vault_id: String::new(),
@@ -1503,11 +1537,11 @@ mod live_tests {
             _ => None,
         };
         let email = format!("desktop-{}@example.com", std::process::id());
-        let code = auth_email_start(server_url.clone(), email.clone())
+        let code = auth_email_start(email.clone())
             .await
             .unwrap()
             .expect("dev server returns the code inline");
-        let state = auth_email_verify(server_url.clone(), email.clone(), code, bootstrap_invite)
+        let state = auth_email_verify(email.clone(), code, bootstrap_invite)
             .await
             .unwrap();
         match &state {
@@ -1533,7 +1567,6 @@ mod live_tests {
 
         let summary = add_vault(AddVaultRequest {
             mode: AddVaultMode::Create,
-            server_url: server_url.clone(),
             local_path: dir.to_string_lossy().into_owned(),
             vault_name: "desktop-account-vault".to_string(),
             vault_id: String::new(),
@@ -1546,7 +1579,7 @@ mod live_tests {
         assert!(!app_json.contains("os_"), "{app_json}");
         assert!(!app_json.contains("api_key"), "{app_json}");
 
-        let listed = list_remote_vaults(server_url.clone()).await.unwrap();
+        let listed = list_remote_vaults().await.unwrap();
         assert_eq!(listed.iter().filter(|v| v.id == summary.id).count(), 1);
 
         let state = AppState::default();
@@ -1556,47 +1589,39 @@ mod live_tests {
         assert!(response.completed_result.is_some());
 
         // Invite gating: a second account needs a code minted by the first.
-        let invite = create_invite(server_url.clone()).await.unwrap();
+        let invite = create_invite().await.unwrap();
         assert!(!invite.code.is_empty());
         let keyring_b = sandbox.join("keyring-b");
         fs::create_dir_all(&keyring_b).unwrap();
         std::env::set_var("OBSINK_KEYRING_DIR", &keyring_b);
         let second = format!("desktop-b-{}@example.com", std::process::id());
-        let code = auth_email_start(server_url.clone(), second.clone())
-            .await
-            .unwrap()
-            .unwrap();
-        let refused = auth_email_verify(server_url.clone(), second.clone(), code.clone(), None)
+        let code = auth_email_start(second.clone()).await.unwrap().unwrap();
+        let refused = auth_email_verify(second.clone(), code.clone(), None)
             .await
             .unwrap_err();
         assert_eq!(refused.kind, ErrorKind::Server, "{refused}");
         assert_eq!(refused.status, Some(403), "{refused}");
         assert!(refused.message.contains("invite"), "{refused}");
-        let accepted = auth_email_verify(
-            server_url.clone(),
-            second.clone(),
-            code,
-            Some(invite.code.clone()),
-        )
-        .await
-        .unwrap();
+        let accepted = auth_email_verify(second.clone(), code, Some(invite.code.clone()))
+            .await
+            .unwrap();
         assert!(matches!(accepted, AccountState::Account { .. }));
         std::env::set_var("OBSINK_KEYRING_DIR", &keyring_dir);
 
         // Capabilities: with an account on the server, new sign-ups need an
         // invite, and the invite list shows the redeemed code as used.
-        let caps = get_auth_capabilities(server_url.clone()).await.unwrap();
+        let caps = get_auth_capabilities().await.unwrap();
         assert!(caps.email && caps.invite_required, "{caps:?}");
-        let invites = list_invites(server_url.clone()).await.unwrap();
+        let invites = list_invites().await.unwrap();
         let used = invites
             .iter()
             .find(|item| item.code == invite.code)
             .expect("minted invite is listed");
         assert_eq!(used.status, "used");
         assert!(used.used_at.is_some());
-        let fresh = create_invite(server_url.clone()).await.unwrap();
+        let fresh = create_invite().await.unwrap();
         assert_eq!(fresh.status, "active");
-        assert!(list_invites(server_url.clone())
+        assert!(list_invites()
             .await
             .unwrap()
             .iter()
@@ -1607,12 +1632,10 @@ mod live_tests {
         let keyring_a2 = sandbox.join("keyring-a2");
         fs::create_dir_all(&keyring_a2).unwrap();
         std::env::set_var("OBSINK_KEYRING_DIR", &keyring_a2);
-        let code = start_code_after_cooldown(&server_url, &email).await;
-        auth_email_verify(server_url.clone(), email.clone(), code, None)
-            .await
-            .unwrap();
+        let code = start_code_after_cooldown(&email).await;
+        auth_email_verify(email.clone(), code, None).await.unwrap();
         std::env::set_var("OBSINK_KEYRING_DIR", &keyring_dir);
-        let (own_session, other_session) = match get_account(server_url.clone()).await.unwrap() {
+        let (own_session, other_session) = match get_account().await.unwrap() {
             AccountState::Account { devices, .. } => {
                 assert_eq!(devices.len(), 2, "{devices:?}");
                 assert_eq!(devices.iter().filter(|device| device.current).count(), 1);
@@ -1628,25 +1651,20 @@ mod live_tests {
             }
             other => panic!("expected account, got {other:?}"),
         };
-        match revoke_session(server_url.clone(), other_session)
-            .await
-            .unwrap()
-        {
+        match revoke_session(other_session).await.unwrap() {
             AccountState::Account { devices, .. } => assert_eq!(devices.len(), 1),
             other => panic!("expected account, got {other:?}"),
         }
         // The revoked session is signed out, and its 401 forgets the bearer.
         std::env::set_var("OBSINK_KEYRING_DIR", &keyring_a2);
         assert!(matches!(
-            get_account(server_url.clone()).await.unwrap(),
+            get_account().await.unwrap(),
             AccountState::SignedOut
         ));
         assert!(load_secret(&bearer_account(&server_url)).is_err());
         // Another account cannot revoke A's session: the server says 404.
         std::env::set_var("OBSINK_KEYRING_DIR", &keyring_b);
-        let cross = revoke_session(server_url.clone(), own_session)
-            .await
-            .unwrap_err();
+        let cross = revoke_session(own_session).await.unwrap_err();
         assert_eq!(cross.kind, ErrorKind::Server, "{cross}");
         assert_eq!(cross.status, Some(404), "{cross}");
         std::env::set_var("OBSINK_KEYRING_DIR", &keyring_dir);
@@ -1666,7 +1684,6 @@ mod live_tests {
         fs::create_dir_all(&dir2).unwrap();
         let second_vault = add_vault(AddVaultRequest {
             mode: AddVaultMode::Create,
-            server_url: server_url.clone(),
             local_path: dir2.to_string_lossy().into_owned(),
             vault_name: "desktop-second-vault".to_string(),
             vault_id: String::new(),
@@ -1681,7 +1698,7 @@ mod live_tests {
         assert!(remaining[0].active && remaining[0].id == summary.id);
         assert!(load_key_from_keychain(&second_vault.id).is_err());
         assert!(dir2.exists());
-        assert!(list_remote_vaults(server_url.clone())
+        assert!(list_remote_vaults()
             .await
             .unwrap()
             .iter()
@@ -1693,7 +1710,7 @@ mod live_tests {
             .unwrap();
         assert!(get_vaults().unwrap().is_empty());
         assert!(load_key_from_keychain(&summary.id).is_err());
-        assert!(!list_remote_vaults(server_url.clone())
+        assert!(!list_remote_vaults()
             .await
             .unwrap()
             .iter()
@@ -1710,7 +1727,6 @@ mod live_tests {
         fs::create_dir_all(&dir_b).unwrap();
         add_vault(AddVaultRequest {
             mode: AddVaultMode::Create,
-            server_url: server_url.clone(),
             local_path: dir_b.to_string_lossy().into_owned(),
             vault_name: "desktop-b-vault".to_string(),
             vault_id: String::new(),
@@ -1719,9 +1735,9 @@ mod live_tests {
         .await
         .unwrap();
         let token_b = load_secret(&bearer_account(&server_url)).unwrap();
-        delete_account(server_url.clone()).await.unwrap();
+        delete_account().await.unwrap();
         assert!(matches!(
-            get_account(server_url.clone()).await.unwrap(),
+            get_account().await.unwrap(),
             AccountState::SignedOut
         ));
         assert!(load_secret(&bearer_account(&server_url)).is_err());
@@ -1734,9 +1750,9 @@ mod live_tests {
         );
         std::env::set_var("OBSINK_KEYRING_DIR", &keyring_dir);
 
-        sign_out(server_url.clone()).await.unwrap();
+        sign_out().await.unwrap();
         assert!(matches!(
-            get_account(server_url.clone()).await.unwrap(),
+            get_account().await.unwrap(),
             AccountState::SignedOut
         ));
 
@@ -1791,9 +1807,9 @@ mod live_tests {
 
     /// `POST /auth/email/start` refuses a second code within 60 s; a live
     /// test that signs the same address in twice waits it out.
-    async fn start_code_after_cooldown(server_url: &str, email: &str) -> String {
+    async fn start_code_after_cooldown(email: &str) -> String {
         for _ in 0..40 {
-            match auth_email_start(server_url.to_string(), email.to_string()).await {
+            match auth_email_start(email.to_string()).await {
                 Ok(code) => return code.expect("dev server returns the code inline"),
                 Err(error) if error.status == Some(429) => {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -1808,10 +1824,9 @@ mod live_tests {
         std::env::var(key).unwrap_or_else(|_| panic!("set {key}"))
     }
 
-    async fn connect_local(server_url: &str, vault_id: &str, passphrase: &str, local_path: &Path) {
+    async fn connect_local(vault_id: &str, passphrase: &str, local_path: &Path) {
         add_vault(AddVaultRequest {
             mode: AddVaultMode::Connect,
-            server_url: server_url.to_string(),
             local_path: local_path.to_string_lossy().into_owned(),
             vault_name: String::new(),
             vault_id: vault_id.to_string(),
