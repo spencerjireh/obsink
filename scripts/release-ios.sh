@@ -27,6 +27,17 @@ set -a; . "$REPO_ROOT/.env"; set +a
 : "${ASC_KEY_PATH:?set ASC_KEY_PATH in .env}"
 [ -f "$ASC_KEY_PATH" ] || { echo "ASC_KEY_PATH not found: $ASC_KEY_PATH"; exit 1; }
 export DEVELOPMENT_TEAM
+# The server URL is baked into the app. A TestFlight build must not carry a
+# development server, so anything set here has to be https.
+export OBSINK_SERVER_URL="${OBSINK_SERVER_URL:-}"
+if [ -n "$OBSINK_SERVER_URL" ]; then
+    case "$OBSINK_SERVER_URL" in
+        https://*) echo "==> Server URL baked into the app: $OBSINK_SERVER_URL" ;;
+        *) echo "OBSINK_SERVER_URL must be https for a release build: $OBSINK_SERVER_URL"; exit 1 ;;
+    esac
+else
+    echo "==> Server URL baked into the app: built-in default"
+fi
 
 VERSION="$(sed -n 's/^ *MARKETING_VERSION: "\(.*\)"/\1/p' "$IOS_DIR/project.yml")"
 BUILD="$(git -C "$REPO_ROOT" rev-list --count HEAD)"

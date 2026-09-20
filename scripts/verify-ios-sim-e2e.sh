@@ -29,6 +29,9 @@ mkdir -p "$WORK"
 exec > >(tee "$WORK/run.log") 2>&1
 set -a; . "$REPO_ROOT/.env"; set +a
 export DEVELOPMENT_TEAM="${DEVELOPMENT_TEAM:-}"
+# Baked into the app by xcodegen below; the UI tests also pass it at launch
+# (OBSINK_UITEST_SERVER_URL), so the phases do not depend on the baked value.
+export OBSINK_SERVER_URL="${OBSINK_SERVER_URL:-}"
 
 VAULT_NAME="e2e-sim-$(date +%s)"
 PASSPHRASE="$(openssl rand -hex 16)"

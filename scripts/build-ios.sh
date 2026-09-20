@@ -70,13 +70,15 @@ xcodebuild -create-xcframework "${XCFRAMEWORK_ARGS[@]}" \
 rm -rf "$HEADERS"
 
 echo "==> Generating Xcode project"
-# DEVELOPMENT_TEAM lives in the gitignored .env (not in project.yml, so the
-# repo stays team-agnostic). XcodeGen substitutes ${DEVELOPMENT_TEAM} from the
-# environment; empty is fine for simulator builds.
+# DEVELOPMENT_TEAM and OBSINK_SERVER_URL live in the gitignored .env (not in
+# project.yml, so the repo stays team-agnostic). XcodeGen substitutes both
+# from the environment; empty is fine for simulator builds (no signing; the
+# app falls back to its built-in server URL).
 if [ -z "${DEVELOPMENT_TEAM:-}" ] && [ -f "$REPO_ROOT/.env" ]; then
     set -a; . "$REPO_ROOT/.env"; set +a
 fi
 export DEVELOPMENT_TEAM="${DEVELOPMENT_TEAM:-}"
+export OBSINK_SERVER_URL="${OBSINK_SERVER_URL:-}"
 ( cd "$IOS_DIR" && xcodegen generate )
 
 echo "Done. Open ios/ObSink.xcodeproj or build with:"
