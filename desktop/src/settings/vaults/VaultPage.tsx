@@ -120,7 +120,7 @@ export function VaultPage({ info, account, message, notify, onError, onSignIn, o
             passphrase.
           </Notice>
         ) : null}
-        {info.state.kind === 'error' ? (
+        {info.state.kind === 'error' && info.state.error_kind !== 'unauthorized' ? (
           <Notice kind={info.state.error_kind === 'network' ? 'warning' : 'danger'}>
             {info.state.error_kind === 'network'
               ? 'Could not reach the server. Check your connection.'

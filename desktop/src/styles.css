@@ -830,6 +830,187 @@ select {
   color: var(--color-text-muted);
 }
 
+/* Brand mark (the app icon as a tile) */
+.brand-mark {
+  display: block;
+  border-radius: 22%;
+}
+
+/* Icon-only buttons */
+.icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  transition:
+    color var(--duration) ease-out,
+    background var(--duration) ease-out;
+}
+
+.icon-button:hover {
+  color: var(--color-text);
+  background: color-mix(in srgb, var(--color-text) 6%, transparent);
+}
+
+/* Popover (menu-bar window) */
+html.window-popover,
+html.window-popover body {
+  overflow: hidden;
+}
+
+.popover {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background: var(--color-bg);
+}
+
+.popover__header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-3) var(--space-1) var(--space-4);
+}
+
+.popover__name {
+  flex: 1;
+  font-weight: 600;
+}
+
+.popover__global {
+  padding: 0 var(--space-4) var(--space-2);
+  font-size: 12px;
+  color: var(--color-text-muted);
+}
+
+.popover__heading {
+  padding: var(--space-3) var(--space-4) var(--space-1);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text-muted);
+}
+
+.popover__vaults {
+  margin: 0;
+  padding: 0 var(--space-2);
+  list-style: none;
+  border-top: 1px solid var(--color-border);
+  border-bottom: 1px solid var(--color-border);
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.vault-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-1) 0;
+}
+
+.vault-row__main {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-2);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--duration) ease-out;
+}
+
+.vault-row__main:hover {
+  background: color-mix(in srgb, var(--color-text) 6%, transparent);
+}
+
+.vault-row__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vault-row__state {
+  font-size: 12px;
+  color: var(--color-text-muted);
+  white-space: nowrap;
+}
+
+.popover__message {
+  padding: var(--space-2) var(--space-4) 0;
+  font-size: 12px;
+  color: var(--color-warning);
+  overflow-wrap: anywhere;
+}
+
+.recent {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.recent .empty-state {
+  padding: 0 var(--space-4);
+  font-size: 12px;
+}
+
+.recent__list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  margin: 0;
+  padding: 0 var(--space-4) var(--space-2);
+  list-style: none;
+  display: grid;
+  gap: var(--space-1);
+  align-content: start;
+}
+
+.recent__item {
+  display: grid;
+  gap: 1px;
+}
+
+.recent__text {
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.recent__item--error .recent__text {
+  color: var(--color-danger);
+}
+
+.recent__item--conflict .recent__text {
+  color: var(--color-warning);
+}
+
+.recent__meta {
+  font-size: 11px;
+  color: var(--color-text-muted);
+}
+
+.popover__footer {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border-top: 1px solid var(--color-border);
+  background: var(--color-surface);
+}
+
 /* Empty states */
 .empty-state {
   color: var(--color-text-muted);

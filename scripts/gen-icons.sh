@@ -11,6 +11,8 @@
 #      transparent 1024 canvas (Apple HIG grid), then `tauri icon` for the
 #      bundle set; only the macOS files are copied into src-tauri/icons.
 #   4. Menu bar: a 36 px black-on-transparent template PNG from tray.svg.
+#   5. Desktop UI: the SVG itself, copied into desktop/src/assets so the
+#      popover header shows the real mark (Vite bundles it).
 #
 # Outputs are committed; rerun after editing design/*.svg.
 # Requires ImageMagick 7 (`magick`) and `npm ci` in desktop/ (Tauri CLI).
@@ -56,5 +58,10 @@ echo "==> Menu-bar template icon"
 tauri_icon -o "$WORK/tray" -p 36 "$DESIGN_DIR/tray.svg"
 cp "$WORK/tray/36x36.png" "$ICONS_DIR/tray.png"
 
+echo "==> Desktop UI mark"
+mkdir -p "$DESKTOP_DIR/src/assets"
+cp "$DESIGN_DIR/icon.svg" "$DESKTOP_DIR/src/assets/icon.svg"
+
 echo "Done: $IOS_ICON"
 echo "      $ICONS_DIR/{32x32,128x128,128x128@2x,icon,tray}.png, icon.icns"
+echo "      $DESKTOP_DIR/src/assets/icon.svg"

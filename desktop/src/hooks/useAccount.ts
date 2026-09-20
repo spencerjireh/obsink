@@ -210,7 +210,8 @@ export function useAccount(notify: Notify) {
   const vaultUsage = (vaultId: string): VaultUsage | null => {
     if (account?.kind !== 'account' || !account.usage) return null
     const entry = account.usage.vaults.find((vault) => vault.id === vaultId)
-    return { bytes: entry?.bytes ?? 0, max: account.usage.max_vault_bytes }
+    if (!entry) return null
+    return { bytes: entry.bytes, max: account.usage.max_vault_bytes }
   }
 
   return {

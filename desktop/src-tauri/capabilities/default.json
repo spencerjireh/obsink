@@ -1,8 +1,11 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Core permissions for the ObSink main window: invoking app commands, listening for tray events, and basic window control.",
-  "windows": ["main"],
+  "description": "Core permissions for the ObSink windows: invoking app commands, listening for events, and basic window control.",
+  "windows": [
+    "popover",
+    "settings"
+  ],
   "permissions": [
     "core:default",
     "core:event:default",

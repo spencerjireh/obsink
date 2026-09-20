@@ -4,14 +4,14 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::Mutex,
-    time::UNIX_EPOCH,
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 use dirs::home_dir;
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Manager, WindowEvent,
+    AppHandle, Emitter, Manager, PhysicalPosition, WebviewWindow, WindowEvent,
 };
 
 use obsink_core::{
@@ -30,10 +30,14 @@ const APP_CONFIG_FILE: &str = ".obsink/app.json";
 
 #[derive(Default)]
 struct AppState {
+    /// Prepared plans awaiting conflict resolution, keyed by vault id.
     pending_plans: Mutex<HashMap<String, SyncPlan>>,
     /// Vaults with a sync or resolution in progress. Two cycles on one vault
     /// would race on the same files and checkpoint, so the second is refused.
     in_flight: Mutex<HashSet<String>>,
+    /// When the popover last hid itself on focus loss. The tray click that
+    /// closes it fires that first, so the click must not reopen it.
+    popover_hidden_at: Mutex<Option<Instant>>,
 }
 
 /// Marks a vault as busy for the guard's lifetime.
@@ -500,8 +504,12 @@ enum VaultState {
         uploads: usize,
         downloads: usize,
     },
+    /// `awaiting_resolution` when a sync stopped on these and holds a plan
+    /// the user must answer; otherwise the diff predicts them and a sync
+    /// will surface them.
     Conflicts {
         count: usize,
+        awaiting_resolution: bool,
     },
     Syncing,
     Error {
@@ -695,7 +703,10 @@ async fn vault_state(vault: &StoredVault, state: &AppState) -> VaultState {
         .and_then(|plans| plans.get(&vault.id).map(|plan| plan.conflicts.len()))
         .unwrap_or(0);
     if pending > 0 {
-        return VaultState::Conflicts { count: pending };
+        return VaultState::Conflicts {
+            count: pending,
+            awaiting_resolution: true,
+        };
     }
     if load_key_from_keychain(&vault.id).is_err() {
         return VaultState::NoKey;
@@ -703,6 +714,7 @@ async fn vault_state(vault: &StoredVault, state: &AppState) -> VaultState {
     match vault_diff(vault).await {
         Ok(diff) if !diff.conflicts.is_empty() => VaultState::Conflicts {
             count: diff.conflicts.len(),
+            awaiting_resolution: false,
         },
         Ok(diff) if !diff.upload.is_empty() || !diff.download.is_empty() => VaultState::Pending {
             uploads: diff.upload.len(),
@@ -1315,35 +1327,136 @@ fn manifest_timestamp(path: &Path) -> Option<u64> {
 }
 
 /// Bring the main window to the foreground, creating no new windows.
-fn show_main_window(app: &AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
-        let _ = window.unminimize();
-        let _ = window.set_focus();
+/// Gap between the menu-bar icon and the popover, in physical pixels.
+const POPOVER_GAP: i32 = 6;
+
+/// Which tab (and vault) the settings window should show; sent by the
+/// popover through `open_settings` and by the tray menu.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SettingsTarget {
+    tab: String,
+    #[serde(default)]
+    vault_id: Option<String>,
+    #[serde(default)]
+    add_vault: bool,
+}
+
+impl SettingsTarget {
+    fn vaults() -> Self {
+        Self {
+            tab: "vaults".to_string(),
+            vault_id: None,
+            add_vault: false,
+        }
     }
+}
+
+fn show_settings(app: &AppHandle, target: SettingsTarget) -> tauri::Result<()> {
+    if let Some(popover) = app.get_webview_window("popover") {
+        let _ = popover.hide();
+    }
+    let Some(window) = app.get_webview_window("settings") else {
+        return Ok(());
+    };
+    // An accessory app has no Dock icon to click; activate it explicitly so
+    // the window takes keyboard focus.
+    #[cfg(target_os = "macos")]
+    let _ = app.show();
+    window.show()?;
+    window.unminimize()?;
+    window.set_focus()?;
+    app.emit_to("settings", "settings://navigate", target)?;
+    Ok(())
+}
+
+/// Open (or raise) the settings window at a tab, from the popover.
+#[tauri::command]
+fn open_settings(target: SettingsTarget, app: AppHandle) -> Result<(), CommandError> {
+    show_settings(&app, target).map_err(|error| CommandError::other(error.to_string()))
+}
+
+/// Put the popover centred under the menu-bar icon, kept inside the work
+/// area of the display the icon is on.
+fn position_popover(
+    app: &AppHandle,
+    window: &WebviewWindow,
+    anchor: tauri::Rect,
+) -> tauri::Result<()> {
+    let probe = anchor.position.to_physical::<f64>(1.0);
+    let monitor = match app.monitor_from_point(probe.x, probe.y)? {
+        Some(monitor) => Some(monitor),
+        None => app.primary_monitor()?,
+    };
+    let Some(monitor) = monitor else {
+        return Ok(());
+    };
+    let scale = monitor.scale_factor();
+    let icon_pos = anchor.position.to_physical::<i32>(scale);
+    let icon_size = anchor.size.to_physical::<i32>(scale);
+    let size = window.outer_size()?;
+    let area = monitor.work_area();
+    let min_x = area.position.x;
+    let max_x = (area.position.x + area.size.width as i32 - size.width as i32).max(min_x);
+    let x = (icon_pos.x + icon_size.width / 2 - size.width as i32 / 2).clamp(min_x, max_x);
+    let y = (icon_pos.y + icon_size.height + POPOVER_GAP).max(area.position.y);
+    window.set_position(PhysicalPosition::new(x, y))
+}
+
+fn recently_hidden(app: &AppHandle, within: Duration) -> bool {
+    app.state::<AppState>()
+        .popover_hidden_at
+        .lock()
+        .ok()
+        .and_then(|at| *at)
+        .is_some_and(|at| at.elapsed() < within)
+}
+
+fn note_popover_hidden(app: &AppHandle) {
+    if let Ok(mut at) = app.state::<AppState>().popover_hidden_at.lock() {
+        *at = Some(Instant::now());
+    }
+}
+
+/// Tray click: show the popover under the icon, or hide it if it is up.
+fn toggle_popover(app: &AppHandle, anchor: tauri::Rect) {
+    let Some(window) = app.get_webview_window("popover") else {
+        return;
+    };
+    if recently_hidden(app, Duration::from_millis(300)) {
+        return;
+    }
+    if window.is_visible().unwrap_or(false) {
+        let _ = window.hide();
+        return;
+    }
+    let _ = position_popover(app, &window, anchor);
+    let _ = window.show();
+    let _ = window.set_focus();
+    let _ = app.emit_to("popover", "popover://opened", ());
 }
 
 /// Build the menu-bar tray icon and wire its menu and click behavior.
 fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     let sync_now = MenuItem::with_id(app, "sync_now", "Sync now", true, None::<&str>)?;
-    let show = MenuItem::with_id(app, "show", "Show ObSink", true, None::<&str>)?;
+    let settings = MenuItem::with_id(app, "settings", "Open settings", true, None::<&str>)?;
     let separator = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "quit", "Quit ObSink", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&sync_now, &show, &separator, &quit])?;
+    let menu = Menu::with_items(app, &[&sync_now, &settings, &separator, &quit])?;
 
     let builder = TrayIconBuilder::with_id("obsink-tray")
         .tooltip("ObSink")
         .menu(&menu)
-        // Left click toggles the window; the menu stays on right click.
+        // Left click toggles the popover; the menu stays on right click.
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "sync_now" => {
-                // The frontend owns the sync flow (conflict state, refresh),
-                // so the tray just asks it to run and surfaces the window.
-                let _ = app.emit("tray://sync-now", ());
-                show_main_window(app);
+                // The popover owns the sync-all flow; it runs whether or not
+                // it is visible.
+                let _ = app.emit_to("popover", "tray://sync-now", ());
             }
-            "show" => show_main_window(app),
+            "settings" => {
+                let _ = show_settings(app, SettingsTarget::vaults());
+            }
             "quit" => app.exit(0),
             _ => {}
         })
@@ -1351,10 +1464,11 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
             if let TrayIconEvent::Click {
                 button: MouseButton::Left,
                 button_state: MouseButtonState::Up,
+                rect,
                 ..
             } = event
             {
-                show_main_window(tray.app_handle());
+                toggle_popover(tray.app_handle(), rect);
             }
         });
 
@@ -1389,6 +1503,7 @@ fn main() {
             get_manifest_diff,
             get_vault_states,
             open_vault_folder,
+            open_settings,
             get_vaults,
             resolve_conflict,
             remove_vault,
@@ -1396,18 +1511,24 @@ fn main() {
             sync_vault,
         ])
         .setup(|app| {
+            // Menu-bar app: no Dock icon, no app switcher entry.
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             setup_tray(app.handle())?;
             Ok(())
         })
-        .on_window_event(|window, event| {
-            // Menu-bar behavior: closing the window hides it to the tray
-            // instead of quitting, so background sync keeps working.
-            if let WindowEvent::CloseRequested { api, .. } = event {
-                if window.label() == "main" {
-                    let _ = window.hide();
-                    api.prevent_close();
-                }
+        .on_window_event(|window, event| match (window.label(), event) {
+            // The popover is transient: it goes away with focus.
+            ("popover", WindowEvent::Focused(false)) => {
+                let _ = window.hide();
+                note_popover_hidden(window.app_handle());
             }
+            // Closing settings hides it; the app lives in the menu bar.
+            ("settings", WindowEvent::CloseRequested { api, .. }) => {
+                let _ = window.hide();
+                api.prevent_close();
+            }
+            _ => {}
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
