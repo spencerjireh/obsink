@@ -184,7 +184,7 @@ Shared labels. Every platform uses exactly these strings:
 
 Empty states:
 
-- Vaults: `No vaults yet.`
+- Vaults: `No vaults yet.` (desktop); `No vault yet. Tap Add vault.` (iOS)
 - Last result / Recent / Activity: `Run a sync to see uploads and downloads.`
 - Vault page with nothing pending: `Nothing to sync.`
 - Conflicts: `Conflicts appear here when a sync needs a decision.`
@@ -248,16 +248,31 @@ next to the account heading in mono.
   `.red` for danger, `.green` for success. Asset catalog colorsets:
   `AccentColor` (`--color-accent`, light and dark variants) for tinted text
   and controls; `Amber` and `Ink` (brand constants) for the primary button.
-- Structure: `Form` with sections named per section 5; each header is a
-  `Label` with an SF Symbol (`folder`, `arrow.triangle.2.circlepath`,
-  `person.crop.circle`, `arrow.triangle.branch`, `xmark.octagon`).
-- `Sync now` is a full-width `.borderedProminent` button, amber with ink
-  text. There is no `Last result` section on iOS; the status line carries
-  the last result.
-- `Devices`, `Invites`, and `Manage vault` are pushed screens
-  (`NavigationLink`) from the root form; typed confirmations are a sheet
-  with a medium detent (`TypedConfirmationSheet`); `Remove from this device`
-  is a confirmation dialog. Errors reach Swift typed (`MobileError`) and
+- Structure: a `TabView`. **Home** is a scroll of cards on the grouped
+  background, one per vault: name and `Manage` (the vault screen), a state
+  dot with the shared state text (section 5) and `Last synced`, the
+  per-vault usage, the last result line on the active vault, the stale
+  banner, `Resolve n conflicts` (pushes the Conflicts screen), a
+  `Passphrase` field until the key is stored, and a full-width
+  `.borderedProminent` `Sync now` (amber with ink text). One sync runs at a
+  time. After the first vault a one-time `Open in Obsidian` card explains
+  the Files path (`Got it` dismisses it for good). `+` in the toolbar adds a
+  vault. **Settings** holds the account: signed in as, usage, `Devices`,
+  `Invites`, `Sign out`, `Delete account`, or `Sign in` when signed out
+  (the session notice when it expired), plus the version.
+- The server is baked in (`OBSINK_SERVER_URL` at build time, read from
+  `Info.plist` `ObSinkServerURL`; `OBSINK_UITEST_SERVER_URL` overrides it
+  for tests) and only printed under the account section. A vault entry on
+  another server shows `On another server` and offers only `Remove from
+  this device`.
+- Add vault is a sheet with steps: `Sign in` (only when signed out; Sign
+  in with Apple or an email code, the invite field only when needed),
+  `Choose vault` (`Create` / `Connect`, the account's vaults listed on
+  entry, `Next`), `Passphrase` (`Create vault` / `Connect vault`).
+- `Devices`, `Invites`, `Manage vault` and `Conflicts` are pushed screens;
+  typed confirmations are a sheet with a medium detent
+  (`TypedConfirmationSheet`); `Remove from this device` is a confirmation
+  dialog. Errors reach Swift typed (`MobileError`) and
   `MobileErrorPresentation.swift` maps each variant to its copy.
 - The vault cache on iOS lives inside the app group, so `Remove from this
   device` and `Delete account` remove it (the copy says so); on desktop the
@@ -286,7 +301,7 @@ remote`, `keep both` in that order.
   harness (`ios/UITests/SyncE2ETests.swift`,
   `scripts/verify-ios-sim-e2e.sh`) finds elements by these identifiers:
   `syncButton`, `passphraseField`, `statusText`, `addVaultButton`,
-  `addVaultServerURL`, `addVaultAccountText`, `listVaultsButton`,
+  `addVaultAccountText`, `addVaultNextButton`, `listVaultsButton`,
   `vaultPicker`, `addVaultStatusText`, `addVaultPassphraseField`,
   `addVaultSubmitButton`, `staleBanner`, `conflictRowTitle`,
   `winnerPicker`, `applyResolutionsButton`, `vaultUsageText`,
@@ -294,9 +309,12 @@ remote`, `keep both` in that order.
   `devicesLink`, `deviceRow`, `deviceSignOutButton`, `invitesLink`,
   `inviteRow`, `deleteAccountButton`, `signInButton`, `sessionExpiredText`,
   `confirmationField`, `confirmDestructiveButton`, `confirmCancelButton`,
-  `addVaultDoneButton`; and by these labels: the `Connect` segment, the
+  `addVaultDoneButton`, `vaultCard`, `vaultStateText`, `lastSyncedText`,
+  `resolveConflictsLink`, `guidanceCard`, `guidanceDismissButton`,
+  `accountNoticeText`, `appVersionText`; and by these labels: the `Connect` segment, the
   `Keep local` / `Keep remote` / `Keep both` segments, the
-  `Remove from this device` confirmation button, the status prefixes
-  `Synced ·`, `Added vault`, `1 conflict`, and the banner text
-  `changed on another device`. Renaming any of them means updating the
+  `Remove from this device` confirmation button, the tab bar buttons
+  `Home` / `Settings`, `Next`, `Got it`, the status prefixes `Synced ·`,
+  `Added vault`, `1 conflict`, the empty state `No vault yet. Tap Add
+  vault.`, and the banner text `changed on another device`. Renaming any of them means updating the
   tests and the harness in the same change.
