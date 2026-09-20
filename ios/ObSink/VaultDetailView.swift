@@ -30,18 +30,24 @@ struct VaultDetailView: View {
                         Text(usage).font(.caption.monospaced()).foregroundStyle(.secondary)
                             .accessibilityIdentifier("vaultDetailUsageText")
                     }
-                    if KeychainStore.load(account: vaultID) != nil {
+                    if model.vaultStates[vaultID]?.hasStoredKey == true {
                         Label("Key saved on this device", systemImage: "key.fill")
                             .font(.caption).foregroundStyle(.green)
+                    }
+                    if !model.isOnDefaultServer(entry) {
+                        Label("On another server", systemImage: "exclamationmark.triangle")
+                            .font(.caption).foregroundStyle(.orange)
                     }
                 }
                 Section {
                     Button("Remove from this device", role: .destructive) { confirmingRemove = true }
                         .disabled(model.busy)
                         .accessibilityIdentifier("removeVaultButton")
-                    Button("Delete vault on server", role: .destructive) { confirmingDelete = true }
-                        .disabled(model.busy || !model.hasBearer)
-                        .accessibilityIdentifier("deleteVaultButton")
+                    if model.isOnDefaultServer(entry) {
+                        Button("Delete vault on server", role: .destructive) { confirmingDelete = true }
+                            .disabled(model.busy || !model.hasBearer)
+                            .accessibilityIdentifier("deleteVaultButton")
+                    }
                 } header: {
                     Label("Manage vault", systemImage: "externaldrive")
                 }
