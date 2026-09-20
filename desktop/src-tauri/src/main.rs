@@ -24,6 +24,9 @@ use obsink_core::{
 };
 use serde::{Deserialize, Serialize};
 
+mod activity;
+use activity::ActivityEvent;
+
 const APP_CONFIG_FILE: &str = ".obsink/app.json";
 
 #[derive(Default)]
@@ -643,20 +646,40 @@ async fn sync_vault_inner(
     progress: &dyn ProgressSink,
 ) -> Result<SyncCommandResponse, CommandError> {
     let vault = own_vault(vault_id)?;
+    let result = run_sync(&vault, state, progress).await;
+    note_failure(&vault.id, &result);
+    result
+}
+
+/// A failed cycle lands in the activity log too, so the popover can say
+/// why a vault is not up to date.
+fn note_failure<T>(vault_id: &str, result: &Result<T, CommandError>) {
+    if let Err(error) = result {
+        if let Err(io_error) = activity::record_error(vault_id, &error.message) {
+            eprintln!("activity log for {vault_id} not written: {io_error}");
+        }
+    }
+}
+
+async fn run_sync(
+    vault: &StoredVault,
+    state: &AppState,
+    progress: &dyn ProgressSink,
+) -> Result<SyncCommandResponse, CommandError> {
     let _guard = InFlightGuard::acquire(state, &vault.id)?;
     let key = load_key_from_keychain(&vault.id)?;
     // A fresh cycle supersedes any plan left over from an earlier one.
     set_pending_plan(state, &vault.id, None)?;
     let plan = bearer_call(
         &vault.server_url,
-        prepare_sync(&to_vault_config(&vault), &key, progress),
+        prepare_sync(&to_vault_config(vault), &key, progress),
     )
     .await?;
 
     if plan.conflicts.is_empty() {
         let result = bearer_call(
             &vault.server_url,
-            complete_sync(&to_vault_config(&vault), &key, &plan, &[], progress),
+            complete_sync(&to_vault_config(vault), &key, &plan, &[], progress),
         )
         .await?;
         return finish_cycle(state, &vault.id, result);
@@ -701,6 +724,9 @@ fn finish_cycle(
     let late_plan = SyncPlan::from_late_conflicts(&result);
     let pending_conflicts = result.conflicts.clone();
     set_pending_plan(state, vault_id, late_plan)?;
+    if let Err(io_error) = activity::record_sync(vault_id, &result) {
+        eprintln!("activity log for {vault_id} not written: {io_error}");
+    }
     Ok(SyncCommandResponse {
         completed_result: Some(result),
         pending_conflicts,
@@ -723,7 +749,18 @@ async fn resolve_conflict_inner(
     state: &AppState,
     progress: &dyn ProgressSink,
 ) -> Result<SyncCommandResponse, CommandError> {
-    let vault = own_vault(Some(vault_id.clone()))?;
+    let vault = own_vault(Some(vault_id))?;
+    let result = run_resolve(&vault, resolutions, state, progress).await;
+    note_failure(&vault.id, &result);
+    result
+}
+
+async fn run_resolve(
+    vault: &StoredVault,
+    resolutions: Vec<ConflictResolution>,
+    state: &AppState,
+    progress: &dyn ProgressSink,
+) -> Result<SyncCommandResponse, CommandError> {
     let _guard = InFlightGuard::acquire(state, &vault.id)?;
     // The plan stays in place until the round succeeds, so a failed attempt
     // (network, keychain) can be retried without a fresh sync.
@@ -731,20 +768,14 @@ async fn resolve_conflict_inner(
         .pending_plans
         .lock()
         .map_err(|_| "pending plan lock poisoned".to_string())?
-        .get(&vault_id)
+        .get(&vault.id)
         .cloned()
-        .ok_or_else(|| format!("no pending conflict set for {}", vault_id))?;
+        .ok_or_else(|| format!("no pending conflict set for {}", vault.id))?;
     let key = load_key_from_keychain(&vault.id)?;
 
     let result = bearer_call(
         &vault.server_url,
-        complete_sync(
-            &to_vault_config(&vault),
-            &key,
-            &plan,
-            &resolutions,
-            progress,
-        ),
+        complete_sync(&to_vault_config(vault), &key, &plan, &resolutions, progress),
     )
     .await?;
     finish_cycle(state, &vault.id, result)
@@ -935,7 +966,26 @@ fn forget_vault(vault_id: &str) -> Result<(), io::Error> {
     }
     save_app_config(&config)?;
     delete_secret(vault_id);
+    activity::forget(vault_id);
     Ok(())
+}
+
+/// The newest activity across every configured vault, or one of them.
+#[tauri::command]
+fn list_activity(
+    vault_id: Option<String>,
+    limit: Option<usize>,
+) -> Result<Vec<ActivityEvent>, CommandError> {
+    let ids: Vec<String> = load_app_config()?
+        .vaults
+        .into_iter()
+        .map(|vault| vault.id)
+        .collect();
+    Ok(activity::list(
+        &ids,
+        vault_id.as_deref(),
+        limit.unwrap_or(activity::MAX_EVENTS),
+    ))
 }
 
 /// `forget_vault` for every vault on one server (account deletion).
@@ -1206,6 +1256,7 @@ fn main() {
             get_account,
             get_auth_capabilities,
             get_server_url,
+            list_activity,
             list_remote_vaults,
             sign_out,
             get_conflict_preview,
@@ -1235,6 +1286,11 @@ fn main() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
+/// Tests that sandbox `HOME` share the process environment, so they take
+/// this lock first.
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
 mod live_tests {
@@ -1764,6 +1820,7 @@ mod live_tests {
     /// and drops the key; `forget_vaults_for_server` is per server.
     #[tokio::test]
     async fn forget_vault_updates_config_and_keyring() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let sandbox = PathBuf::from(format!("/tmp/obsink-desktop-forget-{}", std::process::id()));
         let _ = fs::remove_dir_all(&sandbox);
         fs::create_dir_all(sandbox.join("keyring")).unwrap();

@@ -140,3 +140,15 @@ export type SetupSection = 'account' | 'add-vault'
 // A sidebar request to scroll the setup view to one section; `at` makes a
 // repeat click on the same button scroll again.
 export type SetupFocus = { section: SetupSection; at: number }
+
+// One line of the per-vault activity log (Rust `activity::ActivityEvent`),
+// newest first as returned by `list_activity`.
+export type ActivityKind =
+  'uploaded' | 'downloaded' | 'deleted_here' | 'deleted_on_server' | 'conflict' | 'error' | 'synced'
+export type ActivityEvent = {
+  at: number
+  vault_id: string
+  kind: ActivityKind
+  path?: string
+  detail?: string
+}
