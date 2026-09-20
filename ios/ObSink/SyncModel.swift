@@ -92,13 +92,22 @@ final class SyncModel: ObservableObject {
     static let appGroup = "group.com.obsink.shared"
 
     @Published var entries: [VaultEntry] = []
+    /// The vault whose conflicts, failures and last result are loaded: the
+    /// one synced most recently, or the one the user picked. Every vault has
+    /// its own `VaultState`; this only decides where the detail lives.
     @Published var activeVaultID: String = ""
+    /// Per-vault state for the cards, keyed by vault id.
+    @Published var vaultStates: [String: VaultState] = [:]
+    /// The one-time "Open in Obsidian" card has been dismissed.
+    @Published var guidanceDismissed: Bool
+    /// Outcome of an account action (`Signed out`, `Account deleted`, ...),
+    /// shown on the Settings tab.
+    @Published var accountNotice: String?
 
-    @Published var serverURL: String = "https://"
-    @Published var vaultID: String = ""
-    @Published var passphrase: String = ""
-    /// The account behind the active vault's server (`GET /auth/me`); nil
-    /// when signed out or when the bearer is the operator key.
+    /// The one server this build talks to (`ServerConfig`).
+    var serverURL: String { ServerConfig.defaultURL }
+    /// The account on that server (`GET /auth/me`); nil when signed out or
+    /// when the bearer is the operator key.
     @Published var account: MobileAccount?
     /// Invites this account minted, newest first.
     @Published var invites: [MobileInvite] = []
@@ -114,19 +123,15 @@ final class SyncModel: ObservableObject {
     var accountEmail: String? { account?.email }
     var accountUsage: MobileUsage? { account?.usage }
 
+    /// The active vault's last result, as a sentence (`Synced · ↑n ↓n`,
+    /// `Added vault X`, `Error: …`). Shown on that vault's card.
     @Published var status: String = "Not synced"
     @Published var busy: Bool = false
-    @Published var pendingLocalChanges: Int = 0
-    @Published var hasStoredKey: Bool = false
     @Published var conflicts: [MobileConflict] = []
     @Published var choices: [String: MobileChoice] = [:]
     @Published var previews: [String: MobileConflictPreview] = [:]
     @Published var progress: SyncProgressInfo?
     @Published var failures: [MobileSyncFailure] = []
-
-    /// Remote files this device hasn't pulled yet — the stale-vault warning's
-    /// data source (spec §3.4, OBS-33). Refreshed on open and vault switch.
-    @Published var staleDownloads: Int = 0
 
     private var client: VaultClient?
     private let defaults: UserDefaults
@@ -146,7 +151,12 @@ final class SyncModel: ObservableObject {
             defaults.removeObject(forKey: "vaultEntries")
             defaults.removeObject(forKey: "activeVaultID")
             defaults.removeObject(forKey: "vaultID")
+            defaults.removeObject(forKey: Self.guidanceDismissedKey)
+            for key in defaults.dictionaryRepresentation().keys where key.hasPrefix(Self.lastSyncedPrefix) {
+                defaults.removeObject(forKey: key)
+            }
         }
+        self.guidanceDismissed = defaults.bool(forKey: Self.guidanceDismissedKey)
         self.resetFileProviderDomain = resetForUITest
         if let seed = env["OBSINK_UITEST_SEED"],
            let data = seed.data(using: .utf8),
@@ -167,9 +177,8 @@ final class SyncModel: ObservableObject {
         }
 
         Self.migrateLegacyStorage(activeVaultID: activeVaultID, defaults: defaults)
-        loadActiveIntoFields()
-        refreshPending()
-        refreshStoredKey()
+        rebuildVaultStates()
+        loadBearerState()
         syncFileProviderDomains()
         finishPendingRemovals()
     }
@@ -178,26 +187,57 @@ final class SyncModel: ObservableObject {
         entries.first { $0.vaultID == activeVaultID }
     }
 
-    /// Bearer for the active vault's server (Keychain), empty when signed out.
+    /// Bearer for this build's server (Keychain), empty when signed out.
     var bearer: String {
         KeychainStore.loadBearer(serverURL: serverURL) ?? ""
     }
 
-    /// Load the active vault's connection details into the editable fields.
-    private func loadActiveIntoFields() {
-        if let entry = activeEntry {
-            serverURL = entry.serverURL
-            vaultID = entry.vaultID
-        } else {
-            serverURL = "https://"
-            vaultID = ""
+    func isOnDefaultServer(_ entry: VaultEntry) -> Bool {
+        !VaultState.isForeign(entryURL: entry.serverURL, defaultURL: serverURL)
+    }
+
+    /// Whether this build can talk to the vault: on its server, with a key.
+    func canSync(_ vaultID: String) -> Bool {
+        guard let state = vaultStates[vaultID] else { return false }
+        return !state.isForeign && !sessionExpired
+    }
+
+    private static let guidanceDismissedKey = "guidanceDismissed"
+    private static let lastSyncedPrefix = "lastSynced."
+
+    private static func lastSyncedKey(_ vaultID: String) -> String { lastSyncedPrefix + vaultID }
+
+    /// Build every vault's state from what is on the device: key present,
+    /// server, last sync time, pending File Provider writes.
+    private func rebuildVaultStates() {
+        var states: [String: VaultState] = [:]
+        for entry in entries {
+            states[entry.vaultID] = freshState(for: entry)
         }
-        passphrase = ""
+        vaultStates = states
+    }
+
+    private func freshState(for entry: VaultEntry) -> VaultState {
+        var state = VaultState()
+        state.hasStoredKey = KeychainStore.load(account: entry.vaultID) != nil
+        state.isForeign = !isOnDefaultServer(entry)
+        state.lastSyncedAt = defaults.object(forKey: Self.lastSyncedKey(entry.vaultID)) as? Date
+        state.pendingLocal = (try? ItemStore.store(for: entry.vaultID).pendingCount()) ?? 0
+        return state
+    }
+
+    /// Pick up the bearer (if any) and the account behind it.
+    private func loadBearerState() {
         hasBearer = KeychainStore.loadBearer(serverURL: serverURL) != nil
         account = nil
         invites = []
         issuedInvite = nil
         refreshAccount()
+    }
+
+    func dismissGuidance() {
+        guidanceDismissed = true
+        defaults.set(true, forKey: Self.guidanceDismissedKey)
     }
 
     /// Resolve the account behind the active vault. The operator bearer has
@@ -209,7 +249,7 @@ final class SyncModel: ObservableObject {
         Task.detached { [weak self] in
             let result = Result { try authMe(serverUrl: url, token: token) }
             await MainActor.run { [weak self] in
-                guard let self, self.serverURL == url else { return }
+                guard let self else { return }
                 switch result {
                 case .success(let account):
                     self.account = account
@@ -232,8 +272,7 @@ final class SyncModel: ObservableObject {
         Task.detached { [weak self] in
             guard let invites = try? authListInvites(serverUrl: url, token: token) else { return }
             await MainActor.run { [weak self] in
-                guard let self, self.serverURL == url else { return }
-                self.invites = invites
+                self?.invites = invites
             }
         }
     }
@@ -265,7 +304,7 @@ final class SyncModel: ObservableObject {
                 try authRevokeSession(serverUrl: url, token: token, sessionId: sessionID)
                 await MainActor.run { [weak self] in
                     self?.busy = false
-                    self?.status = "Device signed out"
+                    self?.accountNotice = "Device signed out."
                     self?.refreshAccount()
                 }
             } catch {
@@ -311,7 +350,7 @@ final class SyncModel: ObservableObject {
                     self.hasBearer = false
                     self.sessionExpired = false
                     self.busy = false
-                    self.status = "Account deleted"
+                    self.accountNotice = "Account deleted."
                 }
             }
         }
@@ -346,22 +385,27 @@ final class SyncModel: ObservableObject {
         guard let entry = entries.first(where: { $0.vaultID == vaultID }) else { return }
         markRemoval(vaultID, pending: true)
         entries.removeAll { $0.vaultID == vaultID }
+        vaultStates.removeValue(forKey: vaultID)
+        defaults.removeObject(forKey: Self.lastSyncedKey(vaultID))
         if activeVaultID == vaultID {
             activeVaultID = entries.first?.vaultID ?? ""
-            client = nil
-            conflicts = []
-            choices = [:]
-            previews = [:]
-            failures = []
-            staleDownloads = 0
+            clearActiveDetail()
         }
         Self.saveEntries(entries, active: activeVaultID, to: defaults)
-        loadActiveIntoFields()
         await Self.tearDownStorage(for: entry)
         markRemoval(vaultID, pending: false)
-        refreshPending()
-        refreshStoredKey()
         status = "Removed \(entry.name) from this device"
+    }
+
+    /// Drop the loaded detail (conflicts, previews, failures) when the
+    /// active vault changes.
+    private func clearActiveDetail() {
+        client = nil
+        conflicts = []
+        choices = [:]
+        previews = [:]
+        failures = []
+        progress = nil
     }
 
     private static func tearDownStorage(for entry: VaultEntry) async {
@@ -425,6 +469,10 @@ final class SyncModel: ObservableObject {
         hasBearer = KeychainStore.loadBearer(serverURL: serverURL) != nil
         if hasBearer {
             sessionExpired = false
+            // A card that failed on the old session starts clean.
+            for (id, state) in vaultStates {
+                if case .error = state.phase { vaultStates[id]?.phase = .idle }
+            }
             refreshAccount()
             checkStale()
         }
@@ -441,11 +489,11 @@ final class SyncModel: ObservableObject {
     }
 
     /// `412 MiB of 1 GiB` for one vault, `412 MiB` when the server sets no
-    /// cap; nil until the account is known.
+    /// cap; nil until the account is known or when it does not own the vault.
     func vaultUsageText(for vaultID: String) -> String? {
-        guard !vaultID.isEmpty, let usage = accountUsage else { return nil }
-        let bytes = usage.vaults.first { $0.id == vaultID }?.bytes ?? 0
-        let used = Self.formatBytes(bytes)
+        guard !vaultID.isEmpty, let usage = accountUsage,
+              let entry = usage.vaults.first(where: { $0.id == vaultID }) else { return nil }
+        let used = Self.formatBytes(entry.bytes)
         guard let cap = usage.maxVaultBytes else { return used }
         return "\(used) of \(Self.formatBytes(cap))"
     }
@@ -492,28 +540,18 @@ final class SyncModel: ObservableObject {
         issuedInvite = nil
         hasBearer = false
         sessionExpired = false
-        status = "Signed out"
+        accountNotice = "Signed out."
     }
 
-    /// Switch the active vault (spec §10.3 vault picker). Each vault has its
-    /// own directory, item database, and File Provider domain, so switching
-    /// only changes which one the Sync button drives.
+    /// Make a vault the one whose detail (conflicts, failures, last result)
+    /// is loaded. Each vault has its own directory, item database, File
+    /// Provider domain and `VaultState`; this only moves the detail.
     func selectVault(_ id: String) {
         guard entries.contains(where: { $0.vaultID == id }), id != activeVaultID else { return }
-        persistConfig()
         activeVaultID = id
         Self.saveEntries(entries, active: activeVaultID, to: defaults)
-        loadActiveIntoFields()
-        client = nil
-        conflicts = []
-        choices = [:]
-        previews = [:]
-        failures = []
-        staleDownloads = 0
-        refreshPending()
-        refreshStoredKey()
-        status = "Switched to \(activeEntry?.name ?? id)"
-        checkStale()
+        clearActiveDetail()
+        status = "Not synced"
     }
 
     /// Add (or replace) a vault and make it active.
@@ -523,18 +561,13 @@ final class SyncModel: ObservableObject {
         } else {
             entries.append(entry)
         }
+        vaultStates[entry.vaultID] = freshState(for: entry)
         activeVaultID = entry.vaultID
         Self.saveEntries(entries, active: activeVaultID, to: defaults)
-        loadActiveIntoFields()
-        client = nil
-        conflicts = []
-        choices = [:]
-        previews = [:]
-        failures = []
-        refreshPending()
-        refreshStoredKey()
+        clearActiveDetail()
         syncFileProviderDomains()
         status = "Added vault \(entry.name)"
+        refreshAccount()
     }
 
     // MARK: Persistence
@@ -554,38 +587,30 @@ final class SyncModel: ObservableObject {
         defaults.set(active, forKey: "activeVaultID")
     }
 
-    /// Persist the active vault's current fields (URL into the entry list).
-    func persistConfig() {
-        guard let idx = entries.firstIndex(where: { $0.vaultID == activeVaultID }) else { return }
-        entries[idx].serverURL = serverURL
-        Self.saveEntries(entries, active: activeVaultID, to: defaults)
-        hasBearer = KeychainStore.loadBearer(serverURL: serverURL) != nil
-    }
-
     // MARK: Sync state helpers
 
-    /// Count of File-Provider-queued local changes (pendingUpload/pendingDeletion),
-    /// read from the shared item DB. Surfaces a "Sync to push" hint in the UI.
-    func refreshPending() {
-        guard !activeVaultID.isEmpty else { pendingLocalChanges = 0; return }
-        pendingLocalChanges = (try? ItemStore.store(for: activeVaultID).pendingCount()) ?? 0
+    /// Count of File-Provider-queued local changes (pendingUpload/pendingDeletion)
+    /// for one vault, read from its item DB; the card shows `n to upload`.
+    func refreshPending(for vaultID: String) {
+        guard vaultStates[vaultID] != nil else { return }
+        vaultStates[vaultID]?.pendingLocal = (try? ItemStore.store(for: vaultID).pendingCount()) ?? 0
     }
 
-    /// Whether a derived key is already in the Keychain for this vault (so sync
+    func refreshAllPending() {
+        for id in vaultStates.keys { refreshPending(for: id) }
+    }
+
+    /// Whether a derived key is already in the Keychain for a vault (so sync
     /// can run without re-entering the passphrase).
-    func refreshStoredKey() {
-        hasStoredKey = !vaultID.isEmpty && KeychainStore.load(account: vaultID) != nil
+    func refreshStoredKey(for vaultID: String) {
+        guard vaultStates[vaultID] != nil else { return }
+        vaultStates[vaultID]?.hasStoredKey = KeychainStore.load(account: vaultID) != nil
     }
 
     /// Directory the Rust core reads/writes for a vault; Obsidian (via that
     /// vault's File Provider domain) sees the same files.
     static func vaultDirectory(for vaultID: String) -> URL {
         FileProviderPaths.vaultRoot(vaultID: vaultID)
-    }
-
-    /// The active vault's directory.
-    var vaultDirectory: URL {
-        Self.vaultDirectory(for: activeVaultID)
     }
 
     /// Builds before per-vault storage kept every vault in one `Vault/` dir
@@ -617,23 +642,25 @@ final class SyncModel: ObservableObject {
         }
     }
 
-    func sync() {
-        guard !busy else { return }
-        persistConfig()
+    /// Run a full cycle for one vault. The vault becomes the active one so
+    /// its conflicts and result are the loaded detail. One sync at a time.
+    func sync(vaultID: String, passphrase: String) {
+        guard !busy, let entry = entries.first(where: { $0.vaultID == vaultID }),
+              isOnDefaultServer(entry) else { return }
+        selectVault(vaultID)
         busy = true
         status = "Syncing…"
         conflicts = []
         progress = nil
         failures = []
+        vaultStates[vaultID]?.phase = .syncing
 
         let config = MobileVaultConfig(
-            serverUrl: serverURL,
+            serverUrl: entry.serverURL,
             apiKey: bearer,
             vaultId: vaultID,
-            localPath: vaultDirectory.path
+            localPath: Self.vaultDirectory(for: vaultID).path
         )
-        let passphrase = self.passphrase
-        let vaultID = self.vaultID
         let listener = SyncProgressListener(model: self)
 
         Task.detached {
@@ -646,28 +673,30 @@ final class SyncModel: ObservableObject {
                     guard !passphrase.isEmpty else {
                         await self.fail(NSError(domain: "obsink", code: 1, userInfo: [
                             NSLocalizedDescriptionKey: "Enter a passphrase to set up this vault."
-                        ]))
+                        ]), vaultID: vaultID)
                         return
                     }
                     key = try deriveMasterKey(passphrase: passphrase, vaultId: vaultID)
                     KeychainStore.save(key, account: vaultID)
                 }
+                await MainActor.run { self.refreshStoredKey(for: vaultID) }
                 let client = try VaultClient(config: config, key: key)
                 let outcome = try client.sync(listener: listener)
-                await self.apply(outcome: outcome, client: client)
-                await MainActor.run { self.refreshStoredKey() }
+                await self.apply(outcome: outcome, client: client, vaultID: vaultID)
             } catch {
-                await self.fail(error)
+                await self.fail(error, vaultID: vaultID)
             }
         }
     }
 
     func resolve() {
         guard let client, !busy else { return }
+        let vaultID = activeVaultID
         busy = true
         status = "Resolving…"
         progress = nil
         failures = []
+        vaultStates[vaultID]?.phase = .resolving
         let resolutions = conflicts.map { conflict in
             MobileResolution(path: conflict.path, choice: choices[conflict.path] ?? .keepLocal)
         }
@@ -675,14 +704,14 @@ final class SyncModel: ObservableObject {
         Task.detached {
             do {
                 let outcome = try client.complete(resolutions: resolutions, listener: listener)
-                await self.apply(outcome: outcome, client: client)
+                await self.apply(outcome: outcome, client: client, vaultID: vaultID)
             } catch {
-                await self.fail(error)
+                await self.fail(error, vaultID: vaultID)
             }
         }
     }
 
-    private func apply(outcome: SyncOutcome, client: VaultClient) {
+    private func apply(outcome: SyncOutcome, client: VaultClient, vaultID: String) {
         self.client = client
         conflicts = outcome.conflicts
         choices = Dictionary(uniqueKeysWithValues: outcome.conflicts.map { ($0.path, .keepLocal) })
@@ -690,21 +719,23 @@ final class SyncModel: ObservableObject {
         failures = outcome.failures
         progress = nil
         busy = false
+        let now = Date()
+        vaultStates[vaultID]?.apply(outcome: outcome, now: now)
         let failedSuffix = outcome.failures.isEmpty
             ? ""
             : " · \(outcome.failures.count) failed"
         if outcome.completed {
             status = "Synced · ↑\(outcome.uploaded) ↓\(outcome.downloaded)\(failedSuffix)"
-            staleDownloads = 0
+            defaults.set(now, forKey: Self.lastSyncedKey(vaultID))
             // OBS-20/21: mirror the freshly synced vault into the item DB, then
             // tell the File Provider to re-enumerate so Obsidian/Files see it.
-            let store = ItemStore.store(for: activeVaultID)
-            try? store.reconcileAfterSync(completed: true, vaultRoot: vaultDirectory)
+            let store = ItemStore.store(for: vaultID)
+            try? store.reconcileAfterSync(completed: true, vaultRoot: Self.vaultDirectory(for: vaultID))
             // OBS-22/23: the core sync already pushed uploads/deletes by scanning
             // the vault dir; clear the FP's pending flags now.
             try? store.drainPendingAfterSync(completed: true)
-            signalFileProvider()
-            refreshPending()
+            signalFileProvider(for: vaultID)
+            refreshPending(for: vaultID)
         } else if !outcome.conflicts.isEmpty {
             let count = outcome.conflicts.count
             status = count == 1 ? "1 conflict needs attention" : "\(count) conflicts need attention"
@@ -782,64 +813,84 @@ final class SyncModel: ObservableObject {
         }
     }
 
-    /// Ask the system to re-enumerate the active vault's working set so the
-    /// File Provider picks up the DB changes from `reconcileAfterSync`. Errors
-    /// are ignored: on a fresh install the domain registration may still be
-    /// in flight.
-    private func signalFileProvider() {
-        guard let entry = activeEntry else { return }
+    /// Ask the system to re-enumerate a vault's working set so the File
+    /// Provider picks up the DB changes from `reconcileAfterSync`. Errors are
+    /// ignored: on a fresh install the domain registration may still be in
+    /// flight.
+    private func signalFileProvider(for vaultID: String) {
+        guard let entry = entries.first(where: { $0.vaultID == vaultID }) else { return }
         NSFileProviderManager(for: Self.fpDomain(for: entry))?.signalEnumerator(for: .workingSet) { _ in }
     }
 
     // MARK: Stale-vault warning (spec §3.4, OBS-33)
 
-    /// Compare the local working manifest against the server without syncing.
-    /// Runs only when the vault is fully configured with a stored key (no
-    /// passphrase prompt on open); quietly does nothing otherwise.
+    /// Compare each vault's local working manifest against the server without
+    /// syncing, one vault after another (each call blocks a thread). Only
+    /// vaults on this build's server with a stored key take part; a 401 on
+    /// any of them ends the session once.
     func checkStale() {
-        guard !busy, !vaultID.isEmpty else { return }
-        let config = MobileVaultConfig(
-            serverUrl: serverURL,
-            apiKey: bearer,
-            vaultId: vaultID,
-            localPath: vaultDirectory.path
-        )
-        guard let key = KeychainStore.load(account: vaultID) else { return }
+        guard !busy else { return }
+        let bearer = self.bearer
+        let targets: [(String, MobileVaultConfig, Data)] = entries.compactMap { entry in
+            guard isOnDefaultServer(entry), let key = KeychainStore.load(account: entry.vaultID) else { return nil }
+            let config = MobileVaultConfig(
+                serverUrl: entry.serverURL,
+                apiKey: bearer,
+                vaultId: entry.vaultID,
+                localPath: Self.vaultDirectory(for: entry.vaultID).path
+            )
+            return (entry.vaultID, config, key)
+        }
+        guard !targets.isEmpty else { return }
         Task.detached { [weak self] in
-            // Retry a couple of times: a transient network error on open would
-            // otherwise silently suppress the warning until the next foreground.
-            var pending: UInt32 = 0
-            var unauthorized = false
-            for attempt in 1...3 {
-                do {
-                    pending = try VaultClient(config: config, key: key).vaultStatus().pendingDownloads
-                    break
-                } catch {
-                    if error.isUnauthorized {
-                        unauthorized = true
+            for (vaultID, config, key) in targets {
+                // Retry a couple of times: a transient network error on open
+                // would otherwise silently suppress the warning until the next
+                // foreground.
+                var status: MobileVaultStatus?
+                var unauthorized = false
+                for attempt in 1...3 {
+                    do {
+                        status = try VaultClient(config: config, key: key).vaultStatus()
                         break
+                    } catch {
+                        if error.isUnauthorized {
+                            unauthorized = true
+                            break
+                        }
+                        NSLog("ObSink: stale check attempt %d failed: %@", attempt, error.obsinkMessage)
+                        try? await Task.sleep(nanoseconds: 2_000_000_000)
                     }
-                    NSLog("ObSink: stale check attempt %d failed: %@", attempt, error.obsinkMessage)
-                    try? await Task.sleep(nanoseconds: 2_000_000_000)
                 }
-            }
-            await MainActor.run { [weak self] in
-                guard let self, !self.busy else { return }
-                if unauthorized {
-                    self.handleUnauthorized()
-                    return
+                let stop = await MainActor.run { [weak self] () -> Bool in
+                    guard let self else { return true }
+                    if unauthorized {
+                        self.handleUnauthorized()
+                        return true
+                    }
+                    guard let status, let current = self.vaultStates[vaultID],
+                          current.phase == .idle else { return false }
+                    // Conflicts already loaded for the active vault are the
+                    // authoritative count until they are resolved.
+                    let keepConflicts = vaultID == self.activeVaultID && !self.conflicts.isEmpty
+                    var next = current
+                    next.apply(status: status)
+                    if keepConflicts { next.conflicts = current.conflicts }
+                    self.vaultStates[vaultID] = next
+                    return false
                 }
-                self.staleDownloads = Int(pending)
+                if stop { return }
             }
         }
     }
 
-    private func fail(_ error: Error) {
+    private func fail(_ error: Error, vaultID: String) {
         busy = false
         progress = nil
         if error.isUnauthorized {
             handleUnauthorized()
         }
+        vaultStates[vaultID]?.phase = .error(error.obsinkMessage)
         status = "Error: \(error.obsinkMessage)"
     }
 }

@@ -9,7 +9,9 @@ import XCTest
 /// they are run individually with `-only-testing`, not as a suite.
 ///
 /// Configuration arrives via `TEST_RUNNER_`-prefixed environment variables:
-///   OBSINK_TEST_SERVER_URL / OBSINK_TEST_API_KEY  — server connection (operator bearer)
+///   OBSINK_TEST_SERVER_URL / OBSINK_TEST_API_KEY  — server connection (operator bearer);
+///     the URL also reaches the app as OBSINK_UITEST_SERVER_URL, overriding
+///     the server baked into the build
 ///   OBSINK_TEST_VAULT_ID / OBSINK_TEST_VAULT_NAME — target vault
 ///   OBSINK_TEST_PASSPHRASE                        — vault passphrase
 ///   OBSINK_TEST_CHOICE                            — conflict winner (resolve test)
@@ -33,6 +35,7 @@ final class SyncE2ETests: XCTestCase {
     private func seedBearer(_ app: XCUIApplication) {
         app.launchEnvironment["OBSINK_UITEST_BEARER"] = env["OBSINK_TEST_API_KEY"]!
         app.launchEnvironment["OBSINK_UITEST_BEARER_URL"] = env["OBSINK_TEST_SERVER_URL"]!
+        app.launchEnvironment["OBSINK_UITEST_SERVER_URL"] = env["OBSINK_TEST_SERVER_URL"]!
     }
 
     /// Launch the app with the vault seeded into the app-group defaults so
@@ -84,9 +87,9 @@ final class SyncE2ETests: XCTestCase {
 
     // MARK: Phases
 
-    /// Add Vault → Connect flow against the running server (vault setup UI).
-    /// The bearer is pre-seeded, so typing the server URL should show the
-    /// "signed in" row instead of the sign-in controls.
+    /// Add vault → Connect flow against the running server (vault setup UI).
+    /// The bearer is pre-seeded, so the flow opens on the Choose vault step
+    /// with the "signed in" row instead of the sign-in step.
     func testConnectVaultFlow() throws {
         let app = XCUIApplication()
         app.launchEnvironment["OBSINK_UITEST_RESET"] = "1"
@@ -95,17 +98,8 @@ final class SyncE2ETests: XCTestCase {
 
         app.buttons["addVaultButton"].tap()
 
-        let url = app.textFields["addVaultServerURL"]
-        XCTAssertTrue(url.waitForExistence(timeout: 10))
-        url.tap()
-        // Clear the prefill, then type the full URL.
-        url.press(forDuration: 1.2)
-        if app.menuItems["Select All"].waitForExistence(timeout: 3) { app.menuItems["Select All"].tap() }
-        url.typeText(env["OBSINK_TEST_SERVER_URL"]!)
-        if app.keyboards.buttons["Return"].exists { app.keyboards.buttons["Return"].tap() }
-
         XCTAssertTrue(anyElement(app, "addVaultAccountText").waitForExistence(timeout: 10),
-                      "seeded bearer not recognised for the typed server URL")
+                      "seeded bearer not recognised for the built-in server")
 
         app.buttons["Connect"].tap()
         app.buttons["listVaultsButton"].tap()
@@ -134,7 +128,12 @@ final class SyncE2ETests: XCTestCase {
         XCTAssertTrue(option.exists, "vault '\(vaultName)' not listed")
         option.tap()
 
+        let next = app.buttons["addVaultNextButton"]
+        XCTAssertTrue(next.waitForExistence(timeout: 10), "Next button missing")
+        next.tap()
+
         let pass = app.secureTextFields["addVaultPassphraseField"]
+        XCTAssertTrue(pass.waitForExistence(timeout: 10), "passphrase step missing")
         pass.tap()
         pass.typeText(env["OBSINK_TEST_PASSPHRASE"]!)
 
@@ -153,7 +152,7 @@ final class SyncE2ETests: XCTestCase {
         syncAndWait(app)
     }
 
-    /// Remove from this device (OBS-100): the vault leaves the picker; the
+    /// Remove from this device (OBS-100): the vault's card goes away; the
     /// harness then checks that its cache directory and item database are
     /// gone from the app-group container.
     func testRemoveVaultFromDevice() throws {
@@ -174,7 +173,7 @@ final class SyncE2ETests: XCTestCase {
         confirm.tap()
         let empty = app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH 'No vault yet'")).firstMatch
         XCTAssertTrue(empty.waitForExistence(timeout: 30), "vault still configured after removal")
-        XCTAssertFalse(anyElement(app, "activeVaultPicker").exists)
+        XCTAssertFalse(anyElement(app, "vaultCard").exists)
     }
 
     /// Stale-vault warning on open (OBS-33): server is ahead, banner appears
@@ -202,11 +201,14 @@ final class SyncE2ETests: XCTestCase {
         sync.tap()
         waitForStatus(app, prefix: "1 conflict")
 
-        // The inline row is a NavigationLink; resolve through the detail screen.
+        // The card links to the Conflicts screen; the rows live there.
+        let resolve = anyElement(app, "resolveConflictsLink")
+        XCTAssertTrue(resolve.waitForExistence(timeout: 10), "Resolve link missing")
+        resolve.tap()
+
+        // Each row is a NavigationLink; resolve through the detail screen.
         // Tap the row's title text — the identifier on the NavigationLink
         // itself does not surface in the accessibility tree.
-        // Off-screen Form rows are not in the accessibility tree — scroll
-        // the Conflicts section into view first.
         let row = anyElement(app, "conflictRowTitle")
         var scrolls = 0
         while !row.exists && scrolls < 4 {
