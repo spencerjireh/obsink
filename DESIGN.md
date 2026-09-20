@@ -13,8 +13,9 @@ Each principle follows from a hard rule in `AGENTS.md`.
    decorative texture. The window shows the state of the vault and the one
    thing the user can do about it.
 2. **Sync is the single primary action** (hard rule 2: manual sync only).
-   Every screen has at most one primary button, and on the vault screen it is
-   `Sync now`. Nothing looks like a toggle for automatic or background sync.
+   Every screen has at most one primary button, and on a vault screen it is
+   `Sync now`; the desktop popover's `Sync now` runs it for every vault in
+   turn. Nothing looks like a toggle for automatic or background sync.
 3. **Conflicts and stale state are first-class** (hard rule 3: never silently
    overwrite). Conflicts get their own section that is never hidden behind a
    disclosure; "changed on another device" is a warning notice, not a badge.
@@ -63,7 +64,7 @@ Semantic colours (switch with the system appearance):
 | token | dark | light | role |
 |---|---|---|---|
 | `--color-bg` | `#15141B` | `#F2EFE6` | window background |
-| `--color-surface` | `#1E1D26` | `#FFFFFF` | cards, sidebar, inputs |
+| `--color-surface` | `#1E1D26` | `#FFFFFF` | cards, lists, tab bar, inputs |
 | `--color-border` | `#2C2B35` | `#DDD9CE` | hairlines |
 | `--color-text` | `#F2EFE6` | `#15141B` | body text |
 | `--color-text-muted` | `#A9A59B` | `#5F5B66` | labels, captions |
@@ -118,13 +119,18 @@ iOS uses the system font with Dynamic Type (`.body`, `.caption`,
 
 | component | states | notes |
 |---|---|---|
-| Sync button | idle `Sync now`; busy `Working…` with a spinner; disabled | The only primary button on the vault screen. Disabled when no vault is active, a sync is running, or no key is available. |
-| Status counts | uploads, downloads, conflicts as three counts | Always rendered; zero is shown as `0`. Count in `--font-mono` at 20px, label in muted text. |
+| Sync button | idle `Sync now`; busy `Working…` with a spinner; disabled | The only primary button on the vault screen. Disabled when no vault is active, a sync is running, the session has expired, or no key is available. |
+| State dot | ok, pending, conflict, error, muted | An 8px circle in the semantic colour next to a vault name; the state text next to it says what it means (section 5). Never the only indicator. |
+| Vault row (popover) | idle, hover, syncing | Dot, name, state text, and an icon-only `Open folder` button with an `aria-label`. The row opens the settings window at that vault. |
+| Activity row | uploaded, downloaded, deleted here, deleted on server, conflict, error, synced | Relative time in muted text, the vault name when several vaults are shown, then the line in mono; errors in `--color-danger`, conflicts in `--color-warning`, `Synced` summaries muted. |
+| Tab | selected, idle, hover | `role="tablist"` / `role="tab"` with `aria-selected`; a 2px accent underline marks the selected tab. |
+| Stepper | done, current, todo | Numbered step chips; the current step has the accent border and `aria-current="step"`. Steps already passed are plain text; steps to come are muted. |
+| Icon button | idle, hover | 28px square, no border, muted glyph that turns to `--color-text` on hover; always carries an `aria-label`. |
+| Status counts | uploads, downloads, conflicts as three counts | iOS only. Always rendered; zero is shown as `0`. Count in `--font-mono` at 20px, label in muted text. |
 | Notice | info, warning, danger | One line of text; a `FATAL` or `skipped` tag leads a failure line. Warning is used for the stale banner and pending local changes. |
-| Vault row | active, inactive, disabled while busy | Name in the display face, local path in mono with ellipsis and a full-path tooltip. Active row has a 2px accent left border and `aria-current="page"`. |
+| Vault row (list) | active, inactive, disabled while busy | State dot and name in the display face, state text in mono below. Active row has a 2px accent left border and `aria-current="page"`. |
 | Conflict card | selected, unselected | Path in mono; two rows `This device` / `Other device` with size and modified time; a segmented choice of `Keep local`, `Keep remote`, `Keep both` (or `Delete on server` / `Delete here` when one side is deleted). |
 | Preview | text, deleted, empty, loading | Two columns titled `This device` and `Other device`; body in mono, max height 280px, scrolls. |
-| Result row | Upload, Download, DeleteLocal, DeleteRemote | Path in mono, kind as a tag. Lists are grouped `Uploaded` / `Downloaded`. |
 | Form field | default, focused, invalid | Label above the input in muted text; URLs, ids, and codes in mono; passphrase is a secure field; the error sits below the field in `--color-danger`. |
 | Empty state | — | One sentence in muted text that says what will appear and when. Never an illustration. |
 | Device row | current, other | Device name, a `This device` tag on the current session, sign-in date in muted text, and a `Sign out` button. The current row signs this device out; any other row revokes that session on the server. |
@@ -146,9 +152,16 @@ Shared labels. Every platform uses exactly these strings:
 
 | role | label |
 |---|---|
-| sections | `Vaults`, `Status`, `Account`, `Conflicts`, `Failed this sync`, `Last result`, `Devices`, `Invites`, `Manage vault` |
+| sections | `Vaults`, `Status`, `Account`, `Conflicts`, `Failed this sync`, `Last result` (iOS status line only), `Devices`, `Invites`, `Manage vault`, `Recent` (popover), `Activity` |
+| tabs (desktop settings) | `Vaults`, `Account`, `Activity` |
 | primary actions | `Sync now`, `Apply resolutions` |
-| setup | `Add vault`, `Create vault`, `Connect vault`, `Load vaults`, `Send sign-in code`, `Verify and sign in`, `Change email`, `Sign in` |
+| setup | `Add vault`, `Create vault`, `Connect vault`, `Load vaults` (iOS; desktop lists on entry), `Send sign-in code`, `Verify and sign in`, `Change email`, `Sign in` |
+| add-vault steps | `Sign in`, `Choose vault`, `Folder`, `Passphrase`; navigation `Back`, `Next`, `Cancel`, `Done` |
+| windows | `Settings`, `Open settings`, `Open folder`, `Quit ObSink` |
+| vault state | `Up to date`, `n to upload`, `n to download`, `n to upload · n to download`, `n conflicts` (`1 conflict`), `Syncing…`, `Offline`, `Session expired`, `Error: <message>`, `On another server`, `Needs passphrase` |
+| last synced | `Never synced`, `Just now`, `1 minute ago`, `n minutes ago`, `n hours ago`, `Yesterday`, `n days ago`, then the short date; `Last synced <relative>` on a vault page |
+| popover global line | the worst state across vaults: `Offline`, `n conflicts`, `Syncing…`, `Error`, `Changes pending · synced <relative>`, `Up to date · synced <relative>`; `No vaults yet.` |
+| activity lines | `Uploaded <path>`, `Downloaded <path>`, `Deleted here <path>`, `Deleted on server <path>`, `Conflict <path>`, `Failed <path>: <error>`, `Error: <error>`, `Synced · ↑n ↓n` |
 | account | `Invite someone`, `Copy`, `Sign out` (per device), `Delete account` |
 | vault actions | `Remove from this device`, `Delete vault on server` (distinct from the conflict choice `Delete on server`) |
 | device tag | `This device` (the same string as the conflict side, on purpose) |
@@ -156,7 +169,8 @@ Shared labels. Every platform uses exactly these strings:
 | per-vault usage | `412 MiB of 1 GiB`; `412 MiB` when the server sets no cap |
 | session | `Session expired. Sign in again.` with the action `Sign in` |
 | server without email | `This server has no email sign-in.` |
-| after actions | `Invite code created.`, `Invite code copied.`, `Device signed out.`, `Account deleted.`, `Removed <vault> from this device.`, `Deleted <vault> on the server.` |
+| after actions | `Invite code created.`, `Invite code copied.`, `Device signed out.`, `Account deleted.`, `Added <vault>.`, `Removed <vault> from this device.`, `Deleted <vault> on the server.` |
+| foreign vault | `Vault is on another server. Remove it from this device.` (error); the page explains it is configured for another server and offers only `Remove from this device` |
 | confirmation prompt | `Type <value> to confirm.` |
 | confirmation copy | delete account: `This deletes your account, every vault it owns on <server>, and every signed-in device.` then, desktop: `Vault folders on this device stay.`, iOS: `The copies on this device are removed too.`; delete vault: `This deletes <vault> and all of its files on <server>` then, desktop: `The folder on this device stays.`, iOS: `for every device.`; remove: `The vault stays on the server.` then, desktop: `The key is removed from the keychain, so connecting again needs the passphrase.`, iOS: `The copy on this device, its Files location, and the key are removed, so connecting again needs the passphrase.` |
 | modes | `Create`, `Connect` |
@@ -171,7 +185,8 @@ Shared labels. Every platform uses exactly these strings:
 Empty states:
 
 - Vaults: `No vaults yet.`
-- Last result: `Run a sync to see uploads and downloads.`
+- Last result / Recent / Activity: `Run a sync to see uploads and downloads.`
+- Vault page with nothing pending: `Nothing to sync.`
 - Conflicts: `Conflicts appear here when a sync needs a decision.`
 - Result column: `No entries.`
 - Preview: `Deleted in this version.` / `Empty file.`
@@ -182,7 +197,9 @@ Empty states:
 The invite code field appears only when the server reports
 `invite_required` (`GET /`) or has just refused a sign-up without one; in the
 second case it takes focus. Sign-in methods the server does not offer are
-not shown.
+not shown. The server itself is never shown as a field: each build talks to
+one server (`OBSINK_SERVER_URL` at build time), and the UI only prints it
+next to the account heading in mono.
 
 ## 6. Platform mapping
 
@@ -191,22 +208,38 @@ not shown.
 - Tokens live on `:root` in `desktop/src/styles.css`; light values are the
   default, dark values under `@media (prefers-color-scheme: dark)`.
   `color-scheme: light dark` so native controls follow.
-- Layout: a 240px sidebar (vault list, `Add vault`, `Account`) and a main
-  pane (active vault name with the per-vault usage, `Sync now`, status
-  counts, notices, `Last result`, `Conflicts`, `Manage vault`). Setup
-  (server URL, sign-in, invite, `Devices`, `Invites`, `Delete account`, add
-  vault) is a dedicated view that replaces the main pane; the app opens on
-  it when no vault is configured.
+- Posture: a menu-bar accessory app (`ActivationPolicy::Accessory`, no
+  Dock icon). The server URL is baked in from `OBSINK_SERVER_URL`; an
+  environment variable of the same name at launch overrides it for tests.
+- Popover: a 360x480 borderless window (`decorations: false`, always on
+  top, no transparency) shown centred under the tray icon on a left click
+  and hidden when it loses focus. Header: the app icon as a 20px rounded
+  tile (`BrandMark`), `ObSink`, a gear icon button. Then the global line,
+  one vault row per configured vault (or an `Add vault` row), `Recent`
+  (the newest eight activity events), and a footer with `Sync now`
+  (primary) and `Settings` (ghost). It never shows a form; anything that
+  needs input opens the settings window.
+- Settings window: 900x620, minimum 760x520, hidden by default, closing
+  hides it. A tab bar (`Vaults`, `Account`, `Activity`) over a pane. The
+  Vaults tab is a 240px list (state dot, name, state text; `Add vault`
+  below) and a page: name, state line with `Last synced <relative>` and the
+  per-vault usage, the path with `Open folder`, `Sync now`, `Status`
+  notices, `Conflicts`, `Manage vault`. `Add vault` replaces the page with
+  the stepper flow and ends on a card with the folder path, `Open folder`
+  and `Done`. The Account tab holds sign-in or the account, `Devices`,
+  `Invites`, `Delete account`; the Activity tab lists events with a vault
+  filter. Two-column groups stack below 860px; the list stacks above the
+  page below 760px.
 - Errors reach the UI typed (`CommandError { kind, message, status }`); a
-  401 shows the session notice with `Sign in`, which opens Setup at the
-  account section.
-- Window: default 1000x680, minimum 760x520. Two-column groups stack below
-  860px.
-- Menu bar: the template silhouette; menu items `Sync now`, `Show ObSink`,
-  `Quit ObSink`.
+  401 shows `Session expired` as the vault state and the session notice
+  with `Sign in`, which opens the Account tab.
+- Menu bar: the template silhouette; left click toggles the popover; menu
+  items `Sync now`, `Open settings`, `Quit ObSink`.
 - Icons: `desktop/src-tauri/icons/` holds the generated macOS set
   (`32x32.png`, `128x128.png`, `128x128@2x.png`, `icon.icns`, `icon.png`)
   and `tray.png`; `tauri.conf.json` `bundle.icon` lists them.
+  `desktop/src/assets/icon.svg` is a copy of `design/icon.svg` (made by
+  `scripts/gen-icons.sh`) that the popover header shows as a rounded tile.
 
 ### iOS (SwiftUI)
 
