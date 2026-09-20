@@ -19,10 +19,7 @@ function windowLabel(): string {
 
 const label = windowLabel()
 document.documentElement.classList.add(`window-${label}`)
-const Root = label === 'popover' ? PopoverApp : SettingsApp
 
 ReactDOM.createRoot(document.getElementById('root') as HTMLElement).render(
-  <React.StrictMode>
-    <Root />
-  </React.StrictMode>,
+  <React.StrictMode>{label === 'popover' ? <PopoverApp /> : <SettingsApp />}</React.StrictMode>,
 )
