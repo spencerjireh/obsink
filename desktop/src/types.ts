@@ -70,13 +70,6 @@ export type VaultStateInfo = {
 // `sync://progress` payload: the core event tagged with its vault.
 export type ProgressEnvelope = { vault_id: string; event: ProgressEvent }
 
-// Pending counts for the status tiles, derived from a `VaultState`.
-export type SyncStatus = {
-  pending_uploads: number
-  pending_downloads: number
-  pending_conflicts: number
-}
-
 export type LocalVault = {
   id: string
   name: string
@@ -100,14 +93,6 @@ export type ConflictPreview = {
 
 export type AddVaultMode = 'create' | 'connect'
 export type ResolutionChoice = 'KeepLocal' | 'KeepRemote' | 'KeepBoth'
-
-export type AddVaultForm = {
-  mode: AddVaultMode
-  local_path: string
-  vault_name: string
-  vault_id: string
-  passphrase: string
-}
 
 // Bytes one vault uses on the server against the per-vault cap (null when
 // the server sets none).
@@ -153,13 +138,10 @@ export type AuthCapabilities = { email: boolean; apple: boolean; invite_required
 
 export type RemoteVault = { id: string; name: string; created: number; max_file_size: number }
 
-// Which pane the main area shows. Setup replaces the vault pane; the sidebar
-// stays so the user can always get back.
-export type View = 'vault' | 'setup'
-export type SetupSection = 'account' | 'add-vault'
-// A sidebar request to scroll the setup view to one section; `at` makes a
-// repeat click on the same button scroll again.
-export type SetupFocus = { section: SetupSection; at: number }
+// The settings window's tabs, and what the popover asks it to show
+// (`settings://navigate`, Rust `SettingsTarget`).
+export type SettingsTab = 'vaults' | 'account' | 'activity'
+export type SettingsTarget = { tab: SettingsTab; vault_id: string | null; add_vault: boolean }
 
 // One line of the per-vault activity log (Rust `activity::ActivityEvent`),
 // newest first as returned by `list_activity`.

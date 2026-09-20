@@ -67,3 +67,18 @@ export function inviteStatusLabel(status: InviteStatus): string {
       return 'Expired'
   }
 }
+
+// "synced 2 min ago" style timestamps (unix seconds); null means never.
+export function formatRelative(value: number | null, now = Date.now() / 1000): string {
+  if (!value) return 'Never synced'
+  const seconds = Math.max(0, Math.floor(now - value))
+  if (seconds < 60) return 'Just now'
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return minutes === 1 ? '1 minute ago' : `${minutes} minutes ago`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return hours === 1 ? '1 hour ago' : `${hours} hours ago`
+  const days = Math.floor(hours / 24)
+  if (days === 1) return 'Yesterday'
+  if (days < 7) return `${days} days ago`
+  return new Date(value * 1000).toLocaleDateString()
+}
