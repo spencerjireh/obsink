@@ -1,7 +1,9 @@
 import SwiftUI
 
 /// Two tabs: Home (a card per vault) and Settings (the account). One
-/// `SyncModel` behind both.
+/// `SyncModel` behind both. Every activation runs the auto-sync routine:
+/// pending File Provider writes, a server that is ahead, or a stale vault
+/// sync without a tap.
 struct ContentView: View {
     @StateObject private var model = SyncModel()
     @Environment(\.scenePhase) private var scenePhase
@@ -13,11 +15,10 @@ struct ContentView: View {
             SettingsView(model: model)
                 .tabItem { Label("Settings", systemImage: "gearshape") }
         }
-        .task { model.checkStale() }
+        .task { await model.autoSync(reason: .launch) }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
-                model.refreshAllPending()
-                model.checkStale()
+                Task { await model.autoSync(reason: .foreground) }
             }
         }
         .alert(item: $model.alert) { alert in
