@@ -4,27 +4,36 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+# Every target, wasm32 included: the crypto stack, serde, and the pure rules.
 [dependencies]
 aes-gcm = "0.10"
 argon2 = "0.5"
 base64 = "0.22"
-# Stream combinators for bounded download concurrency; already in the tree via reqwest.
-futures-util = { version = "0.3", default-features = false, features = ["std"] }
 hex = "0.4"
 hkdf = "0.12"
 hmac = "0.12"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "1"
+tracing = "0.1"
+# Wipes the derived sub-keys on drop; already in the dependency tree via aes-gcm.
+zeroize = "1"
+
+# Native only: the sync engine's filesystem walk, HTTP, the daemon, the watcher.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Stream combinators for bounded download concurrency; already in the tree via reqwest.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart"] }
 # Filesystem change events for `obsink watch` and the desktop daemon; FSEvents on macOS, inotify on Linux.
 notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 tokio = { version = "1", features = ["fs", "rt-multi-thread", "macros", "sync", "time"] }
-tracing = "0.1"
 walkdir = "2"
-# Wipes the derived sub-keys on drop; already in the dependency tree via aes-gcm.
-zeroize = "1"
+
+# The browser has no OS entropy syscall: `aes-gcm`'s `OsRng` (via rand_core 0.6 /
+# getrandom 0.2) reads `crypto.getRandomValues` when the `js` feature is on.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
 
 # `keychain`: macOS login-keychain access for the CLI and desktop app, via the
 # Security framework so secrets never travel on a `security` argv.

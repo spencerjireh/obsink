@@ -2,14 +2,17 @@
 # CI (`cargo deny` job): `cargo deny check advisories licenses bans sources`.
 
 [graph]
-# Platforms we ship: server (Linux in Docker), CLI + desktop (macOS arm64), iOS device +
-# simulator. Windows/Android-only transitive deps of Tauri are not evaluated.
+# Platforms we ship: server (Linux in Docker), CLI + desktop (macOS universal), iOS device +
+# simulator, and the browser client (core-wasm). Windows/Android-only transitive deps of
+# Tauri are not evaluated.
 targets = [
   "x86_64-unknown-linux-gnu",
   "aarch64-unknown-linux-gnu",
   "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
   "aarch64-apple-ios",
   "aarch64-apple-ios-sim",
+  "wasm32-unknown-unknown",
 ]
 all-features = true
 

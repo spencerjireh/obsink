@@ -2,9 +2,11 @@
 # (`rustup toolchain install` with no arguments), and inside the cargo-deny container.
 # Keep server/Dockerfile's `rust:1.97-bookworm` tag on the same minor when bumping
 # (the file is .dockerignore'd so Docker builds use the image's own toolchain).
-# iOS targets are installed by scripts/build-ios.sh (`rustup target add`), not here,
-# so the Linux CI jobs and the CLI release build do not download unused std libs.
+# iOS and x86_64 macOS targets are installed by the scripts and release jobs that
+# need them (`rustup target add`), not here, so the Linux CI jobs do not download
+# unused std libs. wasm32 is small and every job that builds `core-wasm` needs it.
 [toolchain]
 channel = "1.97.1"
 components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]
 profile = "minimal"

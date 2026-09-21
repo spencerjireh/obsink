@@ -19,6 +19,9 @@ use crate::{
     ignore::IgnoreRules,
     manifest::{checkpoint_manifest, diff_manifests, ManifestDiff},
     progress::{ProgressEvent, ProgressSink, SyncPhase},
+    sync_rules::{
+        chunk_uploads, conflict_copy_path, conflict_to_upload, effective_choice, parent_hash,
+    },
     types::{
         BatchOp, Conflict, ConflictResolution, ConflictResolutionChoice, FileEntry, Manifest,
         SyncAction, SyncActionKind, SyncFailure, SyncPlan, SyncResult, VaultConfig,
@@ -33,11 +36,6 @@ const MANIFEST_FILE: &str = ".obsink/manifest.json";
 /// 304 instead of a full download. Distinct from `MANIFEST_FILE`, which is the
 /// checkpoint of the last *completed* sync.
 const REMOTE_MANIFEST_CACHE_FILE: &str = ".obsink/remote-manifest.json";
-/// Ciphertext per batch upload. Well under the server's 128 MiB body cap and
-/// the memory a phone can spare for one request.
-const BATCH_BYTE_BUDGET: u64 = 32 * 1024 * 1024;
-/// Operations per batch upload.
-const BATCH_MAX_OPS: usize = 64;
 /// Downloads in flight at once.
 const DOWNLOAD_CONCURRENCY: usize = 8;
 
@@ -630,23 +628,6 @@ async fn checkpoint(
     .await
 }
 
-/// `KeepBoth` needs two live versions. When one side is a deletion there is
-/// nothing to copy, so it collapses to keeping the side that still exists.
-fn effective_choice(
-    choice: &ConflictResolutionChoice,
-    conflict: &Conflict,
-) -> ConflictResolutionChoice {
-    match choice {
-        ConflictResolutionChoice::KeepBoth if conflict.remote.deleted => {
-            ConflictResolutionChoice::KeepLocal
-        }
-        ConflictResolutionChoice::KeepBoth if conflict.local.deleted => {
-            ConflictResolutionChoice::KeepRemote
-        }
-        other => other.clone(),
-    }
-}
-
 /// The on-disk manifest plus a tombstone for every base entry that is no
 /// longer on disk. Tombstones keep the base hash (the parent hash for the
 /// remote delete); their `modified` is informational only.
@@ -834,31 +815,6 @@ fn is_fatal_status(status: u16) -> bool {
     matches!(status, 401 | 403 | 500..=599)
 }
 
-/// Split uploads into consecutive batches: a batch closes when adding the
-/// next file would exceed `BATCH_BYTE_BUDGET` or `BATCH_MAX_OPS`. A file
-/// larger than the budget travels alone. Sizes are the plaintext sizes from
-/// the manifest (ciphertext adds a constant few bytes), so no file is read
-/// before its batch is due.
-fn chunk_uploads(sizes: &[u64]) -> Vec<std::ops::Range<usize>> {
-    let mut batches = Vec::new();
-    let mut start = 0usize;
-    let mut bytes = 0u64;
-    for (index, &size) in sizes.iter().enumerate() {
-        let full =
-            index > start && (bytes + size > BATCH_BYTE_BUDGET || index - start >= BATCH_MAX_OPS);
-        if full {
-            batches.push(start..index);
-            start = index;
-            bytes = 0;
-        }
-        bytes += size;
-    }
-    if start < sizes.len() {
-        batches.push(start..sizes.len());
-    }
-    batches
-}
-
 async fn apply_keep_remote(
     local_root: &Path,
     keys: &CryptoKeys,
@@ -929,15 +885,6 @@ async fn prepare_batch_op(
     }
 }
 
-/// The remote hash the server checks; a synthesized tombstone has none.
-fn parent_hash(action: &SyncAction) -> Option<&str> {
-    action
-        .remote
-        .as_ref()
-        .map(|entry| entry.hash.as_str())
-        .filter(|hash| !hash.is_empty())
-}
-
 fn build_upload_action_for_path(
     local_root: &Path,
     path: &str,
@@ -961,19 +908,6 @@ fn build_upload_action_for_path(
         }),
         remote: None,
     })
-}
-
-fn conflict_to_upload(conflict: &Conflict) -> SyncAction {
-    SyncAction {
-        path: conflict.path.clone(),
-        kind: if conflict.local.deleted {
-            SyncActionKind::DeleteRemote
-        } else {
-            SyncActionKind::Upload
-        },
-        local: Some(conflict.local.clone()),
-        remote: Some(conflict.remote.clone()),
-    }
 }
 
 /// Decrypt a downloaded blob and write it atomically, off the async runtime.
@@ -1021,27 +955,6 @@ fn cleanup_empty_dirs(local_root: &Path, mut current: Option<&Path>) {
     }
 }
 
-fn conflict_copy_path(original: &str) -> String {
-    let path = Path::new(original);
-    let stem = path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or(original);
-    let extension = path.extension().and_then(|value| value.to_str());
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty());
-    let file_name = match extension {
-        Some(extension) => format!("{stem}.conflict.{extension}"),
-        None => format!("{stem}.conflict"),
-    };
-
-    match parent {
-        Some(parent) => format!("{}/{}", parent.to_string_lossy(), file_name),
-        None => file_name,
-    }
-}
-
 fn now_seconds() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1057,8 +970,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        complete_sync, conflict_copy_path, load_manifest_from_disk, ordered_for_apply,
-        prepare_sync, remote_manifest_cache_path, save_manifest_to_disk, sync_manifest_path,
+        complete_sync, load_manifest_from_disk, ordered_for_apply, prepare_sync,
+        remote_manifest_cache_path, save_manifest_to_disk, sync_manifest_path,
     };
     use crate::{
         crypto::{content_hmac, derive_keys, encrypt, encrypt_path, path_token, CryptoKeys},
@@ -1193,15 +1106,6 @@ mod tests {
             sync_manifest_path(dir.path()),
             dir.path().join(".obsink/manifest.json")
         );
-    }
-
-    #[test]
-    fn conflict_copy_keeps_extension() {
-        assert_eq!(
-            conflict_copy_path("notes/today.md"),
-            "notes/today.conflict.md"
-        );
-        assert_eq!(conflict_copy_path("todo"), "todo.conflict");
     }
 
     #[test]
@@ -2164,31 +2068,6 @@ mod tests {
             .await
             .unwrap();
         writes.assert_hits_async(0).await;
-    }
-
-    #[test]
-    fn chunk_uploads_splits_by_bytes_and_op_count() {
-        use super::{chunk_uploads, BATCH_BYTE_BUDGET, BATCH_MAX_OPS};
-
-        assert!(chunk_uploads(&[]).is_empty());
-        assert_eq!(chunk_uploads(&[1, 2, 3]), vec![0..3]);
-
-        // Op count: 64 per batch.
-        let sizes = vec![1u64; BATCH_MAX_OPS * 2 + 1];
-        assert_eq!(chunk_uploads(&sizes), vec![0..64, 64..128, 128..129]);
-
-        // Byte budget: the file that would overflow starts the next batch.
-        let half = BATCH_BYTE_BUDGET / 2;
-        assert_eq!(chunk_uploads(&[half, half, 1, half]), vec![0..2, 2..4]);
-
-        // An oversize file travels alone, and does not drag its neighbours.
-        let huge = BATCH_BYTE_BUDGET + 1;
-        assert_eq!(chunk_uploads(&[1, huge, 1]), vec![0..1, 1..2, 2..3]);
-        assert_eq!(chunk_uploads(&[huge]), vec![0..1]);
-
-        // Deletes cost nothing.
-        let sizes = vec![0u64; 10];
-        assert_eq!(chunk_uploads(&sizes), vec![0..10]);
     }
 
     #[tokio::test]

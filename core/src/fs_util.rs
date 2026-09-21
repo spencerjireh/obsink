@@ -1,3 +1,4 @@
+#[cfg(not(target_arch = "wasm32"))]
 use std::{
     fs, io,
     path::{Path, PathBuf},
@@ -8,12 +9,14 @@ use std::{
 /// hasher skips these so a leftover from a crash is never treated as a note.
 pub const TEMP_SUFFIX: &str = ".obsink-tmp";
 
+#[cfg(not(target_arch = "wasm32"))]
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Write `bytes` to `path` through a temp file in the same directory plus a
 /// rename, so a crash mid-write never leaves a truncated target behind. On
 /// APFS (macOS/iOS, the only targets) `rename` replaces the destination
 /// atomically. Missing parent directories are created.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),

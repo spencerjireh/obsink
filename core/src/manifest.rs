@@ -1,10 +1,13 @@
 use std::collections::BTreeSet;
 
+use serde::{Deserialize, Serialize};
+
 use crate::types::{Conflict, FileEntry, Manifest, SyncAction, SyncActionKind};
 
 /// The three-way diff: what to upload, what to download, and what needs a
 /// decision. Nothing has been transferred yet, so there are no failures.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Serialisable so `core-wasm` can hand it to the browser driver as JSON.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestDiff {
     pub upload: Vec<SyncAction>,
     pub download: Vec<SyncAction>,

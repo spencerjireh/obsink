@@ -12,27 +12,7 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// Normalise a server URL so the same server always maps to the same
-/// keychain entry: trimmed, no trailing slash, lowercase scheme+host.
-pub fn normalize_server_url(url: &str) -> String {
-    let trimmed = url.trim().trim_end_matches('/');
-    match trimmed.split_once("://") {
-        Some((scheme, rest)) => {
-            let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
-            let mut out = format!(
-                "{}://{}",
-                scheme.to_ascii_lowercase(),
-                host.to_ascii_lowercase()
-            );
-            if !path.is_empty() {
-                out.push('/');
-                out.push_str(path);
-            }
-            out
-        }
-        None => trimmed.to_string(),
-    }
-}
+use crate::server_url::normalize_server_url;
 
 #[derive(Debug, Error)]
 pub enum AuthError {
@@ -379,7 +359,7 @@ async fn server_error(status: StatusCode, response: reqwest::Response) -> AuthEr
 mod tests {
     use httpmock::{Method::DELETE, Method::GET, Method::POST, MockServer};
 
-    use super::{normalize_server_url, AuthClient, AuthError};
+    use super::{AuthClient, AuthError};
 
     #[test]
     fn session_debug_redacts_the_token() {
@@ -397,18 +377,6 @@ mod tests {
         let printed = format!("{session:?}");
         assert!(printed.contains("sess_1"));
         assert!(!printed.contains("bearer-secret"));
-    }
-
-    #[test]
-    fn normalizes_urls() {
-        assert_eq!(
-            normalize_server_url(" HTTPS://Example.ObSink.test/ "),
-            "https://example.obsink.test"
-        );
-        assert_eq!(
-            normalize_server_url("https://x.dev/Path/"),
-            "https://x.dev/Path"
-        );
     }
 
     #[tokio::test]

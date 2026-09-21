@@ -30,6 +30,7 @@ use crate::{
     api_client::ApiClient,
     crypto::{derive_keys, KeyBytes},
     hash_cache::Stat,
+    pacing::{Backoff, PollPacing},
     progress::ProgressSink,
     sync_engine::{
         complete_sync, is_fatal_sync_error, prepare_sync, remote_changed, SyncEngineError,
@@ -233,46 +234,14 @@ impl Debouncer {
     }
 }
 
-/// Exponential backoff for fatal errors: `base * 2^n`, capped.
-#[derive(Debug)]
-pub struct Backoff {
-    base: Duration,
-    max: Duration,
-    failures: u32,
-}
-
-impl Backoff {
-    pub fn new(base: Duration, max: Duration) -> Self {
-        Backoff {
-            base,
-            max,
-            failures: 0,
-        }
-    }
-
-    /// The wait after one more failure.
-    pub fn next_wait(&mut self) -> Duration {
-        let wait = self
-            .base
-            .checked_mul(2_u32.saturating_pow(self.failures))
-            .unwrap_or(self.max)
-            .min(self.max);
-        self.failures = self.failures.saturating_add(1);
-        wait
-    }
-
-    pub fn reset(&mut self) {
-        self.failures = 0;
-    }
-}
-
 /// The remote poll interval: quick after activity, slow when idle.
 pub fn poll_interval(options: &DaemonOptions, now: Instant, last_activity: Instant) -> Duration {
-    if now.duration_since(last_activity) < options.active_window {
-        options.poll_active
-    } else {
-        options.poll_idle
+    PollPacing {
+        active: options.poll_active,
+        idle: options.poll_idle,
+        active_window: options.active_window,
     }
+    .interval(now.duration_since(last_activity))
 }
 
 fn stat_of(root: &Path, path: &str) -> Option<Stat> {
@@ -627,15 +596,6 @@ mod tests {
             debouncer.due(start + ms(1700), |_| None),
             Some(vec!["b.md".to_string()])
         );
-    }
-
-    #[test]
-    fn backoff_doubles_and_caps() {
-        let mut backoff = Backoff::new(Duration::from_secs(5), Duration::from_secs(300));
-        let waits: Vec<u64> = (0..8).map(|_| backoff.next_wait().as_secs()).collect();
-        assert_eq!(waits, vec![5, 10, 20, 40, 80, 160, 300, 300]);
-        backoff.reset();
-        assert_eq!(backoff.next_wait().as_secs(), 5);
     }
 
     #[test]
