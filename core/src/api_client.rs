@@ -239,27 +239,6 @@ impl ApiClient {
         parse_empty(path, self.send_with_retry(request).await?).await
     }
 
-    pub async fn delete_file(
-        &self,
-        path: &str,
-        parent_hash: Option<&str>,
-        keys: &CryptoKeys,
-    ) -> Result<(), ApiError> {
-        let token = path_token(&keys.path_token, path);
-        debug!(path, "deleting file");
-        let mut request = self
-            .client
-            .delete(self.vault_url(&format!("files/{token}")))
-            .timeout(SMALL_REQUEST_TIMEOUT)
-            .bearer_auth(&self.config.api_key);
-
-        if let Some(parent_hash) = parent_hash {
-            request = request.header("X-Parent-Hash", parent_hash);
-        }
-
-        parse_empty(path, self.send_with_retry(request).await?).await
-    }
-
     /// Send several puts/deletes in one `multipart/form-data` request: an
     /// `operations` JSON part plus one `content` part per put, named by
     /// operation index. Results come back keyed by real path, one per

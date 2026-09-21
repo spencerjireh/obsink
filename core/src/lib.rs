@@ -29,9 +29,7 @@ pub use daemon::{
 };
 pub use fs_util::{write_atomic, TEMP_SUFFIX};
 pub use hash_cache::{hash_cache_path, HashCache, Stat};
-pub use hasher::{
-    build_manifest_from_dir, build_manifest_with_cache, hash_bytes, hash_file, HasherError,
-};
+pub use hasher::{build_manifest_from_dir, build_manifest_with_cache, hash_file, HasherError};
 pub use ignore::{IgnoreRules, DEFAULT_IGNORE};
 pub use manifest::{checkpoint_manifest, diff_manifests, ManifestDiff};
 pub use progress::{NoProgress, ProgressEvent, ProgressSink, SyncPhase};

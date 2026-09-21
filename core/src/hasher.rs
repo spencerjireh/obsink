@@ -24,15 +24,10 @@ pub enum HasherError {
     InvalidModifiedTime { path: PathBuf },
 }
 
-/// Keyed content hash (HMAC-SHA256) of raw bytes, hex-encoded.
-pub fn hash_bytes(mac_key: &KeyBytes, bytes: &[u8]) -> String {
-    content_hmac(mac_key, bytes)
-}
-
-/// Keyed content hash of a file's contents.
+/// Keyed content hash (HMAC-SHA256, hex) of a file's contents.
 pub fn hash_file(mac_key: &KeyBytes, path: &Path) -> Result<String, HasherError> {
     let bytes = fs::read(path)?;
-    Ok(hash_bytes(mac_key, &bytes))
+    Ok(content_hmac(mac_key, &bytes))
 }
 
 /// Build a manifest of the directory, keyed by real path. Entry hashes are
@@ -121,9 +116,9 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{build_manifest_from_dir, build_manifest_with_cache, hash_bytes};
+    use super::{build_manifest_from_dir, build_manifest_with_cache};
     use crate::{
-        crypto::{derive_key, derive_keys, CryptoKeys},
+        crypto::{content_hmac as hash_bytes, derive_key, derive_keys, CryptoKeys},
         hash_cache::{hash_cache_path, HashCache},
         ignore::IgnoreRules,
     };
