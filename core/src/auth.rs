@@ -60,11 +60,22 @@ pub struct AuthMethods {
     pub api_key: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `Debug` redacts `token` (the bearer).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
     pub token: String,
     pub session: SessionInfo,
     pub user: UserInfo,
+}
+
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("token", &"..")
+            .field("session", &self.session)
+            .field("user", &self.user)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -369,6 +380,24 @@ mod tests {
     use httpmock::{Method::DELETE, Method::GET, Method::POST, MockServer};
 
     use super::{normalize_server_url, AuthClient, AuthError};
+
+    #[test]
+    fn session_debug_redacts_the_token() {
+        let session = super::Session {
+            token: "bearer-secret".into(),
+            session: super::SessionInfo {
+                id: "sess_1".into(),
+                expires: 0,
+            },
+            user: super::UserInfo {
+                id: "user_1".into(),
+                email: Some("a@b.test".into()),
+            },
+        };
+        let printed = format!("{session:?}");
+        assert!(printed.contains("sess_1"));
+        assert!(!printed.contains("bearer-secret"));
+    }
 
     #[test]
     fn normalizes_urls() {

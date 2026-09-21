@@ -23,10 +23,18 @@ const READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// Total attempts (1 initial + retries) for transient network failures.
 const MAX_ATTEMPTS: u32 = 3;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ApiClient {
     config: VaultConfig,
     client: reqwest::Client,
+}
+
+impl std::fmt::Debug for ApiClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiClient")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Error)]
@@ -406,6 +414,19 @@ async fn parse_empty(path: &str, response: Response) -> Result<(), ApiError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn api_client_debug_redacts_the_bearer() {
+        let client = super::ApiClient::new(crate::VaultConfig {
+            server_url: "https://s.test".into(),
+            api_key: "secret-bearer-xyz".into(),
+            vault_id: "vault_1".into(),
+            local_path: "/tmp/v".into(),
+        });
+        let printed = format!("{client:?}");
+        assert!(printed.contains("vault_1"));
+        assert!(!printed.contains("secret-bearer-xyz"));
+    }
+
     use httpmock::{Method::GET, Method::POST, Method::PUT, MockServer};
 
     use super::{ApiClient, ApiError, ManifestFetch};
