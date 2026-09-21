@@ -4,6 +4,7 @@
 # npm workspaces install at the root
 node_modules/
 /desktop/dist/
+/web/dist/
 /desktop/src-tauri/gen/
 
 # Server data dir when running the binary outside Docker
@@ -31,3 +32,6 @@ lefthook-local.yml
 # `tauri icon` mobile output; scripts/gen-icons.sh keeps only the macOS set
 /desktop/src-tauri/icons/android/
 /desktop/src-tauri/icons/ios/
+
+# Playwright MCP session artifacts
+.playwright-mcp/

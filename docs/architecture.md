@@ -10,7 +10,8 @@ This document is for contributors. It describes how ObSink syncs a folder and wh
 │  - obsink CLI       │ ───────────────►│  - accounts, invites, routing │
 │  - Tauri desktop    │  (via a TLS     │  - conflict gating (one tx)   │
 │  - iOS app          │   proxy)        │  - envelope encryption        │
-│  (all wrap core/)   │ ◄───────────────│  - version/trash retention    │
+│  - browser (web/)   │ ◄───────────────│  - version/trash retention    │
+│  (all wrap core/)   │                 │                               │
 └─────────────────────┘                 └───────────┬──────────────────┘
           │                                          │
    builds/diffs                              ┌───────┴────────────────┐

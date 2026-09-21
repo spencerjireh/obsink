@@ -71,6 +71,11 @@ export interface Backend {
   addVault(request: AddVaultRequest): Promise<LocalVault>
   // Present where folders are picked rather than typed (the browser).
   pickFolder?(): Promise<{ id: string; name: string }>
+  // Present where a folder grant can lapse (the browser): ask for it again.
+  requestFolderAccess?(vaultId: string): Promise<void>
+  // Present where the key is not kept between launches (the browser): the
+  // passphrase again for a `no_key` vault.
+  unlockVault?(vaultId: string, passphrase: string): Promise<void>
   removeVault(vaultId: string): Promise<void>
   deleteRemoteVault(vaultId: string): Promise<void>
   getVaultStates(): Promise<VaultStateInfo[]>

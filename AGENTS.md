@@ -55,6 +55,7 @@ obsink/
   server/                # obsink-server (axum): accounts, vaults, files, batch, retention; Dockerfile
   ui/                    # shared React screens + the Backend interface (npm workspace, TS source)
   desktop/               # Tauri v2 shell (src-tauri/) + the Tauri Backend and entry (src/)
+  web/                   # browser client at /app: worker Backend (File System Access + core-wasm + fetch)
   mobile/                # UniFFI facade over core (staticlib/cdylib for iOS)
   ios/                   # Xcode project: ObSink app + FileProvider ext + Tests (XcodeGen)
   docker-compose.yml     # local stack; docker-compose.coolify.yml for production
@@ -131,6 +132,9 @@ docker compose exec server obsink-server invite
 
 # Desktop (lint + format check, build the web bundle, then check the Tauri Rust)
 npm ci && npm run lint && npm run format:check && npm run typecheck -w ui && npm run build -w desktop && cargo check -p obsink-desktop
+
+# Browser client (needs the wasm-pack build above first)
+npm run typecheck -w web && npm run test -w web && npm run build -w web
 
 # Build iOS: device+simulator staticlibs, UniFFI bindings, xcframework, XcodeGen
 scripts/build-ios.sh

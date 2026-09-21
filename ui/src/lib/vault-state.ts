@@ -27,6 +27,8 @@ export function stateText(info: VaultStateInfo): string {
       return 'On another server'
     case 'no_key':
       return 'Needs passphrase'
+    case 'needs_access':
+      return 'Needs folder access'
   }
 }
 
@@ -37,6 +39,7 @@ export function stateTone(info: VaultStateInfo): StateTone {
     case 'pending':
     case 'syncing':
     case 'no_key':
+    case 'needs_access':
       return 'pending'
     case 'conflicts':
       return 'conflict'
@@ -56,7 +59,12 @@ export function remoteChanges(info: VaultStateInfo | null): number {
 }
 
 export function canSync(info: VaultStateInfo | null): boolean {
-  return !!info && info.state.kind !== 'foreign' && info.state.kind !== 'no_key'
+  return (
+    !!info &&
+    info.state.kind !== 'foreign' &&
+    info.state.kind !== 'no_key' &&
+    info.state.kind !== 'needs_access'
+  )
 }
 
 // One line for every vault at once, worst state first.
