@@ -2,6 +2,7 @@ pub mod api_client;
 pub mod auth;
 pub mod crypto;
 pub mod fs_util;
+pub mod hash_cache;
 pub mod hasher;
 #[cfg(feature = "keychain")]
 pub mod keychain;
@@ -20,7 +21,10 @@ pub use crypto::{
     path_token, CryptoError, CryptoKeys, KeyBytes, PROTOCOL_VERSION,
 };
 pub use fs_util::{write_atomic, TEMP_SUFFIX};
-pub use hasher::{build_manifest_from_dir, hash_bytes, hash_file, HasherError};
+pub use hash_cache::{hash_cache_path, HashCache, Stat};
+pub use hasher::{
+    build_manifest_from_dir, build_manifest_with_cache, hash_bytes, hash_file, HasherError,
+};
 pub use manifest::{checkpoint_manifest, diff_manifests, ManifestDiff};
 pub use progress::{NoProgress, ProgressEvent, ProgressSink, SyncPhase};
 pub use sync_engine::{
