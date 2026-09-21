@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
-import { listen } from '@tauri-apps/api/event'
-import type { SettingsTab, SettingsTarget } from '../types'
+import type { SettingsTab } from '../types'
+import { useBackend } from '../backend'
 import { useAccount } from '../hooks/useAccount'
 import { useVaultStates } from '../hooks/useVaultStates'
 import { Notice } from '../components/Notices'
@@ -11,6 +11,7 @@ import { VaultsTab } from './vaults/VaultsTab'
 
 // The settings window: everything that is not a glance at status.
 export function SettingsApp() {
+  const backend = useBackend()
   const [tab, setTab] = useState<SettingsTab>('vaults')
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [adding, setAdding] = useState(false)
@@ -31,19 +32,17 @@ export function SettingsApp() {
   }, [loaded, states, selectedId])
 
   // The popover (or the tray) asks for a tab, a vault, or the add flow.
-  useEffect(() => {
-    const unlisten = listen<SettingsTarget>('settings://navigate', (event) => {
-      const target = event.payload
-      setTab(target.tab)
-      if (target.vault_id) setSelectedId(target.vault_id)
-      setAdding(target.add_vault)
-      setMessage('')
-      void refresh()
-    })
-    return () => {
-      void unlisten.then((dispose) => dispose())
-    }
-  }, [refresh])
+  useEffect(
+    () =>
+      backend.on('settings://navigate', (target) => {
+        setTab(target.tab)
+        if (target.vault_id) setSelectedId(target.vault_id)
+        setAdding(target.add_vault)
+        setMessage('')
+        void refresh()
+      }),
+    [backend, refresh],
+  )
 
   function changeTab(next: SettingsTab) {
     setTab(next)

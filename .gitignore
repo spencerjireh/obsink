@@ -1,7 +1,8 @@
 /target/
 # wasm-pack output of core-wasm (rebuilt by CI and the web image)
 /core-wasm/pkg/
-/desktop/node_modules/
+# npm workspaces install at the root
+node_modules/
 /desktop/dist/
 /desktop/src-tauri/gen/
 

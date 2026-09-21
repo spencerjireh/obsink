@@ -1,15 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { listen } from '@tauri-apps/api/event'
 import type {
   Conflict,
   ConflictPreview,
   Progress,
-  ProgressEnvelope,
   ResolutionChoice,
   SyncResponse,
   SyncResult,
 } from '../types'
-import { call } from '../lib/tauri'
+import { useBackend } from '../backend'
 import { plural } from '../lib/format'
 
 type Notify = (message: string) => void
@@ -18,6 +16,7 @@ type Notify = (message: string) => void
 // show progress and the last result. Mounted per vault (`key={vaultId}`) so
 // switching vaults drops everything.
 export function useSyncRunner(vaultId: string, onError: (error: unknown) => void, notify: Notify) {
+  const backend = useBackend()
   const [busy, setBusy] = useState(false)
   const [progress, setProgress] = useState<Progress | null>(null)
   const [syncResult, setSyncResult] = useState<SyncResult | null>(null)
@@ -76,26 +75,26 @@ export function useSyncRunner(vaultId: string, onError: (error: unknown) => void
   }
 
   const sync = useCallback(
-    () => run(() => call<SyncResponse>('sync_vault', { vaultId }), 'Sync complete.'),
+    () => run(() => backend.syncVault(vaultId), 'Sync complete.'),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [vaultId],
+    [backend, vaultId],
   )
 
   const resolve = useCallback(
     () =>
       run(
         () =>
-          call<SyncResponse>('resolve_conflict', {
+          backend.resolveConflict(
             vaultId,
-            resolutions: conflicts.map((conflict) => ({
+            conflicts.map((conflict) => ({
               path: conflict.path,
               choice: choices[conflict.path] ?? 'KeepLocal',
             })),
-          }),
+          ),
         'Conflict resolutions applied.',
       ),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [vaultId, conflicts, choices],
+    [backend, vaultId, conflicts, choices],
   )
 
   const choose = useCallback((path: string, choice: ResolutionChoice) => {
@@ -104,9 +103,9 @@ export function useSyncRunner(vaultId: string, onError: (error: unknown) => void
 
   // Progress lines for this vault only.
   useEffect(() => {
-    const unlisten = listen<ProgressEnvelope>('sync://progress', (event) => {
-      if (event.payload.vault_id !== vaultId) return
-      const ev = event.payload.event
+    return backend.on('sync://progress', (envelope) => {
+      if (envelope.vault_id !== vaultId) return
+      const ev = envelope.event
       if ('Phase' in ev) {
         setProgress({ phase: ev.Phase, current: 0, total: 0, path: null })
       } else if ('FileStarted' in ev) {
@@ -120,10 +119,7 @@ export function useSyncRunner(vaultId: string, onError: (error: unknown) => void
         setProgress(null)
       }
     })
-    return () => {
-      void unlisten.then((dispose) => dispose())
-    }
-  }, [vaultId])
+  }, [backend, vaultId])
 
   // Keep a conflict selected while there are any.
   useEffect(() => {
@@ -145,7 +141,8 @@ export function useSyncRunner(vaultId: string, onError: (error: unknown) => void
     }
     let cancelled = false
     setPreviewBusy(true)
-    call<ConflictPreview>('get_conflict_preview', { vaultId, path: selectedPath })
+    backend
+      .getConflictPreview(vaultId, selectedPath)
       .then((next) => {
         if (!cancelled) setPreview(next)
       })
@@ -161,7 +158,7 @@ export function useSyncRunner(vaultId: string, onError: (error: unknown) => void
     return () => {
       cancelled = true
     }
-  }, [vaultId, selectedPath])
+  }, [backend, vaultId, selectedPath])
 
   return {
     busy,

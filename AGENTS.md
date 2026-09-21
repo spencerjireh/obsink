@@ -53,7 +53,8 @@ obsink/
   core-wasm/             # wasm-bindgen bindings over the pure core modules for the browser client
   cli/                   # `obsink` CLI (reference client)
   server/                # obsink-server (axum): accounts, vaults, files, batch, retention; Dockerfile
-  desktop/               # Tauri v2 + React app (src-tauri/ + src/)
+  ui/                    # shared React screens + the Backend interface (npm workspace, TS source)
+  desktop/               # Tauri v2 shell (src-tauri/) + the Tauri Backend and entry (src/)
   mobile/                # UniFFI facade over core (staticlib/cdylib for iOS)
   ios/                   # Xcode project: ObSink app + FileProvider ext + Tests (XcodeGen)
   docker-compose.yml     # local stack; docker-compose.coolify.yml for production
@@ -98,9 +99,9 @@ obsink/
 7. **Tests and lints stay green.** `cargo test --workspace` (server integration
    tests skip without `DATABASE_URL`; run them against Postgres before touching
    `server/`), `cargo clippy --workspace --all-targets -- -D warnings`,
-   `cargo deny check`, and in `desktop/` `npm run lint && npm run format:check
-   && npm run build`. CI enforces all of them on every PR; run them before
-   considering work done.
+   `cargo deny check`, and at the repo root `npm run lint && npm run format:check
+   && npm run typecheck -w ui && npm run build -w desktop`. CI enforces all of
+   them on every PR; run them before considering work done.
 8. **No new dependencies without a one-line justification.** The core crypto
    stack (aes-gcm, argon2, hkdf, hmac, sha2) is fixed — do not swap it out.
 
@@ -129,7 +130,7 @@ docker compose up -d            # OBSINK_PORT=18080 if 8080 is taken
 docker compose exec server obsink-server invite
 
 # Desktop (lint + format check, build the web bundle, then check the Tauri Rust)
-(cd desktop && npm ci && npm run lint && npm run format:check && npm run build && cargo check -p obsink-desktop)
+npm ci && npm run lint && npm run format:check && npm run typecheck -w ui && npm run build -w desktop && cargo check -p obsink-desktop
 
 # Build iOS: device+simulator staticlibs, UniFFI bindings, xcframework, XcodeGen
 scripts/build-ios.sh

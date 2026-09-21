@@ -1,10 +1,10 @@
 import type { VaultStateInfo } from '../../types'
 import type { Account } from '../../hooks/useAccount'
+import { useBackend } from '../../backend'
 import { useSyncRunner } from '../../hooks/useSyncRunner'
 import { SESSION_EXPIRED } from '../../lib/errors'
 import { formatRelative, phaseLabel, plural, vaultUsageLine } from '../../lib/format'
 import { canSync, remoteChanges, stateText, stateTone } from '../../lib/vault-state'
-import { call } from '../../lib/tauri'
 import { Conflicts } from '../../components/Conflicts'
 import { FailureNotice, Notice } from '../../components/Notices'
 import { StateDot } from '../../components/StateDot'
@@ -25,6 +25,7 @@ type Props = {
 // Mounted with `key={info.id}` so the runner and any open confirmation
 // belong to this vault only.
 export function VaultPage({ info, account, message, notify, onError, onSignIn, onGone }: Props) {
+  const backend = useBackend()
   const runner = useSyncRunner(info.id, onError, notify)
   const busy = runner.busy || account.busy
   const syncable = canSync(info)
@@ -46,9 +47,9 @@ export function VaultPage({ info, account, message, notify, onError, onSignIn, o
   // The expiry notice carries the same text, so the plain one is redundant.
   const plainMessage = message && !(sessionExpired && message === SESSION_EXPIRED) ? message : ''
 
-  async function removal(command: string, done: string): Promise<boolean> {
+  async function removal(action: () => Promise<void>, done: string): Promise<boolean> {
     try {
-      await call(command, { vaultId: info.id })
+      await action()
       notify(done)
       onGone()
       return true
@@ -59,7 +60,7 @@ export function VaultPage({ info, account, message, notify, onError, onSignIn, o
   }
 
   function openFolder() {
-    call('open_vault_folder', { vaultId: info.id }).catch(onError)
+    backend.openVaultFolder(info.id).catch(onError)
   }
 
   return (
@@ -85,13 +86,15 @@ export function VaultPage({ info, account, message, notify, onError, onSignIn, o
           </p>
           <p className="pane-header__meta">
             <code>{info.local_path}</code>{' '}
-            <button
-              className="button button--ghost button--small"
-              onClick={openFolder}
-              type="button"
-            >
-              Open folder
-            </button>
+            {backend.platform.canOpenFolder ? (
+              <button
+                className="button button--ghost button--small"
+                onClick={openFolder}
+                type="button"
+              >
+                Open folder
+              </button>
+            ) : null}
           </p>
         </div>
         <button
@@ -177,8 +180,12 @@ export function VaultPage({ info, account, message, notify, onError, onSignIn, o
         vault={info}
         busy={busy}
         removeOnly={!syncable}
-        onRemove={() => removal('remove_vault', `Removed ${info.name} from this device.`)}
-        onDeleteRemote={() => removal('delete_remote_vault', `Deleted ${info.name} on the server.`)}
+        onRemove={() =>
+          removal(() => backend.removeVault(info.id), `Removed ${info.name} from this device.`)
+        }
+        onDeleteRemote={() =>
+          removal(() => backend.deleteRemoteVault(info.id), `Deleted ${info.name} on the server.`)
+        }
       />
     </div>
   )

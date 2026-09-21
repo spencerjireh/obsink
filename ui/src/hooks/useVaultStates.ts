@@ -1,12 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { listen } from '@tauri-apps/api/event'
 import type { VaultStateInfo } from '../types'
-import { call } from '../lib/tauri'
+import { useBackend, type BackendEvent } from '../backend'
 
-// Every configured vault with its state. Re-read on mount, whenever Rust
-// says something changed, and on any extra event names given (the popover
-// passes `popover://opened`).
-export function useVaultStates(onError: (error: unknown) => void, extraEvents: string[] = []) {
+// Every configured vault with its state. Re-read on mount, whenever the
+// backend says something changed, and on any extra event names given (the
+// popover passes `popover://opened`).
+export function useVaultStates(
+  onError: (error: unknown) => void,
+  extraEvents: BackendEvent[] = [],
+) {
+  const backend = useBackend()
   const [states, setStates] = useState<VaultStateInfo[]>([])
   const [loaded, setLoaded] = useState(false)
   const onErrorRef = useRef(onError)
@@ -24,7 +27,7 @@ export function useVaultStates(onError: (error: unknown) => void, extraEvents: s
     try {
       do {
         again.current = false
-        setStates(await call<VaultStateInfo[]>('get_vault_states'))
+        setStates(await backend.getVaultStates())
         setLoaded(true)
       } while (again.current)
     } catch (error) {
@@ -32,19 +35,17 @@ export function useVaultStates(onError: (error: unknown) => void, extraEvents: s
     } finally {
       inFlight.current = false
     }
-  }, [])
+  }, [backend])
 
   useEffect(() => {
     void refresh()
-    const names = ['state://changed', ...extraEvents]
-    const unlisteners = names.map((name) => listen(name, () => void refresh()))
+    const names: BackendEvent[] = ['state://changed', ...extraEvents]
+    const unsubscribes = names.map((name) => backend.on(name, () => void refresh()))
     return () => {
-      for (const unlisten of unlisteners) {
-        void unlisten.then((dispose) => dispose())
-      }
+      for (const unsubscribe of unsubscribes) unsubscribe()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [refresh])
+  }, [backend, refresh])
 
   return { states, loaded, refresh }
 }

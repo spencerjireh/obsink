@@ -109,19 +109,17 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: desktop/package-lock.json
-      - name: Install frontend dependencies
-        working-directory: desktop
+          cache-dependency-path: package-lock.json
+      - name: Install the npm workspaces (ui, desktop)
         run: npm ci
       - name: Lint
-        working-directory: desktop
         run: npm run lint
       - name: Check formatting
-        working-directory: desktop
         run: npm run format:check
+      - name: Type-check the shared UI package
+        run: npm run typecheck -w ui
       - name: Build desktop frontend
-        working-directory: desktop
-        run: npm run build
+        run: npm run build -w desktop
       - name: Clippy the Tauri shell and the CLI (macOS keychain path)
         run: cargo clippy -p obsink-desktop -p obsink --all-targets -- -D warnings
 

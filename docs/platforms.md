@@ -42,11 +42,11 @@ If you omit `--passphrase`, the CLI prompts for it interactively.
 
 ## macOS desktop
 
-A Tauri v2 + React menu-bar app (`desktop/`).
+A Tauri v2 menu-bar app (`desktop/`). The React screens live in the shared `ui/` npm workspace and reach the platform through the `Backend` interface (`ui/src/backend.tsx`); `desktop/src/backend.ts` implements it with Tauri commands and events, and the browser client implements it again over a worker.
 
 ```bash
+npm ci                   # at the repo root: installs the ui and desktop workspaces
 cd desktop
-npm ci
 npm run tauri dev        # run against your server (docker compose up -d for a local one)
 npm run tauri build      # produce a .app/.dmg
 ```
