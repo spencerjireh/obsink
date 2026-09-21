@@ -9,13 +9,14 @@ final class ItemStore {
 
     /// One store per vault, shared by the app and the extension (each in its
     /// own process) through the App Group database `items-<vaultID>.sqlite`.
-    /// Failing to open the backing store is fatal: the FP can't operate
-    /// without it.
-    static func store(for vaultID: String) -> ItemStore {
+    /// An open failure (a locked data-protection container before first
+    /// unlock, a stale `-wal`) is reported to the caller: the extension
+    /// answers `cannotSynchronize` instead of crashing.
+    static func store(for vaultID: String) throws -> ItemStore {
         storesLock.lock()
         defer { storesLock.unlock() }
         if let existing = stores[vaultID] { return existing }
-        let store = try! ItemStore(databaseURL: ItemStore.defaultDatabaseURL(vaultID: vaultID))
+        let store = try ItemStore(databaseURL: ItemStore.defaultDatabaseURL(vaultID: vaultID))
         stores[vaultID] = store
         return store
     }
@@ -120,23 +121,49 @@ final class ItemStore {
     }
 
     func children(of parentIdentifier: String) throws -> [ItemRecord] {
+        try children(of: parentIdentifier, limit: nil, offset: 0)
+    }
+
+    /// One page of a folder's live children, ordered by filename. `limit: nil`
+    /// returns everything after `offset`.
+    func children(of parentIdentifier: String, limit: Int?, offset: Int) throws -> [ItemRecord] {
         try dbQueue.read { db in
-            try ItemRecord
+            var request = ItemRecord
                 .filter(Column("parentIdentifier") == parentIdentifier)
                 .filter(Column("isDeleted") == false)
                 .order(Column("filename"))
-                .fetchAll(db)
+            if let limit { request = request.limit(limit, offset: offset) }
+            return try request.fetchAll(db)
+        }
+    }
+
+    /// One page of every live item, ordered by identifier. Backs the working
+    /// set, which the system uses for offline availability and search.
+    func allItems(limit: Int?, offset: Int) throws -> [ItemRecord] {
+        try dbQueue.read { db in
+            var request = ItemRecord
+                .filter(Column("isDeleted") == false)
+                .order(Column("identifier"))
+            if let limit { request = request.limit(limit, offset: offset) }
+            return try request.fetchAll(db)
         }
     }
 
     /// Items changed since `anchor` (rowVersion strictly greater), INCLUDING
-    /// tombstones (`isDeleted`). Slice B's enumerator maps tombstones to deletes.
+    /// tombstones (`isDeleted`). The enumerator maps tombstones to deletes.
     func changes(from anchor: Int64) throws -> [ItemRecord] {
+        try changes(from: anchor, limit: nil)
+    }
+
+    /// The first `limit` changes after `anchor` in rowVersion order, so a
+    /// large delta can be handed over in pages.
+    func changes(from anchor: Int64, limit: Int?) throws -> [ItemRecord] {
         try dbQueue.read { db in
-            try ItemRecord
+            var request = ItemRecord
                 .filter(Column("rowVersion") > anchor)
                 .order(Column("rowVersion"))
-                .fetchAll(db)
+            if let limit { request = request.limit(limit) }
+            return try request.fetchAll(db)
         }
     }
 
@@ -162,9 +189,41 @@ final class ItemStore {
         }
     }
 
+    /// Insert a new record with the next `rowVersion`, assigned inside the
+    /// write transaction so the row shows up in `changes(from:)` at once.
+    /// Returns the stored record.
+    @discardableResult
+    func insert(_ record: ItemRecord) throws -> ItemRecord {
+        try dbQueue.write { db in
+            var rec = record
+            rec.rowVersion = try Self.maxRowVersion(db) + 1
+            try rec.insert(db, onConflict: .replace)
+            return rec
+        }
+    }
+
+    /// Record new bytes for an item (size and mtime), bumping `rowVersion` so
+    /// the content version the File Provider reports changes with them.
+    @discardableResult
+    func updateContent(identifier: String, size: Int64?, modified: Int64) throws -> ItemRecord? {
+        try dbQueue.write { db in
+            guard var rec = try ItemRecord.filter(Column("identifier") == identifier).fetchOne(db) else {
+                return nil
+            }
+            rec.size = size
+            rec.modified = modified
+            rec.rowVersion = try Self.maxRowVersion(db) + 1
+            try rec.update(db)
+            return rec
+        }
+    }
+
     /// Rename/move an item, keeping its identifier stable (spec §11.6). Used by
-    /// the File Provider's `modifyItem` (Slice D) — a disk scan cannot detect
-    /// renames, so the FP must report them by identifier.
+    /// the File Provider's `modifyItem` — a disk scan cannot detect renames,
+    /// so the FP must report them by identifier. Moving a directory rewrites
+    /// the `localPath` of everything under it; those rows keep their
+    /// `rowVersion` because nothing the File Provider sees about them
+    /// (identifier, parent, filename) changed.
     @discardableResult
     func rename(identifier: String,
                 toPath localPath: String,
@@ -174,24 +233,44 @@ final class ItemStore {
             guard var rec = try ItemRecord.filter(Column("identifier") == identifier).fetchOne(db) else {
                 return nil
             }
+            let oldPath = rec.localPath
             rec.filename = filename
             rec.localPath = localPath
             rec.parentIdentifier = parentIdentifier
             rec.rowVersion = try Self.maxRowVersion(db) + 1
             try rec.update(db)
+            if rec.isDirectory && oldPath != localPath {
+                for var child in try Self.descendants(of: oldPath, db: db) {
+                    child.localPath = localPath + child.localPath.dropFirst(oldPath.count)
+                    try child.update(db)
+                }
+            }
             return rec
         }
     }
 
+    /// Flag an item for the next sync. A queued deletion also tombstones the
+    /// row so it drops out of enumeration immediately; the host app removes
+    /// it after syncing. Deleting a directory tombstones everything under it,
+    /// each with its own `rowVersion`, so `enumerateChanges` reports every
+    /// item the folder took with it.
     func setPending(identifier: String, upload: Bool = false, deletion: Bool = false) throws {
         try dbQueue.write { db in
             guard var rec = try ItemRecord.filter(Column("identifier") == identifier).fetchOne(db) else { return }
+            var next = try Self.maxRowVersion(db) + 1
             if upload { rec.pendingUpload = true }
-            // A queued deletion also tombstones the row so it drops out of
-            // enumeration immediately; the host app removes it after syncing.
             if deletion { rec.pendingDeletion = true; rec.isDeleted = true }
-            rec.rowVersion = try Self.maxRowVersion(db) + 1
+            rec.rowVersion = next
+            next += 1
             try rec.update(db)
+            guard deletion, rec.isDirectory else { return }
+            for var child in try Self.descendants(of: rec.localPath, db: db) where !child.isDeleted {
+                child.pendingDeletion = true
+                child.isDeleted = true
+                child.rowVersion = next
+                next += 1
+                try child.update(db)
+            }
         }
     }
 
@@ -382,5 +461,18 @@ final class ItemStore {
 
     private static func maxRowVersion(_ db: Database) throws -> Int64 {
         try Int64.fetchOne(db, sql: "SELECT MAX(rowVersion) FROM items") ?? 0
+    }
+
+    /// Every row whose `localPath` sits under `directoryPath`, tombstones
+    /// included. `_` and `%` in the path are escaped so they match literally.
+    private static func descendants(of directoryPath: String, db: Database) throws -> [ItemRecord] {
+        let escaped = directoryPath
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "%", with: "\\%")
+            .replacingOccurrences(of: "_", with: "\\_")
+        return try ItemRecord
+            .filter(sql: "localPath LIKE ? ESCAPE '\\'", arguments: [escaped + "/%"])
+            .order(Column("localPath"))
+            .fetchAll(db)
     }
 }

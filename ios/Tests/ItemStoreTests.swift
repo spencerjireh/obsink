@@ -253,17 +253,102 @@ final class ItemStoreTests: XCTestCase {
     // opens a fresh one instead of reusing a closed queue.
     func testForgetClosesAndReopens() throws {
         let id = "vault_forget_\(UUID().uuidString)"
-        let first = ItemStore.store(for: id)
+        let first = try ItemStore.store(for: id)
         XCTAssertEqual(try first.pendingCount(), 0)
 
         ItemStore.forget(vaultID: id)
         XCTAssertThrowsError(try first.pendingCount(), "the closed queue rejects work")
 
-        let second = ItemStore.store(for: id)
+        let second = try ItemStore.store(for: id)
         XCTAssertEqual(try second.pendingCount(), 0)
         ItemStore.forget(vaultID: id)
         for suffix in ["", "-wal", "-shm"] {
             try? FileManager.default.removeItem(atPath: ItemStore.defaultDatabaseURL(vaultID: id).path + suffix)
         }
+    }
+
+    // MARK: OBS-103: File Provider fixes
+
+    private func record(_ id: String, parent: String, path: String, directory: Bool = false) -> ItemRecord {
+        ItemRecord(identifier: id, parentIdentifier: parent, filename: (path as NSString).lastPathComponent,
+                   contentHash: nil, localPath: path, isDirectory: directory, size: directory ? nil : 1, modified: 1)
+    }
+
+    func testInsertAssignsRowVersionVisibleInChanges() throws {
+        let (store, _, _) = try makeStore()
+        let stored = try store.insert(record("A", parent: "", path: "a.md"))
+        XCTAssertEqual(stored.rowVersion, 1)
+        let again = try store.insert(record("B", parent: "", path: "b.md"))
+        XCTAssertEqual(again.rowVersion, 2)
+        XCTAssertEqual(try store.changes(from: 0).map(\.identifier), ["A", "B"])
+        XCTAssertEqual(try store.changes(from: 1).map(\.identifier), ["B"])
+    }
+
+    func testUpdateContentBumpsRowVersionAndStoresBytesMetadata() throws {
+        let (store, _, _) = try makeStore()
+        let stored = try store.insert(record("A", parent: "", path: "a.md"))
+        let updated = try store.updateContent(identifier: "A", size: 42, modified: 99)
+        XCTAssertEqual(updated?.size, 42)
+        XCTAssertEqual(updated?.modified, 99)
+        XCTAssertEqual(updated?.rowVersion, stored.rowVersion + 1)
+        XCTAssertNil(try store.updateContent(identifier: "missing", size: 1, modified: 1))
+    }
+
+    func testRenamingADirectoryRewritesDescendantPathsAndKeepsIdentifiers() throws {
+        let (store, _, _) = try makeStore()
+        try store.insert(record("D", parent: "", path: "notes", directory: true))
+        try store.insert(record("S", parent: "D", path: "notes/sub", directory: true))
+        try store.insert(record("F", parent: "D", path: "notes/a.md"))
+        try store.insert(record("G", parent: "S", path: "notes/sub/b.md"))
+        try store.insert(record("X", parent: "", path: "notes_other.md"))   // LIKE `_` must not match
+        let before = try store.currentAnchor()
+
+        let moved = try store.rename(identifier: "D", toPath: "archive/notes", filename: "notes", parentIdentifier: "R")
+        XCTAssertEqual(moved?.localPath, "archive/notes")
+        XCTAssertEqual(moved?.rowVersion, before + 1)
+        XCTAssertEqual(try store.item(for: "F")?.localPath, "archive/notes/a.md")
+        XCTAssertEqual(try store.item(for: "S")?.localPath, "archive/notes/sub")
+        XCTAssertEqual(try store.item(for: "G")?.localPath, "archive/notes/sub/b.md")
+        XCTAssertEqual(try store.item(for: "F")?.parentIdentifier, "D")
+        XCTAssertEqual(try store.item(for: "X")?.localPath, "notes_other.md")
+        // Descendants keep their row versions: only the moved folder is a change.
+        XCTAssertEqual(try store.changes(from: before).map(\.identifier), ["D"])
+    }
+
+    func testDeletingADirectoryTombstonesDescendantsAndDrainRemovesThem() throws {
+        let (store, _, _) = try makeStore()
+        try store.insert(record("D", parent: "", path: "notes", directory: true))
+        try store.insert(record("F", parent: "D", path: "notes/a.md"))
+        try store.insert(record("G", parent: "D", path: "notes/b.md"))
+        try store.insert(record("K", parent: "", path: "keep.md"))
+        let before = try store.currentAnchor()
+
+        try store.setPending(identifier: "D", deletion: true)
+        let changed = try store.changes(from: before)
+        XCTAssertEqual(Set(changed.map(\.identifier)), ["D", "F", "G"])
+        XCTAssertTrue(changed.allSatisfy { $0.isDeleted && $0.pendingDeletion })
+        XCTAssertEqual(Set(changed.map(\.rowVersion)).count, 3, "each tombstone has its own version")
+        XCTAssertNil(try store.item(for: "F"))
+        XCTAssertNotNil(try store.item(for: "K"))
+        XCTAssertEqual(try store.pendingCount(), 3)
+
+        try store.drainPendingAfterSync(completed: true)
+        XCTAssertEqual(try store.pendingCount(), 0)
+        XCTAssertEqual(try store.changes(from: 0).map(\.identifier), ["K"])
+    }
+
+    func testPagedReadsCoverEveryRowOnce() throws {
+        let (store, _, _) = try makeStore()
+        try store.insert(record("D", parent: "", path: "d", directory: true))
+        for i in 0..<7 {
+            try store.insert(record("F\(i)", parent: "D", path: "d/f\(i).md"))
+        }
+        let page1 = try store.children(of: "D", limit: 3, offset: 0)
+        let page2 = try store.children(of: "D", limit: 3, offset: 3)
+        let page3 = try store.children(of: "D", limit: 3, offset: 6)
+        XCTAssertEqual((page1 + page2 + page3).map(\.filename), (0..<7).map { "f\($0).md" })
+        XCTAssertEqual(try store.allItems(limit: nil, offset: 0).count, 8)
+        XCTAssertEqual(try store.allItems(limit: 5, offset: 5).count, 3)
+        XCTAssertEqual(try store.changes(from: 0, limit: 2).map(\.identifier), ["D", "F0"])
     }
 }
