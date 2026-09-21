@@ -40,6 +40,16 @@ The **Rust core** (`core/`) holds all the logic worth sharing across platforms. 
 
 The engine **never auto-resolves** a conflict — that's a UI decision. The one collapse it does apply: **keep both** needs two live versions, so with a deletion on one side it becomes keep local (remote deleted) or keep remote (local deleted).
 
+## The daemon
+
+`core/src/daemon.rs` is a driver *above* the engine (`AGENTS.md` rule 2): it decides when to call `prepare_sync` / `complete_sync` and never changes what they do. One daemon per vault, one cycle at a time, driven from a single command channel (`SyncNow`, `Resolve`, `Stop`) so nothing else runs a cycle on a daemon-managed vault. `obsink watch` and the desktop app host it.
+
+- **Local edits** come from `core/src/watcher.rs` (`notify`, recursive; FSEvents on macOS) as vault-relative paths, minus the ignore rules. A `Debouncer` releases a path once it has been quiet for 750 ms *and* its `(mtime, size)` stat still matches the one seen at its last event (a file mid-write keeps changing size), or after a 2 s batch window from the first event so a busy path cannot hold the rest back. Events that arrive during a cycle land in the next batch; the paths the cycle itself wrote (downloads, local deletes) are dropped so they do not trigger a no-op cycle.
+- **Remote edits** are found by `remote_changed`: a conditional manifest fetch with the cached ETag, every 5 s within a minute of any activity and every 60 s when idle. A 304 costs nothing; a 200 refreshes the cache so the cycle that follows is served from it.
+- **Conflicts** are never resolved by the daemon. Every conflict is answered with `ConflictResolutionChoice::Defer`: nothing moves for that path, it is held back from the checkpoint (so the next diff still sees "both changed"), and it comes back on `SyncResult.conflicts` and as a `ConflictsPending` event each cycle. Everything else keeps syncing. A `Resolve` command applies the user's choices to the pending plan; anything unanswered stays deferred.
+- **Failures** that are fatal (network down, auth, 5xx) suppress every trigger for `5 s × 2^n`, capped at 5 min, until a cycle succeeds.
+- **Ignore rules** (`core/src/ignore.rs`) are shared by the walker, the watcher and the diff: `.obsink/`, `*.obsink-tmp`, `.obsidian/workspace.json`, `.obsidian/workspace-mobile.json`, `.trash/`, `.DS_Store`, `.git/`, plus a vault's own `ignore` patterns. `diff_local_and_remote` filters base, local and remote alike, so a path that was synced before it became ignored is simply invisible rather than deleted.
+
 ## Wire format (v2)
 
 `PROTOCOL_VERSION = 2`. The guiding principle: **the server learns nothing about your vault**.

@@ -77,9 +77,11 @@ obsink/
    `complete_sync`) stays a pure, caller-triggered cycle with no timers and no
    watcher inside it: one call runs the full pull→diff→download→resolve→upload
    cycle. Automatic syncing lives in drivers outside the engine (the iOS
-   foreground and background refresh; the desktop/CLI daemon) that decide
-   *when* to call it. Nothing in `core/src/sync_engine.rs` may grow a clock or
-   a file watcher, and no driver may resolve a conflict on its own.
+   foreground and background refresh; `core/src/daemon.rs` for the desktop
+   app and `obsink watch`) that decide *when* to call it. Nothing in
+   `core/src/sync_engine.rs` may grow a clock or a file watcher, and no driver
+   may resolve a conflict on its own (the daemon defers every conflict to the
+   user).
 3. **Conflict-aware — never silently overwrite.** `PUT`/`DELETE` require
    `X-Parent-Hash`; on mismatch the server returns `409` and the client surfaces
    the conflict to the UI (keep local / keep remote / keep both). The check runs
