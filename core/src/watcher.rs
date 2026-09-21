@@ -26,13 +26,19 @@ pub fn spawn_watcher(
     ignore: IgnoreRules,
     tx: mpsc::UnboundedSender<Vec<String>>,
 ) -> Result<RecommendedWatcher, WatcherError> {
+    // FSEvents reports canonical paths (`/private/var/...` for `/var/...`),
+    // so the prefix to strip is the canonical root; the non-canonical
+    // spelling is kept as a fallback for watchers that echo the given path.
+    let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
     let watched = root.clone();
     let mut watcher = notify::recommended_watcher(move |event: notify::Result<Event>| {
         let Ok(event) = event else { return };
         let paths: Vec<String> = event
             .paths
             .iter()
-            .filter_map(|path| relative_key(&watched, path))
+            .filter_map(|path| {
+                relative_key(&canonical, path).or_else(|| relative_key(&watched, path))
+            })
             .filter(|key| !ignore.is_ignored(key))
             .collect();
         if !paths.is_empty() {
@@ -69,8 +75,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_write_reaches_the_channel_and_ignored_paths_do_not() {
+        // The non-canonical temp path (`/var/...` on macOS) checks that
+        // events reported under `/private/var/...` still map.
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
+        let root = dir.path().to_path_buf();
         std::fs::create_dir_all(root.join(".obsink")).unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
         let _watcher = spawn_watcher(root.clone(), IgnoreRules::defaults(), tx).unwrap();
