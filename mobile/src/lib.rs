@@ -54,10 +54,17 @@ impl MobileError {
     }
 }
 
-/// A 401 on a bearer call means the session is gone; on a sign-in call it
-/// means the code was wrong, which is an ordinary server answer.
-fn map_status(status: u16, message: String, bearer_call: bool) -> MobileError {
-    if status == 401 && bearer_call {
+/// What a call carries, which decides what a 401 means: on a `Bearer`
+/// call the session is gone; on a `SignIn` call the code was wrong, which
+/// is an ordinary server answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallKind {
+    SignIn,
+    Bearer,
+}
+
+fn map_status(status: u16, message: String, kind: CallKind) -> MobileError {
+    if status == 401 && kind == CallKind::Bearer {
         MobileError::Unauthorized {
             message: "unauthorized: sign in again".into(),
         }
@@ -66,12 +73,12 @@ fn map_status(status: u16, message: String, bearer_call: bool) -> MobileError {
     }
 }
 
-fn from_auth(error: AuthError, bearer_call: bool) -> MobileError {
+fn from_auth(error: AuthError, kind: CallKind) -> MobileError {
     match error {
         AuthError::Http(error) => MobileError::Network {
             message: error.to_string(),
         },
-        AuthError::Server { status, message } => map_status(status.as_u16(), message, bearer_call),
+        AuthError::Server { status, message } => map_status(status.as_u16(), message, kind),
     }
 }
 
@@ -81,9 +88,9 @@ fn from_api(error: ApiError) -> MobileError {
         ApiError::Http(error) => MobileError::Network {
             message: error.to_string(),
         },
-        ApiError::Unauthorized => map_status(401, String::new(), true),
+        ApiError::Unauthorized => map_status(401, String::new(), CallKind::Bearer),
         ApiError::UnexpectedStatus { status, body } => {
-            map_status(status.as_u16(), parse_error_body(&body), true)
+            map_status(status.as_u16(), parse_error_body(&body), CallKind::Bearer)
         }
         other @ (ApiError::Crypto(_) | ApiError::Conflict { .. }) => MobileError::sync(other),
     }
@@ -461,7 +468,7 @@ pub struct MobileDevice {
 #[uniffi::export]
 pub fn auth_capabilities(server_url: String) -> Result<MobileCapabilities, MobileError> {
     let caps = block_on(AuthClient::new(&server_url).capabilities())
-        .map_err(|error| from_auth(error, false))?;
+        .map_err(|error| from_auth(error, CallKind::SignIn))?;
     Ok(MobileCapabilities {
         email: caps.auth.email,
         apple: caps.auth.apple,
@@ -474,7 +481,7 @@ pub fn auth_capabilities(server_url: String) -> Result<MobileCapabilities, Mobil
 #[uniffi::export]
 pub fn auth_email_start(server_url: String, email: String) -> Result<Option<String>, MobileError> {
     let result = block_on(AuthClient::new(&server_url).email_start(&email))
-        .map_err(|error| from_auth(error, false))?;
+        .map_err(|error| from_auth(error, CallKind::SignIn))?;
     Ok(result.code)
 }
 
@@ -492,7 +499,7 @@ pub fn auth_email_verify(
         &device_name,
         clean_invite(invite_code.as_deref()),
     ))
-    .map_err(|error| from_auth(error, false))?;
+    .map_err(|error| from_auth(error, CallKind::SignIn))?;
     Ok(to_mobile_session(session))
 }
 
@@ -523,14 +530,14 @@ pub fn auth_apple(
             clean_invite(invite_code.as_deref()),
         ),
     )
-    .map_err(|error| from_auth(error, false))?;
+    .map_err(|error| from_auth(error, CallKind::SignIn))?;
     Ok(to_mobile_session(session))
 }
 
 #[uniffi::export]
 pub fn auth_me(server_url: String, token: String) -> Result<MobileAccount, MobileError> {
     let me = block_on(AuthClient::new(&server_url).me(&token))
-        .map_err(|error| from_auth(error, true))?;
+        .map_err(|error| from_auth(error, CallKind::Bearer))?;
     let user = me.user.ok_or_else(|| {
         MobileError::sync("this credential is the operator API key, not an account")
     })?;
@@ -567,7 +574,7 @@ pub fn auth_me(server_url: String, token: String) -> Result<MobileAccount, Mobil
 #[uniffi::export]
 pub fn auth_create_invite(server_url: String, token: String) -> Result<MobileInvite, MobileError> {
     let invite = block_on(AuthClient::new(&server_url).create_invite(&token))
-        .map_err(|error| from_auth(error, true))?;
+        .map_err(|error| from_auth(error, CallKind::Bearer))?;
     Ok(invite.into())
 }
 
@@ -578,14 +585,15 @@ pub fn auth_list_invites(
     token: String,
 ) -> Result<Vec<MobileInvite>, MobileError> {
     let invites = block_on(AuthClient::new(&server_url).list_invites(&token))
-        .map_err(|error| from_auth(error, true))?;
+        .map_err(|error| from_auth(error, CallKind::Bearer))?;
     Ok(invites.into_iter().map(MobileInvite::from).collect())
 }
 
 /// Revoke the current session (sign out this device).
 #[uniffi::export]
 pub fn auth_logout(server_url: String, token: String) -> Result<(), MobileError> {
-    block_on(AuthClient::new(&server_url).logout(&token)).map_err(|error| from_auth(error, true))
+    block_on(AuthClient::new(&server_url).logout(&token))
+        .map_err(|error| from_auth(error, CallKind::Bearer))
 }
 
 /// Sign out another device of the same account (`DELETE /auth/sessions/:id`).
@@ -596,14 +604,14 @@ pub fn auth_revoke_session(
     session_id: String,
 ) -> Result<(), MobileError> {
     block_on(AuthClient::new(&server_url).revoke_session(&token, &session_id))
-        .map_err(|error| from_auth(error, true))
+        .map_err(|error| from_auth(error, CallKind::Bearer))
 }
 
 /// Delete the account and every vault it owns. Irreversible.
 #[uniffi::export]
 pub fn auth_delete_account(server_url: String, token: String) -> Result<(), MobileError> {
     block_on(AuthClient::new(&server_url).delete_account(&token))
-        .map_err(|error| from_auth(error, true))
+        .map_err(|error| from_auth(error, CallKind::Bearer))
 }
 
 /// Delete a vault (and its server-side blobs) the bearer owns.
@@ -953,16 +961,16 @@ mod tests {
     #[test]
     fn a_401_is_unauthorized_only_on_bearer_calls() {
         assert!(matches!(
-            map_status(401, "x".into(), true),
+            map_status(401, "x".into(), CallKind::Bearer),
             MobileError::Unauthorized { .. }
         ));
         // A wrong sign-in code is an ordinary server answer.
         assert!(matches!(
-            map_status(401, "incorrect code".into(), false),
+            map_status(401, "incorrect code".into(), CallKind::SignIn),
             MobileError::Server { status: 401, message } if message == "incorrect code"
         ));
         assert!(matches!(
-            map_status(403, "invite code is required".into(), true),
+            map_status(403, "invite code is required".into(), CallKind::Bearer),
             MobileError::Server { status: 403, .. }
         ));
     }
@@ -1002,7 +1010,7 @@ mod tests {
         // Port 9 (discard) is closed on a developer machine; the connection is refused at once.
         let error = block_on(AuthClient::new("http://127.0.0.1:9").capabilities()).unwrap_err();
         assert!(matches!(
-            from_auth(error, false),
+            from_auth(error, CallKind::SignIn),
             MobileError::Network { .. }
         ));
     }
