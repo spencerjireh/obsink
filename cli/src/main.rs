@@ -15,7 +15,7 @@ use obsink_core::{
     load_local_state, normalize_server_url, prepare_sync, run_daemon, sync_manifest_path,
     write_atomic, ApiClient, AuthClient, Conflict, ConflictResolution, ConflictResolutionChoice,
     CreateVaultRequest, DaemonEvent, DaemonOptions, KeyBytes, ProgressEvent, ProgressSink,
-    SyncActionKind, SyncPhase, SyncPlan, VaultConfig,
+    SyncActionKind, SyncFailure, SyncPhase, SyncPlan, VaultConfig,
 };
 use rpassword::prompt_password;
 use serde::{Deserialize, Serialize};
@@ -178,57 +178,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             server_url,
             device_name,
             invite_code,
-        } => {
-            let url = resolve_server_url(server_url.as_deref())?;
-            let auth = AuthClient::new(&url);
-            let caps = auth.capabilities().await?;
-            if !caps.auth.email {
-                return Err(format!(
-                    "{url} does not offer email sign-in (the operator has not configured SMTP)"
-                )
-                .into());
-            }
-            let email = match email {
-                Some(email) => email,
-                None => prompt_line("Email: ")?,
-            };
-            // A supplied --code belongs to a code already sent; requesting
-            // another would replace it server-side.
-            let code = match code {
-                Some(code) => code,
-                None => {
-                    let start = auth.email_start(&email).await?;
-                    match start.code {
-                        Some(dev_code) => {
-                            eprintln!("(dev server returned the code inline)");
-                            dev_code
-                        }
-                        None => {
-                            println!("Sent a 6-digit code to {email}.");
-                            prompt_line("Code: ")?
-                        }
-                    }
-                }
-            };
-            let device = device_name.unwrap_or_else(default_device_name);
-            let session = match auth
-                .email_verify(&email, code.trim(), &device, invite_code.as_deref())
-                .await
-            {
-                Ok(session) => session,
-                Err(obsink_core::AuthError::Server { status, message })
-                    if status.as_u16() == 403 && invite_code.is_none() =>
-                {
-                    return Err(format!("{message} (pass --invite-code)").into());
-                }
-                Err(error) => return Err(error.into()),
-            };
-            save_secret(&bearer_account(&url), &session.token)?;
-            println!(
-                "signed in as {} on {url}",
-                session.user.email.unwrap_or(session.user.id)
-            );
-        }
+        } => run_login(email, code, server_url, device_name, invite_code).await?,
         Commands::Logout { server_url } => {
             let url = resolve_server_url(server_url.as_deref())?;
             let account = bearer_account(&url);
@@ -246,46 +196,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             delete_secret(&account);
             println!("signed out of {url}");
         }
-        Commands::Whoami { server_url } => {
-            let url = resolve_server_url(server_url.as_deref())?;
-            let token = load_secret(&bearer_account(&url))
-                .map_err(|_| format!("not signed in to {url}; run `obsink login`"))?;
-            let me = AuthClient::new(&url).me(&token).await?;
-            println!("server: {url}");
-            match me.user {
-                Some(user) => {
-                    println!("account: {} ({})", user.email.unwrap_or_default(), user.id);
-                    for session in me.sessions {
-                        println!(
-                            "  device: {}{}",
-                            session.device_name,
-                            if session.current {
-                                " (this device)"
-                            } else {
-                                ""
-                            }
-                        );
-                    }
-                }
-                None => println!("credential: operator API key ({})", me.kind),
-            }
-            if let Some(usage) = me.usage {
-                let limit = match (usage.max_vault_bytes, usage.max_vaults) {
-                    (Some(bytes), Some(vaults)) => {
-                        format!("; limit {bytes} bytes per vault, {vaults} vaults")
-                    }
-                    _ => String::new(),
-                };
-                println!(
-                    "usage: {} bytes across {} vault(s){limit}",
-                    usage.total_bytes,
-                    usage.vaults.len()
-                );
-                for vault in usage.vaults {
-                    println!("  vault {}: {} bytes", vault.id, vault.bytes);
-                }
-            }
-        }
+        Commands::Whoami { server_url } => run_whoami(server_url).await?,
         Commands::Invite { server_url, list } => {
             let url = resolve_server_url(server_url.as_deref())?;
             let token = load_secret(&bearer_account(&url))
@@ -323,39 +234,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             vault_name,
             directory,
             passphrase,
-        } => {
-            let (url, bearer) = resolve_server(&server)?;
-            let directory = resolve_vault_dir(&directory)?;
-            let client = ApiClient::new(VaultConfig {
-                server_url: url.clone(),
-                api_key: bearer,
-                vault_id: String::new(),
-                local_path: directory.display().to_string(),
-                ignore: Vec::new(),
-            });
-            let response = client
-                .create_vault(&CreateVaultRequest {
-                    name: vault_name,
-                    max_file_size: 50 * 1024 * 1024,
-                })
-                .await?;
-
-            let vault_id = response.vault.id;
-            let key = derive_key_from_passphrase(passphrase, &vault_id)?;
-            save_secret(&vault_id, &hex::encode(key))?;
-
-            let config = CliConfig {
-                server_url: url,
-                vault_id,
-                local_path: directory.display().to_string(),
-                ignore: Vec::new(),
-            };
-            save_config(&config)?;
-            run_sync_for_config(&config, &key).await?;
-
-            println!("connected vault {}", config.vault_id);
-            println!("config: {}", config_path()?.display());
-        }
+        } => run_init(server, vault_name, directory, passphrase).await?,
         Commands::Connect {
             server,
             vault_id,
@@ -380,30 +259,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
             println!("config: {}", config_path()?.display());
         }
-        Commands::Status { directory } => {
-            let stored = load_config()?;
-            let keys = derive_keys(&load_key_from_keychain(&stored.vault_id)?);
-            let directory = match directory {
-                Some(directory) => resolve_vault_dir(&directory)?,
-                None => PathBuf::from(&stored.local_path),
-            };
-            let vault_config = to_vault_config(&stored)?;
-            let ignore = vault_config.ignore_rules();
-            let local = load_local_state(&directory, &keys, &ignore)?;
-            let live = local.working.values().filter(|entry| !entry.deleted);
-            let total_size: u64 = live.clone().map(|entry| entry.size).sum();
-
-            println!("directory: {}", directory.display());
-            println!("files: {}", live.count());
-            println!("bytes: {total_size}");
-
-            let remote =
-                fetch_remote_manifest(&ApiClient::new(vault_config), &directory, &keys).await?;
-            let diff = diff_local_and_remote(&local.base, &local.working, &remote, &ignore);
-            println!("upload: {}", diff.upload.len());
-            println!("download: {}", diff.download.len());
-            println!("conflicts: {}", diff.conflicts.len());
-        }
+        Commands::Status { directory } => run_status(directory).await?,
         Commands::Sync => {
             let config = load_config()?;
             let key = load_key_from_keychain(&config.vault_id)?;
@@ -417,6 +273,186 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+/// `obsink login`: an emailed code (or a dev code the server returns
+/// inline) becomes the session bearer for the server.
+async fn run_login(
+    email: Option<String>,
+    code: Option<String>,
+    server_url: Option<String>,
+    device_name: Option<String>,
+    invite_code: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let url = resolve_server_url(server_url.as_deref())?;
+    let auth = AuthClient::new(&url);
+    let caps = auth.capabilities().await?;
+    if !caps.auth.email {
+        return Err(format!(
+            "{url} does not offer email sign-in (the operator has not configured SMTP)"
+        )
+        .into());
+    }
+    let email = match email {
+        Some(email) => email,
+        None => prompt_line("Email: ")?,
+    };
+    // A supplied --code belongs to a code already sent; requesting
+    // another would replace it server-side.
+    let code = match code {
+        Some(code) => code,
+        None => {
+            let start = auth.email_start(&email).await?;
+            match start.code {
+                Some(dev_code) => {
+                    eprintln!("(dev server returned the code inline)");
+                    dev_code
+                }
+                None => {
+                    println!("Sent a 6-digit code to {email}.");
+                    prompt_line("Code: ")?
+                }
+            }
+        }
+    };
+    let device = device_name.unwrap_or_else(default_device_name);
+    let session = match auth
+        .email_verify(&email, code.trim(), &device, invite_code.as_deref())
+        .await
+    {
+        Ok(session) => session,
+        Err(obsink_core::AuthError::Server { status, message })
+            if status.as_u16() == 403 && invite_code.is_none() =>
+        {
+            return Err(format!("{message} (pass --invite-code)").into());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    save_secret(&bearer_account(&url), &session.token)?;
+    println!(
+        "signed in as {} on {url}",
+        session.user.email.unwrap_or(session.user.id)
+    );
+    Ok(())
+}
+
+/// `obsink whoami`: the account, its devices and its usage.
+async fn run_whoami(server_url: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let url = resolve_server_url(server_url.as_deref())?;
+    let token = load_secret(&bearer_account(&url))
+        .map_err(|_| format!("not signed in to {url}; run `obsink login`"))?;
+    let me = AuthClient::new(&url).me(&token).await?;
+    println!("server: {url}");
+    match me.user {
+        Some(user) => {
+            println!("account: {} ({})", user.email.unwrap_or_default(), user.id);
+            for session in me.sessions {
+                println!(
+                    "  device: {}{}",
+                    session.device_name,
+                    if session.current {
+                        " (this device)"
+                    } else {
+                        ""
+                    }
+                );
+            }
+        }
+        None => println!("credential: operator API key ({})", me.kind),
+    }
+    if let Some(usage) = me.usage {
+        let limit = match (usage.max_vault_bytes, usage.max_vaults) {
+            (Some(bytes), Some(vaults)) => {
+                format!("; limit {bytes} bytes per vault, {vaults} vaults")
+            }
+            _ => String::new(),
+        };
+        println!(
+            "usage: {} bytes across {} vault(s){limit}",
+            usage.total_bytes,
+            usage.vaults.len()
+        );
+        for vault in usage.vaults {
+            println!("  vault {}: {} bytes", vault.id, vault.bytes);
+        }
+    }
+    Ok(())
+}
+
+/// `obsink init`: create the vault on the server, derive and store the key,
+/// save the config and run the first sync.
+async fn run_init(
+    server: ServerArgs,
+    vault_name: String,
+    directory: PathBuf,
+    passphrase: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (url, bearer) = resolve_server(&server)?;
+    let directory = resolve_vault_dir(&directory)?;
+    let client = ApiClient::new(VaultConfig {
+        server_url: url.clone(),
+        api_key: bearer,
+        vault_id: String::new(),
+        local_path: directory.display().to_string(),
+        ignore: Vec::new(),
+    });
+    let response = client
+        .create_vault(&CreateVaultRequest {
+            name: vault_name,
+            max_file_size: 50 * 1024 * 1024,
+        })
+        .await?;
+
+    let vault_id = response.vault.id;
+    let key = derive_key_from_passphrase(passphrase, &vault_id)?;
+    save_secret(&vault_id, &hex::encode(key))?;
+
+    let config = CliConfig {
+        server_url: url,
+        vault_id,
+        local_path: directory.display().to_string(),
+        ignore: Vec::new(),
+    };
+    save_config(&config)?;
+    run_sync_for_config(&config, &key).await?;
+
+    println!("connected vault {}", config.vault_id);
+    println!("config: {}", config_path()?.display());
+    Ok(())
+}
+
+/// `obsink status`: what the next sync would do, without transferring.
+async fn run_status(directory: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+    let stored = load_config()?;
+    let keys = derive_keys(&load_key_from_keychain(&stored.vault_id)?);
+    let directory = match directory {
+        Some(directory) => resolve_vault_dir(&directory)?,
+        None => PathBuf::from(&stored.local_path),
+    };
+    let vault_config = to_vault_config(&stored)?;
+    let ignore = vault_config.ignore_rules();
+    let local = load_local_state(&directory, &keys, &ignore)?;
+    let live = local.working.values().filter(|entry| !entry.deleted);
+    let total_size: u64 = live.clone().map(|entry| entry.size).sum();
+
+    println!("directory: {}", directory.display());
+    println!("files: {}", live.count());
+    println!("bytes: {total_size}");
+
+    let remote = fetch_remote_manifest(&ApiClient::new(vault_config), &directory, &keys).await?;
+    let diff = diff_local_and_remote(&local.base, &local.working, &remote, &ignore);
+    println!("upload: {}", diff.upload.len());
+    println!("download: {}", diff.download.len());
+    println!("conflicts: {}", diff.conflicts.len());
+    Ok(())
+}
+
+/// One line per failed transfer, tagged `FATAL` or `skipped`.
+fn print_failures(failures: &[SyncFailure], mut out: impl FnMut(String)) {
+    for failure in failures {
+        let tag = if failure.fatal { "FATAL" } else { "skipped" };
+        out(format!("  [{tag}] {}: {}", failure.path, failure.error));
+    }
 }
 
 /// `obsink watch`: the daemon with the stderr progress sink, one line per
@@ -451,10 +487,7 @@ async fn run_watch(config: &CliConfig, key: &KeyBytes) -> Result<(), Box<dyn std
                     result.download.len(),
                     result.failures.len()
                 );
-                for failure in &result.failures {
-                    let tag = if failure.fatal { "FATAL" } else { "skipped" };
-                    println!("  [{tag}] {}: {}", failure.path, failure.error);
-                }
+                print_failures(&result.failures, |line| println!("{line}"));
                 if let Some(error) = &result.checkpoint_error {
                     println!("  checkpoint failed: {error}");
                 }
@@ -591,13 +624,9 @@ async fn run_sync_for_config(
         println!("uploaded: {}", result.upload.len());
 
         if !result.failures.is_empty() {
-            let fatal = result.failures.iter().any(|failure| failure.fatal);
             eprintln!("{} file(s) failed this sync:", result.failures.len());
-            for failure in &result.failures {
-                let tag = if failure.fatal { "FATAL" } else { "skipped" };
-                eprintln!("  [{tag}] {}: {}", failure.path, failure.error);
-            }
-            if fatal {
+            print_failures(&result.failures, |line| eprintln!("{line}"));
+            if result.failures.iter().any(|failure| failure.fatal) {
                 eprintln!("a fatal error stopped the sync early; re-run `obsink sync` to resume");
             }
         }
