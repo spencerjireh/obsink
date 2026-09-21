@@ -475,7 +475,7 @@ obsink/
     ├── rulesets/main.json    branch ruleset for main (applied with gh api)
     └── workflows/
         ├── ci.yml            commit check, fmt/clippy/tests, cargo-deny, server on Postgres, web (wasm + client + image), desktop lint+build, iOS simulator tests
-        └── release.yml       on v*.*.* tags: verify versions, build + publish the macOS arm64 CLI
+        └── release.yml       on v*.*.* tags: verify versions, build + publish the universal CLI tarball and the signed, notarized universal DMG
 ```
 
 ---

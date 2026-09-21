@@ -63,8 +63,10 @@ A Tauri v2 menu-bar app (`desktop/`). The React screens live in the shared `ui/`
 npm ci                   # at the repo root: installs the ui and desktop workspaces
 cd desktop
 npm run tauri dev        # run against your server (docker compose up -d for a local one)
-npm run tauri build      # produce a .app/.dmg
+npm run tauri build      # produce a .app/.dmg (ad hoc signed; the release workflow signs and notarizes)
 ```
+
+Releases ship a universal DMG (Apple Silicon and Intel), Developer ID signed and notarized by `release.yml` on a `v*.*.*` tag, linked from the website's macOS section together with its SHA-256; the same tag publishes the universal CLI tarball that `install.sh` fetches.
 
 App, dock, and menu-bar icons are generated from `design/icon.svg` and
 `design/tray.svg` by `scripts/gen-icons.sh` (see `DESIGN.md`); rerun it after
