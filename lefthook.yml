@@ -12,10 +12,9 @@ pre-commit:
       run: rustfmt --edition 2021 {staged_files}
       stage_fixed: true
     - name: prettier
-      root: "desktop/"
-      glob: "*.{ts,tsx,css,json}"
-      # --no: fail loudly if desktop/node_modules is missing instead of downloading prettier
-      run: npx --no prettier --write {staged_files}
+      glob: "{ui,desktop,web,site}/**/*.{ts,tsx,css,json,html}"
+      # --no-install: fail loudly if node_modules is missing (`npm ci` at the root) instead of downloading prettier
+      run: npx --no-install prettier --write {staged_files}
       stage_fixed: true
 
 commit-msg:

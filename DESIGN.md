@@ -206,7 +206,7 @@ next to the account heading in mono.
 
 ### Desktop (Tauri, React)
 
-- Tokens live on `:root` in `desktop/src/styles.css`; light values are the
+- Tokens live on `:root` in `ui/src/styles.css`; light values are the
   default, dark values under `@media (prefers-color-scheme: dark)`.
   `color-scheme: light dark` so native controls follow.
 - Posture: a menu-bar accessory app (`ActivationPolicy::Accessory`, no
@@ -239,7 +239,7 @@ next to the account heading in mono.
 - Icons: `desktop/src-tauri/icons/` holds the generated macOS set
   (`32x32.png`, `128x128.png`, `128x128@2x.png`, `icon.icns`, `icon.png`)
   and `tray.png`; `tauri.conf.json` `bundle.icon` lists them.
-  `desktop/src/assets/icon.svg` is a copy of `design/icon.svg` (made by
+  `ui/src/assets/icon.svg` is a copy of `design/icon.svg` (made by
   `scripts/gen-icons.sh`) that the popover header shows as a rounded tile.
 
 ### iOS (SwiftUI)

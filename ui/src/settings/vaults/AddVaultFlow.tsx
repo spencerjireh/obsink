@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import type { AddVaultMode, LocalVault, RemoteVault } from '../../types'
 import type { Account } from '../../hooks/useAccount'
-import { call } from '../../lib/tauri'
+import { useBackend } from '../../backend'
 import { Notice } from '../../components/Notices'
 import { SignInForm } from '../account/SignInForm'
 
@@ -28,12 +28,16 @@ type Props = {
 // pick or create the vault, choose the folder, set the passphrase. Ends on a
 // card that says where the folder is.
 export function AddVaultFlow({ account, message, notify, onError, onAdded, onClose }: Props) {
+  const backend = useBackend()
+  const { deviceNoun, folderPlaceholder, canOpenFolder } = backend.platform
   const [step, setStep] = useState<Step>(account.signedIn ? 'choose' : 'sign-in')
   const [mode, setMode] = useState<AddVaultMode>('connect')
   const [remoteVaults, setRemoteVaults] = useState<RemoteVault[] | null>(null)
   const [vaultId, setVaultId] = useState('')
   const [vaultName, setVaultName] = useState('')
+  // A typed path, or the id of a picked folder (with its name for display).
   const [localPath, setLocalPath] = useState('')
+  const [folderName, setFolderName] = useState('')
   const [passphrase, setPassphrase] = useState('')
   const [busy, setBusy] = useState(false)
   const [added, setAdded] = useState<LocalVault | null>(null)
@@ -49,7 +53,8 @@ export function AddVaultFlow({ account, message, notify, onError, onAdded, onClo
   useEffect(() => {
     if (step !== 'choose' || remoteVaults !== null) return
     let cancelled = false
-    call<RemoteVault[]>('list_remote_vaults')
+    backend
+      .listRemoteVaults()
       .then((list) => {
         if (cancelled) return
         setRemoteVaults(list)
@@ -97,17 +102,27 @@ export function AddVaultFlow({ account, message, notify, onError, onAdded, onClo
     else if (step === 'passphrase') await submit()
   }
 
+  async function pickFolder() {
+    if (!backend.pickFolder) return
+    try {
+      const picked = await backend.pickFolder()
+      setLocalPath(picked.id)
+      setFolderName(picked.name)
+    } catch (error) {
+      onError(error)
+    }
+  }
+
   async function submit() {
     setBusy(true)
     try {
-      const request = {
+      const saved = await backend.addVault({
         mode,
         local_path: localPath.trim(),
         vault_name: vaultName.trim(),
         vault_id: vaultId,
         passphrase,
-      }
-      const saved = await call<LocalVault>('add_vault', { request })
+      })
       setAdded(saved)
       setPassphrase('')
       setStep('done')
@@ -122,7 +137,7 @@ export function AddVaultFlow({ account, message, notify, onError, onAdded, onClo
 
   function openFolder() {
     if (!added) return
-    call('open_vault_folder', { vaultId: added.id }).catch(onError)
+    backend.openVaultFolder(added.id).catch(onError)
   }
 
   if (step === 'done' && added) {
@@ -142,9 +157,11 @@ export function AddVaultFlow({ account, message, notify, onError, onAdded, onClo
             <code>{added.local_path}</code>
           </p>
           <div className="choice-row">
-            <button className="button button--ghost" onClick={openFolder} type="button">
-              Open folder
-            </button>
+            {canOpenFolder ? (
+              <button className="button button--ghost" onClick={openFolder} type="button">
+                Open folder
+              </button>
+            ) : null}
             <button className="button button--primary" onClick={onClose} type="button">
               Done
             </button>
@@ -279,24 +296,41 @@ export function AddVaultFlow({ account, message, notify, onError, onAdded, onClo
             <h2 id="step-heading">Folder</h2>
             <span className="section__hint">
               {mode === 'create'
-                ? 'Where the vault lives on this Mac'
-                : 'Where to put the vault on this Mac'}
+                ? `Where the vault lives on ${deviceNoun}`
+                : `Where to put the vault on ${deviceNoun}`}
             </span>
           </div>
           <div className="form-grid">
-            <label className="form-grid__wide">
-              <span>Local vault path</span>
-              <input
-                className="mono"
-                autoCapitalize="off"
-                autoCorrect="off"
-                autoFocus
-                spellCheck={false}
-                placeholder="/Users/you/Documents/Notes"
-                value={localPath}
-                onChange={(event) => setLocalPath(event.target.value)}
-              />
-            </label>
+            {backend.pickFolder ? (
+              <div className="form-grid__wide">
+                <span>Vault folder</span>
+                <div className="choice-row">
+                  <button
+                    className="button button--ghost"
+                    autoFocus
+                    onClick={() => void pickFolder()}
+                    type="button"
+                  >
+                    {folderName ? 'Choose another folder' : 'Choose folder'}
+                  </button>
+                  {folderName ? <code>{folderName}</code> : null}
+                </div>
+              </div>
+            ) : (
+              <label className="form-grid__wide">
+                <span>Local vault path</span>
+                <input
+                  className="mono"
+                  autoCapitalize="off"
+                  autoCorrect="off"
+                  autoFocus
+                  spellCheck={false}
+                  placeholder={folderPlaceholder}
+                  value={localPath}
+                  onChange={(event) => setLocalPath(event.target.value)}
+                />
+              </label>
+            )}
             <div className="choice-row form-grid__actions">
               <button className="button button--ghost" onClick={back} type="button">
                 Back

@@ -1,0 +1,18 @@
+{
+  "name": "@obsink/ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "The ObSink screens (popover, settings window, conflicts, account) over a Backend interface; consumed as TypeScript source by desktop/ and web/",
+  "exports": {
+    ".": "./src/index.ts",
+    "./styles.css": "./src/styles.css"
+  },
+  "scripts": {
+    "typecheck": "tsc"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  }
+}

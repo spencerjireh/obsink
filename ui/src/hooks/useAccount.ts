@@ -1,15 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { listen } from '@tauri-apps/api/event'
 import type { AccountState, AuthCapabilities, InviteInfo, VaultUsage } from '../types'
-import { call } from '../lib/tauri'
+import { useBackend } from '../backend'
 import { isInviteRequired, isUnauthorized, SESSION_EXPIRED, toCommandError } from '../lib/errors'
 
 type Notify = (message: string) => void
 
 // The account on the one server this build talks to: who is signed in, the
 // devices and invites, and the sign-in form. A 401 anywhere marks the
-// session expired (the bearer is already gone on the Rust side).
+// session expired (the bearer is already gone on the backend side).
 export function useAccount(notify: Notify) {
+  const backend = useBackend()
   const [serverUrl, setServerUrl] = useState('')
   const [account, setAccount] = useState<AccountState | null>(null)
   const [invites, setInvites] = useState<InviteInfo[]>([])
@@ -51,15 +51,15 @@ export function useAccount(notify: Notify) {
 
   const refreshInvites = useCallback(async () => {
     try {
-      setInvites(await call<InviteInfo[]>('list_invites'))
+      setInvites(await backend.listInvites())
     } catch (error) {
       fail(error)
     }
-  }, [fail])
+  }, [backend, fail])
 
   const refresh = useCallback(async () => {
     try {
-      const next = await call<AccountState>('get_account')
+      const next = await backend.getAccount()
       setAccount(next)
       if (next.kind === 'account') {
         setSessionExpired(false)
@@ -70,27 +70,24 @@ export function useAccount(notify: Notify) {
     } catch (error) {
       fail(error)
     }
-  }, [fail, refreshInvites])
+  }, [backend, fail, refreshInvites])
 
   const refreshCapabilities = useCallback(async () => {
     try {
-      setCapabilities(await call<AuthCapabilities>('get_auth_capabilities'))
+      setCapabilities(await backend.getAuthCapabilities())
     } catch (error) {
       setCapabilities(null)
       fail(error)
     }
-  }, [fail])
+  }, [backend, fail])
 
   useEffect(() => {
-    void call<string>('get_server_url').then(setServerUrl)
+    void backend.getServerUrl().then(setServerUrl)
     void refresh()
     void refreshCapabilities()
     // Devices, invites and usage change from other devices and after syncs.
-    const unlisten = listen('state://changed', () => void refresh())
-    return () => {
-      void unlisten.then((dispose) => dispose())
-    }
-  }, [refresh, refreshCapabilities])
+    return backend.on('state://changed', () => void refresh())
+  }, [backend, refresh, refreshCapabilities])
 
   async function withBusy(action: () => Promise<void>) {
     setBusy(true)
@@ -104,7 +101,7 @@ export function useAccount(notify: Notify) {
   const sendCode = () =>
     withBusy(async () => {
       try {
-        const devCode = await call<string | null>('auth_email_start', { email: authEmail })
+        const devCode = await backend.authEmailStart(authEmail)
         setCodeSent(true)
         if (devCode) {
           setAuthCode(devCode)
@@ -120,11 +117,7 @@ export function useAccount(notify: Notify) {
   const verifyCode = () =>
     withBusy(async () => {
       try {
-        const next = await call<AccountState>('auth_email_verify', {
-          email: authEmail,
-          code: authCode,
-          inviteCode: inviteCode.trim() || null,
-        })
+        const next = await backend.authEmailVerify(authEmail, authCode, inviteCode.trim() || null)
         setAccount(next)
         setSessionExpired(false)
         setCodeSent(false)
@@ -150,7 +143,7 @@ export function useAccount(notify: Notify) {
   const createInvite = () =>
     withBusy(async () => {
       try {
-        await call<InviteInfo>('create_invite')
+        await backend.createInvite()
         await refreshInvites()
         notifyRef.current('Invite code created.')
       } catch (error) {
@@ -170,7 +163,7 @@ export function useAccount(notify: Notify) {
   const revokeDevice = (sessionId: string) =>
     withBusy(async () => {
       try {
-        setAccount(await call<AccountState>('revoke_session', { sessionId }))
+        setAccount(await backend.revokeSession(sessionId))
         notifyRef.current('Device signed out.')
       } catch (error) {
         fail(error)
@@ -180,7 +173,7 @@ export function useAccount(notify: Notify) {
   const signOut = () =>
     withBusy(async () => {
       try {
-        await call('sign_out')
+        await backend.signOut()
         setAccount({ kind: 'signed_out' })
         setInvites([])
         notifyRef.current(`Signed out of ${serverUrl}.`)
@@ -193,7 +186,7 @@ export function useAccount(notify: Notify) {
   const deleteAccount = async (): Promise<boolean> => {
     setBusy(true)
     try {
-      await call('delete_account')
+      await backend.deleteAccount()
       setAccount({ kind: 'signed_out' })
       setInvites([])
       notifyRef.current('Account deleted.')

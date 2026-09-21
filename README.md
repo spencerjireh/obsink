@@ -88,7 +88,8 @@ exponential backoff; HTTP status errors surface immediately as typed `ApiError`s
 | `core-wasm/` | wasm-bindgen bindings over the pure core (keys, diff, rules) for the browser client |
 | `cli/` | `obsink` CLI — the reference client |
 | `server/` | `obsink-server` (axum): accounts, invites, vaults, files, batch, retention; Dockerfile |
-| `desktop/` | Tauri v2 + React app (menu-bar on macOS) |
+| `ui/` | The React screens and the `Backend` interface they run on (npm workspace shared by `desktop/` and the browser client) |
+| `desktop/` | Tauri v2 shell (menu-bar on macOS) and its Tauri `Backend` |
 | `ios/`, `mobile/` | SwiftUI app + File Provider extension over the shared core |
 | `docker-compose.yml` | Local stack: server built from the checkout, Postgres, Mailpit |
 | `docker-compose.coolify.yml` | Production stack: server built from source by Coolify, Postgres |
@@ -139,7 +140,7 @@ cargo test --workspace                                       # core, CLI, mobile
 DATABASE_URL=postgres://postgres:postgres@localhost:5433/postgres \
   OBSINK_TEST_REQUIRE_DB=1 cargo test -p obsink-server       # server integration tests (needs Postgres)
 cargo clippy --workspace --all-targets -- -D warnings && cargo deny check
-(cd desktop && npm ci && npm run lint && npm run format:check && npm run build && cargo check -p obsink-desktop)
+npm ci && npm run lint && npm run format:check && npm run typecheck -w ui && npm run build -w desktop && cargo check -p obsink-desktop
 docker compose up -d && ./scripts/verify-server-deploy.sh    # contract check against the local stack
 ```
 

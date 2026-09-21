@@ -1,9 +1,9 @@
 import React from 'react'
 import ReactDOM from 'react-dom/client'
 import { getCurrentWindow } from '@tauri-apps/api/window'
-import { PopoverApp } from './popover/PopoverApp'
-import { SettingsApp } from './settings/SettingsApp'
-import './styles.css'
+import { BackendProvider, PopoverApp, SettingsApp } from '@obsink/ui'
+import '@obsink/ui/styles.css'
+import { tauriBackend } from './backend'
 
 // One bundle, two windows: the label decides what renders. `?view=` is for
 // a plain browser during development, where there is no Tauri window.
@@ -21,5 +21,9 @@ const label = windowLabel()
 document.documentElement.classList.add(`window-${label}`)
 
 ReactDOM.createRoot(document.getElementById('root') as HTMLElement).render(
-  <React.StrictMode>{label === 'popover' ? <PopoverApp /> : <SettingsApp />}</React.StrictMode>,
+  <React.StrictMode>
+    <BackendProvider backend={tauriBackend}>
+      {label === 'popover' ? <PopoverApp /> : <SettingsApp />}
+    </BackendProvider>
+  </React.StrictMode>,
 )

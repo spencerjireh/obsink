@@ -1,12 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
-import { listen } from '@tauri-apps/api/event'
-import type { SyncResponse } from '../types'
+import { useBackend } from '../backend'
 import { useActivity } from '../hooks/useActivity'
 import { useVaultStates } from '../hooks/useVaultStates'
-import { call } from '../lib/tauri'
 import { toCommandError } from '../lib/errors'
 import { canSync, globalLine } from '../lib/vault-state'
-import { openFolder, openSettings } from '../lib/windows'
 import { BrandMark } from '../components/BrandMark'
 import { RecentList } from './RecentList'
 import { VaultRow } from './VaultRow'
@@ -15,6 +12,7 @@ import { VaultRow } from './VaultRow'
 // happened, and one button that syncs everything. Anything that needs a
 // decision opens the settings window.
 export function PopoverApp() {
+  const backend = useBackend()
   const [message, setMessage] = useState('')
   const [syncingId, setSyncingId] = useState<string | null>(null)
   const fail = (error: unknown) => setMessage(toCommandError(error).message)
@@ -42,12 +40,12 @@ export function PopoverApp() {
       for (const info of targets) {
         setSyncingId(info.id)
         try {
-          const response = await call<SyncResponse>('sync_vault', { vaultId: info.id })
+          const response = await backend.syncVault(info.id)
           if (response.pending_conflicts.length > 0) {
             setMessage(`${info.name} needs a decision. Open settings to resolve it.`)
           }
         } catch (error) {
-          // Recorded in the activity log by Rust; the row shows the state.
+          // Recorded in the activity log by the backend; the row shows the state.
           setMessage(`${info.name}: ${toCommandError(error).message}`)
         }
       }
@@ -60,22 +58,13 @@ export function PopoverApp() {
   const syncAllRef = useRef(syncAll)
   syncAllRef.current = syncAll
 
-  useEffect(() => {
-    const unlisten = listen('tray://sync-now', () => void syncAllRef.current())
-    return () => {
-      void unlisten.then((dispose) => dispose())
-    }
-  }, [])
-
-  useEffect(() => {
-    const unlisten = listen('popover://opened', () => setMessage(''))
-    return () => {
-      void unlisten.then((dispose) => dispose())
-    }
-  }, [])
+  useEffect(() => backend.on('tray://sync-now', () => void syncAllRef.current()), [backend])
+  useEffect(() => backend.on('popover://opened', () => setMessage('')), [backend])
 
   const busy = syncingId !== null
   const anySyncable = states.some(canSync)
+  const openSettings = (target?: Parameters<typeof backend.openSettings>[0]) =>
+    void backend.openSettings(target).catch(fail)
 
   return (
     <div className="popover">
@@ -86,7 +75,7 @@ export function PopoverApp() {
           className="icon-button"
           aria-label="Open settings"
           title="Settings"
-          onClick={() => void openSettings().catch(fail)}
+          onClick={() => openSettings()}
           type="button"
         >
           <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false">
@@ -108,15 +97,19 @@ export function PopoverApp() {
             key={info.id}
             info={info}
             syncing={syncingId === info.id}
-            onOpen={() => void openSettings({ tab: 'vaults', vault_id: info.id }).catch(fail)}
-            onOpenFolder={() => void openFolder(info.id).catch(fail)}
+            onOpen={() => openSettings({ tab: 'vaults', vault_id: info.id })}
+            onOpenFolder={
+              backend.platform.canOpenFolder
+                ? () => void backend.openVaultFolder(info.id).catch(fail)
+                : undefined
+            }
           />
         ))}
         {states.length === 0 ? (
           <li className="vault-row">
             <button
               className="vault-row__main"
-              onClick={() => void openSettings({ tab: 'vaults', add_vault: true }).catch(fail)}
+              onClick={() => openSettings({ tab: 'vaults', add_vault: true })}
               type="button"
             >
               <span className="vault-row__name">Add vault</span>
@@ -142,11 +135,7 @@ export function PopoverApp() {
         >
           {busy ? 'Working…' : 'Sync now'}
         </button>
-        <button
-          className="button button--ghost"
-          onClick={() => void openSettings().catch(fail)}
-          type="button"
-        >
+        <button className="button button--ghost" onClick={() => openSettings()} type="button">
           Settings
         </button>
       </footer>

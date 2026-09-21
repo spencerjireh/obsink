@@ -11,7 +11,7 @@
 #      transparent 1024 canvas (Apple HIG grid), then `tauri icon` for the
 #      bundle set; only the macOS files are copied into src-tauri/icons.
 #   4. Menu bar: a 36 px black-on-transparent template PNG from tray.svg.
-#   5. Desktop UI: the SVG itself, copied into desktop/src/assets so the
+#   5. UI mark: the SVG itself, copied into ui/src/assets so the
 #      popover header shows the real mark (Vite bundles it).
 #
 # Outputs are committed; rerun after editing design/*.svg.
@@ -28,7 +28,7 @@ IOS_ICON="$REPO_ROOT/ios/ObSink/Assets.xcassets/AppIcon.appiconset/AppIcon.png"
 INK="#15141B"
 
 command -v magick >/dev/null || { echo "ImageMagick 7 (magick) is required" >&2; exit 1; }
-[ -d "$DESKTOP_DIR/node_modules/@tauri-apps/cli" ] || { echo "run 'npm ci' in desktop/ first" >&2; exit 1; }
+[ -d "$REPO_ROOT/node_modules/@tauri-apps/cli" ] || { echo "run 'npm ci' at the repo root first" >&2; exit 1; }
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -58,10 +58,10 @@ echo "==> Menu-bar template icon"
 tauri_icon -o "$WORK/tray" -p 36 "$DESIGN_DIR/tray.svg"
 cp "$WORK/tray/36x36.png" "$ICONS_DIR/tray.png"
 
-echo "==> Desktop UI mark"
-mkdir -p "$DESKTOP_DIR/src/assets"
-cp "$DESIGN_DIR/icon.svg" "$DESKTOP_DIR/src/assets/icon.svg"
+echo "==> UI mark (shared ui package)"
+mkdir -p "$REPO_ROOT/ui/src/assets"
+cp "$DESIGN_DIR/icon.svg" "$REPO_ROOT/ui/src/assets/icon.svg"
 
 echo "Done: $IOS_ICON"
 echo "      $ICONS_DIR/{32x32,128x128,128x128@2x,icon,tray}.png, icon.icns"
-echo "      $DESKTOP_DIR/src/assets/icon.svg"
+echo "      $REPO_ROOT/ui/src/assets/icon.svg"

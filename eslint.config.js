@@ -5,8 +5,9 @@ import reactRefresh from 'eslint-plugin-react-refresh'
 import tseslint from 'typescript-eslint'
 import { defineConfig, globalIgnores } from 'eslint/config'
 
+// One config for every npm workspace (ui/, desktop/, web/).
 export default defineConfig([
-  globalIgnores(['dist', 'src-tauri']),
+  globalIgnores(['**/dist', 'desktop/src-tauri', 'core-wasm', 'target', '**/src/wasm']),
   {
     files: ['**/*.{ts,tsx}'],
     extends: [js.configs.recommended, tseslint.configs.recommended, reactRefresh.configs.vite],

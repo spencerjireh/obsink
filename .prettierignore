@@ -1,0 +1,7 @@
+dist/
+node_modules/
+package-lock.json
+desktop/src-tauri/target/
+desktop/src-tauri/gen/
+core-wasm/pkg/
+target/

@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { useBackend } from '../backend'
 import { ConfirmForm } from './ConfirmForm'
 
 type Props = {
@@ -14,6 +15,7 @@ type Props = {
 // Mounted with `key={vault.id}` so an open confirmation never outlives the
 // vault it was asked about.
 export function VaultActions({ vault, busy, removeOnly = false, onRemove, onDeleteRemote }: Props) {
+  const { keyStoreNoun } = useBackend().platform
   const [confirming, setConfirming] = useState<'remove' | 'delete' | null>(null)
 
   return (
@@ -44,7 +46,7 @@ export function VaultActions({ vault, busy, removeOnly = false, onRemove, onDele
       {confirming === 'remove' ? (
         <ConfirmForm
           title="Remove from this device"
-          description="The vault stays on the server. The key is removed from the keychain, so connecting again needs the passphrase."
+          description={`The vault stays on the server. The key is removed from ${keyStoreNoun}, so connecting again needs the passphrase.`}
           confirmLabel="Remove from this device"
           busy={busy}
           onConfirm={onRemove}
