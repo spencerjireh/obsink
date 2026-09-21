@@ -29,6 +29,7 @@
           { "context": "core + CLI + mobile", "integration_id": 15368 },
           { "context": "cargo deny", "integration_id": 15368 },
           { "context": "server (postgres)", "integration_id": 15368 },
+          { "context": "web", "integration_id": 15368 },
           { "context": "desktop (macOS)", "integration_id": 15368 },
           { "context": "ios (simulator)", "integration_id": 15368 }
         ]
