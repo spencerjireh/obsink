@@ -41,9 +41,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
       - name: Clippy (all crates except the Tauri shell, which is linted on macOS)
-        run: cargo clippy -p obsink-core -p obsink -p obsink-mobile -p obsink-server --all-targets -- -D warnings
-      - name: Test core, CLI, and mobile facade
-        run: cargo test -p obsink-core -p obsink -p obsink-mobile
+        run: cargo clippy -p obsink-core -p obsink-core-wasm -p obsink -p obsink-mobile -p obsink-server --all-targets -- -D warnings
+      - name: Test core, the wasm bindings (natively), CLI, and mobile facade
+        run: cargo test -p obsink-core -p obsink-core-wasm -p obsink -p obsink-mobile
 
   deny:
     name: cargo deny
@@ -81,6 +81,21 @@ jobs:
         run: cargo test -p obsink-server
       - name: Build server image
         run: docker build -f server/Dockerfile .
+
+  web:
+    name: web
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml, with wasm32)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install wasm-pack (cached in ~/.cargo/bin by rust-cache)
+        run: command -v wasm-pack >/dev/null || cargo install wasm-pack --locked --version 0.15.0
+      - name: Build the core for the browser
+        run: wasm-pack build core-wasm --target web
+      - name: Test the bindings inside a wasm runtime
+        run: wasm-pack test --node --release core-wasm
 
   desktop:
     name: desktop (macOS)
