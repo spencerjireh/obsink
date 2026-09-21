@@ -2,11 +2,15 @@
   "name": "obsink",
   "private": true,
   "type": "module",
-  "workspaces": ["ui", "desktop", "web"],
+  "workspaces": [
+    "ui",
+    "desktop",
+    "web"
+  ],
   "scripts": {
     "lint": "eslint ui desktop web --max-warnings 0",
-    "format": "prettier --write ui desktop web",
-    "format:check": "prettier --check ui desktop web",
+    "format": "prettier --write ui desktop web site",
+    "format:check": "prettier --check ui desktop web site",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "build": "npm run build --workspaces --if-present",
     "test": "npm run test --workspaces --if-present"

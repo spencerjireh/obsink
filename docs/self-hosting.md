@@ -59,8 +59,9 @@ audience is the ObSink app's bundle id, which the server verifies against Apple'
 
 1. In Coolify, add a resource of type **Docker Compose** pointing at this repository (branch
    `main`) with the compose file `docker-compose.coolify.yml`. Coolify builds `server/Dockerfile`
-   on the host (a Rust release build, several minutes the first time) and runs Postgres
-   alongside it. Every deploy rebuilds the image from the branch, so an upgrade is a redeploy.
+   and `web/Dockerfile` on the host (Rust release builds, several minutes the first time) and runs
+   Postgres alongside them. Every deploy rebuilds the images from the branch, so an upgrade is a
+   redeploy.
 2. Set the environment variables in Coolify:
    - `OBSINK_SERVER_KEY` — run `cargo run -p obsink-server -- keygen` in a checkout (or
      `docker compose run --rm --no-deps server keygen` once the local stack image is built) and
@@ -69,14 +70,22 @@ audience is the ObSink app's bundle id, which the server verifies against Apple'
    - `POSTGRES_PASSWORD` — `openssl rand -hex 24`.
    - `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM`, `SMTP_TLS` — from your
      mail provider.
-3. Assign a domain to the `server` service (port 8080). Coolify's Traefik issues the certificate.
+3. Assign two domains: the API domain to the `server` service (port 8080) and the site domain to
+   the `web` service (port 80). Coolify's Traefik issues the certificates. The `web` container
+   serves the landing page at `/` and the browser client at `/app`, and forwards `/auth/*`,
+   `/vaults/*`, `/healthz` (and `GET /` for non-browser clients) to `server`, so the site domain
+   also works as an API host: the reference deployment moved its API from
+   `obsink.spencerjireh.com` to `obsink-api.spencerjireh.com` this way without breaking the builds
+   that bake the old host. If you only want the API, leave `web` without a domain.
 4. Deploy. Coolify creates the two named volumes (`obsink-data`, `obsink-pg`); mark them persistent
    in the resource settings so redeploys keep them.
-5. Check `https://your-domain/healthz` returns `{"ok":true}` and `https://your-domain/` lists the
-   sign-in methods you configured.
+5. Check `https://your-api-domain/healthz` returns `{"ok":true}` and `https://your-api-domain/`
+   lists the sign-in methods you configured; `https://your-site-domain/` in a browser is the
+   landing page and `https://your-site-domain/app` the client.
 
 Any other compose host works the same way: copy `docker-compose.coolify.yml`, provide the same
-environment, and route your proxy to port 8080 of the `server` container.
+environment, and route your proxy to port 8080 of the `server` container (and port 80 of `web`
+for the site).
 
 ## 4. First account and invites
 

@@ -105,6 +105,8 @@ jobs:
         run: npm ci
       - name: Type-check, test and build the browser client
         run: npm run typecheck -w web && npm run test -w web && npm run build -w web
+      - name: Build the web image (site, client, API proxy)
+        run: docker build -f web/Dockerfile .
 
   desktop:
     name: desktop (macOS)

@@ -15,11 +15,12 @@ ObSink is a free, self-hosted, end-to-end encrypted sync engine for Obsidian vau
 │                  │ HTTPS  │  axum      (API, accounts)   │ HTTPS  │  iOS (Swift)     │
 │  macOS           │◄──────►│  Postgres  (manifest/meta)   │◄──────►│  + File Provider │
 │  CLI             │ (proxy)│  volume    (encrypted blobs) │ (proxy)│                  │
-│                  │        │  retention task              │        │                  │
-└──────────────────┘        └──────────────────────────────┘        └──────────────────┘
+│  Browser (/app)  │        │  retention task              │        │                  │
+└──────────────────┘        │  web: site + /app + proxy    │        └──────────────────┘
+                            └──────────────────────────────┘
 ```
 
-TLS is terminated by the operator's reverse proxy (Coolify's Traefik in the reference deployment); the server itself speaks plain HTTP.
+TLS is terminated by the operator's reverse proxy (Coolify's Traefik in the reference deployment); the server itself speaks plain HTTP. The `web` container (Caddy) serves the landing page and the browser client and forwards the API paths to the server, so the site domain doubles as an API host for builds that bake it.
 
 ### Components
 
@@ -473,7 +474,7 @@ obsink/
     ├── pull_request_template.md
     ├── rulesets/main.json    branch ruleset for main (applied with gh api)
     └── workflows/
-        ├── ci.yml            commit check, fmt/clippy/tests, cargo-deny, server on Postgres, desktop lint+build, iOS simulator tests
+        ├── ci.yml            commit check, fmt/clippy/tests, cargo-deny, server on Postgres, web (wasm + client + image), desktop lint+build, iOS simulator tests
         └── release.yml       on v*.*.* tags: verify versions, build + publish the macOS arm64 CLI
 ```
 

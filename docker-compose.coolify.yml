@@ -2,8 +2,12 @@
 # Coolify clones the repo and builds server/Dockerfile on the host (a Rust
 # release build: several minutes on the first deploy, cached afterwards); a
 # redeploy rebuilds from the current branch.
-# The server speaks plain HTTP on 8080; Coolify's Traefik terminates TLS and
-# routes the domain to it. Set these in the Coolify environment:
+# Two services take a domain: `web` (the site, obsink.spencerjireh.com) and
+# `server` (the API, obsink-api.spencerjireh.com). Both speak plain HTTP;
+# Coolify's Traefik terminates TLS and routes each domain to its container.
+# The `web` container also proxies the API paths on the site domain, so
+# builds that bake the old host keep working. Set these in the Coolify
+# environment:
 #   OBSINK_SERVER_KEY   `obsink-server keygen` output; back it up
 #   OBSINK_API_KEY      operator bearer for the admin CLI and verify scripts
 #   POSTGRES_PASSWORD   database password
@@ -41,6 +45,25 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "obsink-server", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # The website: landing page, browser client at /app, and a reverse proxy
+  # for the API paths (see web/Caddyfile). Assign the public site domain to
+  # this service and the API domain to `server`; both build from the branch.
+  web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+    expose:
+      - "80"
+    depends_on:
+      server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/healthz"]
       interval: 30s
       timeout: 5s
       retries: 5

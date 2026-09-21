@@ -33,11 +33,14 @@ deployment in `docs/self-hosting.md`.
 - **Desktop** — Tauri v2 (`@tauri-apps` 2.0), React 18.3, Vite 5.4, TypeScript 5.6.
 - **iOS** — Swift/SwiftUI + File Provider extension; Rust via **UniFFI 0.28**
   (`mobile/` crate). Project generated with XcodeGen (`ios/project.yml`).
-- **Infra** — `server/Dockerfile` (cargo-chef, distroless), `docker-compose.yml`
-  (local: server built from the checkout, Postgres 16, Mailpit) and
-  `docker-compose.coolify.yml` (production: Coolify builds `server/Dockerfile`
-  from the branch on every deploy, Postgres). TLS is the operator's proxy
-  (Coolify Traefik). Windows, Linux, and Android clients are out of scope.
+- **Infra** — `server/Dockerfile` (cargo-chef, distroless) and `web/Dockerfile`
+  (wasm-pack + npm build, Caddy: the landing page from `site/`, the client at
+  `/app`, and a proxy for the API paths; `web/Caddyfile`). `docker-compose.yml`
+  (local: server and web built from the checkout, Postgres 16, Mailpit) and
+  `docker-compose.coolify.yml` (production: Coolify builds both images from the
+  branch on every deploy, Postgres; `web` takes the site domain, `server` the
+  API domain). TLS is the operator's proxy (Coolify Traefik). Windows, Linux,
+  and Android clients are out of scope.
 
 ## Project structure
 
@@ -55,7 +58,9 @@ obsink/
   server/                # obsink-server (axum): accounts, vaults, files, batch, retention; Dockerfile
   ui/                    # shared React screens + the Backend interface (npm workspace, TS source)
   desktop/               # Tauri v2 shell (src-tauri/) + the Tauri Backend and entry (src/)
-  web/                   # browser client at /app: worker Backend (File System Access + core-wasm + fetch)
+  web/                   # browser client at /app: worker Backend (File System Access + core-wasm + fetch);
+                         #   Dockerfile + Caddyfile for the website container
+  site/                  # landing page (index.html, icon.svg) and install.sh, served by the web container
   mobile/                # UniFFI facade over core (staticlib/cdylib for iOS)
   ios/                   # Xcode project: ObSink app + FileProvider ext + Tests (XcodeGen)
   docker-compose.yml     # local stack; docker-compose.coolify.yml for production

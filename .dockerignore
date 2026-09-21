@@ -11,3 +11,8 @@ server/data/
 # Docker builds use the image's own toolchain (rust:1.97-bookworm); without this rustup
 # would install the pinned toolchain + components inside every build.
 rust-toolchain.toml
+# Built by the web image itself
+core-wasm/pkg/
+web/dist/
+# Playwright MCP session artifacts
+.playwright-mcp/

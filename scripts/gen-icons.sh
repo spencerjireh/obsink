@@ -62,6 +62,9 @@ echo "==> UI mark (shared ui package)"
 mkdir -p "$REPO_ROOT/ui/src/assets"
 cp "$DESIGN_DIR/icon.svg" "$REPO_ROOT/ui/src/assets/icon.svg"
 
+echo "==> Website mark"
+cp "$DESIGN_DIR/icon.svg" "$REPO_ROOT/site/icon.svg"
+
 echo "Done: $IOS_ICON"
 echo "      $ICONS_DIR/{32x32,128x128,128x128@2x,icon,tray}.png, icon.icns"
-echo "      $REPO_ROOT/ui/src/assets/icon.svg"
+echo "      $REPO_ROOT/ui/src/assets/icon.svg, $REPO_ROOT/site/icon.svg"
