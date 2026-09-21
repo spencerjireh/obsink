@@ -15,7 +15,7 @@ path = "src/bin/uniffi-bindgen.rs"
 [dependencies]
 obsink-core = { path = "../core" }
 uniffi = { version = "0.28", features = ["cli"] }
-tokio = { version = "1", features = ["rt", "macros", "time", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net"] }
 thiserror = "1"
 # Parses the server's `{ "error": ... }` bodies for `MobileError::Server` (same
 # versions core already pulls in).
