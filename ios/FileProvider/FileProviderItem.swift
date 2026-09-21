@@ -52,8 +52,12 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
         guard !isRoot, let rec = record else {
             return [.allowsAddingSubItems, .allowsContentEnumerating, .allowsReading]
         }
+        // Folders can be reorganised too: a notes vault gets restructured
+        // often, and the store cascades a folder's rename or delete to its
+        // descendants.
         return rec.isDirectory
-            ? [.allowsAddingSubItems, .allowsContentEnumerating, .allowsReading]
+            ? [.allowsAddingSubItems, .allowsContentEnumerating, .allowsReading,
+               .allowsDeleting, .allowsRenaming, .allowsReparenting]
             : [.allowsReading, .allowsWriting, .allowsDeleting, .allowsReparenting, .allowsRenaming]
     }
 
@@ -67,11 +71,27 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
         return Date(timeIntervalSince1970: TimeInterval(rec.modified))
     }
 
-    // Replicated extensions require an item version. rowVersion changes on every
-    // real mutation, so it doubles as both content and metadata version.
+    // Replicated extensions require an item version. The content version is
+    // the bytes' (size, mtime) so a rename or a pending flag (which bump
+    // rowVersion) does not make the system re-fetch unchanged contents; the
+    // metadata version is rowVersion, which changes on every real mutation.
+    // The extension has no vault keys, so the content HMAC is not available
+    // here; `contentHash` stays reserved.
     var itemVersion: NSFileProviderItemVersion {
+        NSFileProviderItemVersion(contentVersion: contentVersionData, metadataVersion: metadataVersionData)
+    }
+
+    var contentVersionData: Data {
+        guard !isRoot, let rec = record, !rec.isDirectory else { return Data(count: 16) }
+        var size = (rec.size ?? -1).bigEndian
+        var modified = rec.modified.bigEndian
+        var data = withUnsafeBytes(of: &size) { Data($0) }
+        data.append(withUnsafeBytes(of: &modified) { Data($0) })
+        return data
+    }
+
+    var metadataVersionData: Data {
         var be = (record?.rowVersion ?? 0).bigEndian
-        let data = withUnsafeBytes(of: &be) { Data($0) }
-        return NSFileProviderItemVersion(contentVersion: data, metadataVersion: data)
+        return withUnsafeBytes(of: &be) { Data($0) }
     }
 }
