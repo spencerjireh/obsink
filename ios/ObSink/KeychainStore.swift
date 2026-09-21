@@ -8,6 +8,11 @@ import Security
 enum KeychainStore {
     private static let service = "obsink"
 
+    /// Items are readable once the device has been unlocked since boot, so
+    /// the background refresh can sync while it is locked again. Still
+    /// encrypted at rest until that first unlock.
+    static let accessibility = kSecAttrAccessibleAfterFirstUnlock
+
     @discardableResult
     static func save(_ key: Data, account: String) -> Bool {
         let query: [String: Any] = [
@@ -18,7 +23,31 @@ enum KeychainStore {
         SecItemDelete(query as CFDictionary)
         var add = query
         add[kSecValueData as String] = key
+        add[kSecAttrAccessible as String] = accessibility
         return SecItemAdd(add as CFDictionary, nil) == errSecSuccess
+    }
+
+    /// Re-save an existing item under the current accessibility class; a
+    /// missing item is fine.
+    @discardableResult
+    static func resave(account: String) -> Bool {
+        guard let data = load(account: account) else { return true }
+        return save(data, account: account)
+    }
+
+    /// The accessibility class an item was saved with (tests).
+    static func accessibility(of account: String) -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecReturnAttributes as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        var item: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+              let attributes = item as? [String: Any] else { return nil }
+        return attributes[kSecAttrAccessible as String] as? String
     }
 
     static func load(account: String) -> Data? {
