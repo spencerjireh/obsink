@@ -113,13 +113,25 @@ fn parse_error_body(body: &str) -> String {
         .unwrap_or_else(|_| body.to_string())
 }
 
-/// Connection details for one vault, supplied by the host app.
-#[derive(Debug, Clone, uniffi::Record)]
+/// Connection details for one vault, supplied by the host app. `Debug`
+/// redacts `api_key`.
+#[derive(Clone, uniffi::Record)]
 pub struct MobileVaultConfig {
     pub server_url: String,
     pub api_key: String,
     pub vault_id: String,
     pub local_path: String,
+}
+
+impl std::fmt::Debug for MobileVaultConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MobileVaultConfig")
+            .field("server_url", &self.server_url)
+            .field("api_key", &"..")
+            .field("vault_id", &self.vault_id)
+            .field("local_path", &self.local_path)
+            .finish()
+    }
 }
 
 impl From<MobileVaultConfig> for VaultConfig {
@@ -367,12 +379,24 @@ pub struct MobileCapabilities {
 }
 
 /// A signed-in session: `token` is the bearer to store in the Keychain.
-#[derive(Debug, Clone, uniffi::Record)]
+/// `Debug` redacts it.
+#[derive(Clone, uniffi::Record)]
 pub struct MobileSession {
     pub token: String,
     pub session_id: String,
     pub user_id: String,
     pub email: Option<String>,
+}
+
+impl std::fmt::Debug for MobileSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MobileSession")
+            .field("token", &"..")
+            .field("session_id", &self.session_id)
+            .field("user_id", &self.user_id)
+            .field("email", &self.email)
+            .finish()
+    }
 }
 
 /// `GET /auth/me` for the signed-in account.
@@ -875,20 +899,47 @@ fn to_mobile_conflict(conflict: &obsink_core::Conflict) -> MobileConflict {
     }
 }
 
-/// Run a future to completion on a fresh single-threaded Tokio runtime. Mobile
-/// sync is infrequent, so per-call runtime construction is acceptable and keeps
-/// the FFI surface synchronous.
+/// Run a future to completion on the shared runtime, keeping the FFI surface
+/// synchronous. One multi-thread runtime lives for the process: the reqwest
+/// connection pool and TLS sessions survive between `prepare` and `complete`,
+/// `block_on` may be entered from several Swift threads at once, and the
+/// blocking pool the sync engine's filesystem work runs on stays warm.
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("failed to build Tokio runtime")
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("failed to build Tokio runtime")
+        })
         .block_on(future)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn records_redact_secrets_in_debug() {
+        let config = MobileVaultConfig {
+            server_url: "https://s.test".into(),
+            api_key: "secret-bearer-xyz".into(),
+            vault_id: "vault_1".into(),
+            local_path: "/tmp/v".into(),
+        };
+        let session = MobileSession {
+            token: "bearer-secret".into(),
+            session_id: "sess_1".into(),
+            user_id: "user_1".into(),
+            email: None,
+        };
+        let printed = format!("{config:?} {session:?}");
+        assert!(printed.contains("vault_1") && printed.contains("sess_1"));
+        assert!(!printed.contains("secret-bearer-xyz"));
+        assert!(!printed.contains("bearer-secret"));
+    }
 
     #[test]
     fn a_401_is_unauthorized_only_on_bearer_calls() {
