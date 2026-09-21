@@ -729,16 +729,24 @@ final class SyncModel: ObservableObject {
             defaults.set(now, forKey: Self.lastSyncedKey(vaultID))
             // OBS-20/21: mirror the freshly synced vault into the item DB, then
             // tell the File Provider to re-enumerate so Obsidian/Files see it.
-            let store = ItemStore.store(for: vaultID)
-            try? store.reconcileAfterSync(completed: true, vaultRoot: Self.vaultDirectory(for: vaultID))
-            // OBS-22/23: the core sync already pushed uploads/deletes by scanning
-            // the vault dir; clear the FP's pending flags now.
-            try? store.drainPendingAfterSync(completed: true)
+            // OBS-22/23: the core sync already pushed uploads/deletes by
+            // scanning the vault dir; clear the FP's pending flags now.
+            if let store = try? ItemStore.store(for: vaultID) {
+                try? store.reconcileAfterSync(completed: true, vaultRoot: Self.vaultDirectory(for: vaultID))
+                try? store.drainPendingAfterSync(completed: true)
+            }
             signalFileProvider(for: vaultID)
             refreshPending(for: vaultID)
         } else if !outcome.conflicts.isEmpty {
             let count = outcome.conflicts.count
             status = count == 1 ? "1 conflict needs attention" : "\(count) conflicts need attention"
+            // The prepare step already applied the non-conflicting downloads
+            // to disk, so the item DB and the File Provider must see them now;
+            // the pending flags stay until the uploads run.
+            if let store = try? ItemStore.store(for: vaultID) {
+                try? store.reconcile(vaultRoot: Self.vaultDirectory(for: vaultID))
+            }
+            signalFileProvider(for: vaultID)
             loadPreviews()
         } else {
             status = "Prepared · ↑\(outcome.uploaded) ↓\(outcome.downloaded)\(failedSuffix)"
@@ -813,13 +821,15 @@ final class SyncModel: ObservableObject {
         }
     }
 
-    /// Ask the system to re-enumerate a vault's working set so the File
-    /// Provider picks up the DB changes from `reconcileAfterSync`. Errors are
+    /// Ask the system to re-enumerate a vault's working set and root so the
+    /// File Provider picks up the DB changes from a reconcile. Errors are
     /// ignored: on a fresh install the domain registration may still be in
     /// flight.
     private func signalFileProvider(for vaultID: String) {
-        guard let entry = entries.first(where: { $0.vaultID == vaultID }) else { return }
-        NSFileProviderManager(for: Self.fpDomain(for: entry))?.signalEnumerator(for: .workingSet) { _ in }
+        guard let entry = entries.first(where: { $0.vaultID == vaultID }),
+              let manager = NSFileProviderManager(for: Self.fpDomain(for: entry)) else { return }
+        manager.signalEnumerator(for: .workingSet) { _ in }
+        manager.signalEnumerator(for: .rootContainer) { _ in }
     }
 
     // MARK: Stale-vault warning (spec §3.4, OBS-33)

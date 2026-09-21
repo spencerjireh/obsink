@@ -12,21 +12,43 @@ import Foundation
 /// Identifiers are stable UUIDs assigned by `ItemStore`. Local writes
 /// (`createItem`/`modifyItem`/`deleteItem`) update the cache and mark
 /// `pendingUpload`/`pendingDeletion` so the host app's next sync drains them.
+///
+/// The store is opened once at init. If that fails (a data-protection-locked
+/// container before first unlock, a stale `-wal`), every request answers
+/// `cannotSynchronize` until the system re-creates the extension, instead of
+/// crashing and leaving the Files listing at LOADING.
 final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
     private let domain: NSFileProviderDomain
     private let root: URL
-    private let store: ItemStore
+    private let storeResult: Result<ItemStore, Error>
 
-    required init(domain: NSFileProviderDomain) {
+    /// Designated initializer; tests inject a temp store and root.
+    init(domain: NSFileProviderDomain, store: Result<ItemStore, Error>, root: URL) {
         self.domain = domain
-        let vaultID = domain.identifier.rawValue
-        self.root = FileProviderPaths.vaultRoot(vaultID: vaultID)
-        self.store = ItemStore.store(for: vaultID)
+        self.root = root
+        self.storeResult = store
         super.init()
-        NSLog("ObSinkFP: init domain=%@", vaultID)
+    }
+
+    required convenience init(domain: NSFileProviderDomain) {
+        let vaultID = domain.identifier.rawValue
+        let store = Result { try ItemStore.store(for: vaultID) }
+        self.init(domain: domain, store: store, root: FileProviderPaths.vaultRoot(vaultID: vaultID))
+        switch store {
+        case .success: NSLog("ObSinkFP: init domain=%@", vaultID)
+        case .failure(let error): NSLog("ObSinkFP: init domain=%@ store unavailable: %@", vaultID, "\(error)")
+        }
     }
 
     func invalidate() {}
+
+    /// The store, or `cannotSynchronize` when it could not be opened.
+    private func openStore() throws -> ItemStore {
+        switch storeResult {
+        case .success(let store): return store
+        case .failure: throw NSFileProviderError(.cannotSynchronize)
+        }
+    }
 
     func item(
         for identifier: NSFileProviderItemIdentifier,
@@ -38,10 +60,15 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
             completionHandler(FileProviderItem.root(named: domain.displayName), nil)
             return Progress()
         }
-        if let rec = try? store.item(for: identifier.rawValue) {
-            completionHandler(FileProviderItem(record: rec), nil)
-        } else {
-            completionHandler(nil, NSFileProviderError(.noSuchItem))
+        do {
+            let store = try openStore()
+            if let rec = try? store.item(for: identifier.rawValue) {
+                completionHandler(FileProviderItem(record: rec), nil)
+            } else {
+                completionHandler(nil, NSFileProviderError(.noSuchItem))
+            }
+        } catch {
+            completionHandler(nil, error)
         }
         return Progress()
     }
@@ -52,6 +79,10 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
         request _: NSFileProviderRequest,
         completionHandler: @escaping (URL?, NSFileProviderItem?, Error?) -> Void
     ) -> Progress {
+        guard let store = try? openStore() else {
+            completionHandler(nil, nil, NSFileProviderError(.cannotSynchronize))
+            return Progress()
+        }
         guard
             itemIdentifier != .rootContainer,
             let rec = try? store.item(for: itemIdentifier.rawValue),
@@ -84,8 +115,12 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
         request _: NSFileProviderRequest,
         completionHandler: @escaping (NSFileProviderItem?, NSFileProviderItemFields, Bool, Error?) -> Void
     ) -> Progress {
+        guard let store = try? openStore() else {
+            completionHandler(nil, [], false, NSFileProviderError(.cannotSynchronize))
+            return Progress()
+        }
         let parentID = parentIdentifierValue(of: itemTemplate.parentItemIdentifier)
-        let parentPath = parentPath(forIdentifier: itemTemplate.parentItemIdentifier)
+        let parentPath = parentPath(forIdentifier: itemTemplate.parentItemIdentifier, store: store)
         let filename = itemTemplate.filename
         let localPath = parentPath.isEmpty ? filename : "\(parentPath)/\(filename)"
         let destination = root.appendingPathComponent(localPath)
@@ -100,21 +135,17 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
                 FileManager.default.createFile(atPath: destination.path, contents: nil)
             }
 
-            let size: Int64? = isFolder
-                ? nil
-                : (try? destination.resourceValues(forKeys: [.fileSizeKey]))?.fileSize.map(Int64.init)
-            let rec = ItemRecord(
+            let rec = try store.insert(ItemRecord(
                 identifier: UUID().uuidString,
                 parentIdentifier: parentID,
                 filename: filename,
                 contentHash: nil,
                 localPath: localPath,
                 isDirectory: isFolder,
-                size: size,
+                size: isFolder ? nil : size(of: destination),
                 modified: mtime(of: destination),
                 pendingUpload: true
-            )
-            try store.upsert(rec)
+            ))
             completionHandler(FileProviderItem(record: rec), [], false, nil)
         } catch {
             completionHandler(nil, [], false, error)
@@ -131,6 +162,10 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
         request _: NSFileProviderRequest,
         completionHandler: @escaping (NSFileProviderItem?, NSFileProviderItemFields, Bool, Error?) -> Void
     ) -> Progress {
+        guard let store = try? openStore() else {
+            completionHandler(nil, [], false, NSFileProviderError(.cannotSynchronize))
+            return Progress()
+        }
         let id = item.itemIdentifier
         guard
             id != .rootContainer,
@@ -141,25 +176,33 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
             return Progress()
         }
         do {
+            var current = rec
             if let newContents {
                 try? FileManager.default.removeItem(at: url)
                 try FileManager.default.copyItem(at: newContents, to: url)
+                // New bytes change the content version (size + mtime); the
+                // rename below, if any, changes only the metadata version.
+                if let updated = try store.updateContent(
+                    identifier: current.identifier, size: size(of: url), modified: mtime(of: url)
+                ) {
+                    current = updated
+                }
             }
-            var current = rec
             if changedFields.contains(.filename) || changedFields.contains(.parentItemIdentifier) {
                 let newFilename = changedFields.contains(.filename) ? item.filename : current.filename
                 let newParentID = changedFields.contains(.parentItemIdentifier)
                     ? parentIdentifierValue(of: item.parentItemIdentifier)
                     : current.parentIdentifier
                 let newParentPath = changedFields.contains(.parentItemIdentifier)
-                    ? parentPath(forIdentifier: item.parentItemIdentifier)
-                    : parentPath(forIdentifier: NSFileProviderItemIdentifier(current.parentIdentifier))
+                    ? parentPath(forIdentifier: item.parentItemIdentifier, store: store)
+                    : parentPath(forIdentifier: NSFileProviderItemIdentifier(current.parentIdentifier), store: store)
                 let newLocalPath = newParentPath.isEmpty ? newFilename : "\(newParentPath)/\(newFilename)"
                 if newLocalPath != current.localPath {
                     let destination = root.appendingPathComponent(newLocalPath)
                     try? FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
-                    try? FileManager.default.moveItem(at: url, to: destination)
-                    if let moved = try? store.rename(
+                    // A failed move is an error, not a phantom rename in the DB.
+                    try FileManager.default.moveItem(at: url, to: destination)
+                    if let moved = try store.rename(
                         identifier: current.identifier,
                         toPath: newLocalPath,
                         filename: newFilename,
@@ -184,6 +227,10 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
         request _: NSFileProviderRequest,
         completionHandler: @escaping (Error?) -> Void
     ) -> Progress {
+        guard let store = try? openStore() else {
+            completionHandler(NSFileProviderError(.cannotSynchronize))
+            return Progress()
+        }
         guard
             identifier != .rootContainer,
             let rec = try? store.item(for: identifier.rawValue),
@@ -193,6 +240,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
             return Progress()
         }
         try? FileManager.default.removeItem(at: url)
+        // Tombstones the row and, for a folder, everything under it.
         try? store.setPending(identifier: rec.identifier, deletion: true)
         completionHandler(nil)
         return Progress()
@@ -203,7 +251,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
         request _: NSFileProviderRequest
     ) throws -> NSFileProviderEnumerator {
         NSLog("ObSinkFP: enumerator(for:) %@", containerItemIdentifier.rawValue)
-        return FileProviderEnumerator(container: containerItemIdentifier, store: store)
+        return FileProviderEnumerator(container: containerItemIdentifier, store: try openStore())
     }
 
     // MARK: Helpers
@@ -214,11 +262,15 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
     }
 
     /// The on-disk relative path of an item's parent, looked up from the DB.
-    private func parentPath(forIdentifier parent: NSFileProviderItemIdentifier) -> String {
+    private func parentPath(forIdentifier parent: NSFileProviderItemIdentifier, store: ItemStore) -> String {
         guard parent != .rootContainer, let rec = try? store.item(for: parent.rawValue) else {
             return ""
         }
         return rec.localPath
+    }
+
+    private func size(of url: URL) -> Int64? {
+        (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize.map(Int64.init)
     }
 
     private func mtime(of url: URL) -> Int64 {
