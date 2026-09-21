@@ -156,3 +156,26 @@ async fn enforces_the_per_account_vault_limit_and_per_vault_byte_budget() {
     assert_eq!(me["usage"]["vaults"][0]["id"], ops);
     env.finish().await;
 }
+
+/// A test that panics never reaches `finish()`; `Drop` must still remove
+/// the database it created.
+#[tokio::test]
+async fn a_dropped_env_removes_its_database() {
+    let Some(env) = TestEnv::try_new().await else {
+        return;
+    };
+    let admin_url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+    let db_name = env.db_name().to_string();
+    assert!(TestEnv::database_exists(&admin_url, &db_name).await);
+
+    // Dropping from an async context is what a panic unwinding through a
+    // `#[tokio::test]` does; the cleanup runs on its own thread.
+    tokio::task::spawn_blocking(move || drop(env))
+        .await
+        .expect("drop on a blocking thread");
+
+    assert!(
+        !TestEnv::database_exists(&admin_url, &db_name).await,
+        "{db_name} was left behind"
+    );
+}
