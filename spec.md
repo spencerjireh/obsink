@@ -2,7 +2,7 @@
 
 > *Because things will go wrong.*
 
-ObSink is a free, self-hosted, end-to-end encrypted sync engine for Obsidian vaults on macOS and iOS. It replaces paid sync services with a manual "Sync" button, a shared Rust core, and a small Rust server you run yourself with `docker compose up`.
+ObSink is a free, self-hosted, end-to-end encrypted sync engine for Obsidian vaults on macOS and iOS. It replaces paid sync services with a "Sync" button that the clients also press for you (on iOS when the app comes to the foreground or in a background refresh; on desktop and the CLI through a daemon), a shared Rust core, and a small Rust server you run yourself with `docker compose up`.
 
 ---
 
@@ -45,13 +45,19 @@ TLS is terminated by the operator's reverse proxy (Coolify's Traefik in the refe
 
 ## 3. Sync Model
 
-### 3.1 Manual Sync (Button-Driven)
+### 3.1 Driven Sync
 
-There is no automatic file watching or background sync. Users press a "Sync" button to trigger the full sync cycle. This eliminates debouncing, race conditions, partial write handling, and iOS background scheduling issues.
+The sync engine has no clock and no file watcher: one call runs the full cycle below, and nothing happens between calls. What triggers a call is a driver outside the engine:
+
+- the user tapping "Sync";
+- on iOS, the app coming to the foreground and an OS-scheduled `BGAppRefreshTask` (`AutoSyncPolicy`: a vault with File Provider writes waiting, a server that is ahead, or no sync in the last 15 minutes; never a vault that is syncing, keyless, on another server, or holding conflicts);
+- on desktop and the CLI, a daemon that debounces filesystem events and polls the server manifest (§1 of the roadmap; `core/src/daemon.rs`).
+
+Drivers never resolve a conflict. A conflicted path stays pending for the user and everything else keeps syncing.
 
 ### 3.2 Sync Flow
 
-When the user taps "Sync":
+When a sync starts (tap, foreground, background refresh, or daemon):
 
 1. **Pull manifest** — `GET /manifest` from the server. Compare it against the working manifest (the vault on disk) and the **base** (`.obsink/manifest.json`, the checkpoint of the last completed sync; a base entry with no file on disk is a local deletion).
 2. **Compute diff** — Per path, a side has changed when its version (§3.3) differs from the base:
@@ -82,7 +88,7 @@ On app open, perform a lightweight `GET /manifest` check. If the server has chan
 
 > "3 files changed on another device. Sync before editing?"
 
-This prevents most accidental conflicts.
+This prevents most accidental conflicts. On iOS the same check feeds the auto-sync (§3.1): a vault the server is ahead of is synced right after the check, so the banner is the state of the moment before that sync starts and stays only for a vault the auto-sync skips (one holding conflicts).
 
 ---
 
@@ -477,6 +483,6 @@ obsink/
 
 - **Privacy:** Server never sees plaintext. All encryption/decryption happens on-device.
 - **Cost:** one small VPS (or any Docker host) runs the server, Postgres, and the blob volume for a household of users; no per-request pricing.
-- **Reliability:** Manual sync means no data races. Conflict detection means no silent data loss.
+- **Reliability:** One sync at a time per vault, driven by explicit calls into an engine without timers, means no data races. Conflict detection means no silent data loss.
 - **Portability:** Rust core compiles to every target platform; the server is one static binary in a distroless image. No platform lock-in beyond the iOS File Provider.
-- **Simplicity:** Minimal moving parts. No daemon processes. No background sync (v1). One button does everything.
+- **Simplicity:** Minimal moving parts. One engine call does everything; the drivers (foreground and background refresh, the daemon) only decide when to make it.

@@ -12,10 +12,11 @@ Each principle follows from a hard rule in `AGENTS.md`.
 1. **A utility, not a product page.** No hero, no tagline, no gradients, no
    decorative texture. The window shows the state of the vault and the one
    thing the user can do about it.
-2. **Sync is the single primary action** (hard rule 2: manual sync only).
-   Every screen has at most one primary button, and on a vault screen it is
-   `Sync now`; the desktop popover's `Sync now` runs it for every vault in
-   turn. Nothing looks like a toggle for automatic or background sync.
+2. **Sync is the single primary action** (hard rule 2: sync is driven, not
+   ambient). Every screen has at most one primary button, and on a vault
+   screen it is `Sync now`; the desktop popover's `Sync now` runs it for every
+   vault in turn. Automatic sync is visible only through the state text
+   (`Syncing…`, `Last synced`); there is no toggle for it.
 3. **Conflicts and stale state are first-class** (hard rule 3: never silently
    overwrite). Conflicts get their own section that is never hidden behind a
    disclosure; "changed on another device" is a warning notice, not a badge.
@@ -311,7 +312,7 @@ remote`, `keep both` in that order.
   `confirmationField`, `confirmDestructiveButton`, `confirmCancelButton`,
   `addVaultDoneButton`, `vaultCard`, `vaultStateText`, `lastSyncedText`,
   `resolveConflictsLink`, `guidanceCard`, `guidanceDismissButton`,
-  `accountNoticeText`, `appVersionText`; and by these labels: the `Connect` segment, the
+  `accountNoticeText`, `appVersionText`, `backgroundRefreshText`; and by these labels: the `Connect` segment, the
   `Keep local` / `Keep remote` / `Keep both` segments, the
   `Remove from this device` confirmation button, the tab bar buttons
   `Home` / `Settings`, `Next`, `Got it`, the status prefixes `Synced ·`,
