@@ -140,6 +140,8 @@ final class SyncModel: ObservableObject {
     @Published var previews: [String: MobileConflictPreview] = [:]
     @Published var progress: SyncProgressInfo?
     @Published var failures: [MobileSyncFailure] = []
+    /// The last sync moved its files but could not write the checkpoint.
+    @Published var checkpointError: String?
 
     private var client: VaultClient?
     private let defaults: UserDefaults
@@ -427,6 +429,7 @@ final class SyncModel: ObservableObject {
         choices = [:]
         previews = [:]
         failures = []
+        checkpointError = nil
         progress = nil
     }
 
@@ -675,6 +678,7 @@ final class SyncModel: ObservableObject {
         conflicts = []
         progress = nil
         failures = []
+        checkpointError = nil
         vaultStates[vaultID]?.phase = .syncing
 
         let config = MobileVaultConfig(
@@ -718,6 +722,7 @@ final class SyncModel: ObservableObject {
         status = "Resolving…"
         progress = nil
         failures = []
+        checkpointError = nil
         vaultStates[vaultID]?.phase = .resolving
         let resolutions = conflicts.map { conflict in
             MobileResolution(path: conflict.path, choice: choices[conflict.path] ?? .keepLocal)
@@ -740,6 +745,7 @@ final class SyncModel: ObservableObject {
         choices = Dictionary(uniqueKeysWithValues: outcome.conflicts.map { ($0.path, .keepLocal) })
         previews = [:]
         failures = outcome.failures
+        checkpointError = outcome.checkpointError
         progress = nil
         busy = false
         let now = Date()

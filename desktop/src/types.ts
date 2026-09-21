@@ -29,6 +29,7 @@ export type SyncResult = {
   download: SyncAction[]
   conflicts: Conflict[]
   failures: SyncFailure[]
+  checkpoint_error?: string
 }
 
 // Core `ProgressEvent` serializes (serde, externally-tagged) to this shape.

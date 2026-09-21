@@ -63,6 +63,11 @@ pub struct SyncResult {
     /// Per-file transfers that failed this cycle. Empty on a clean sync.
     #[serde(default)]
     pub failures: Vec<SyncFailure>,
+    /// The checkpoint (re-fetch of the server manifest and the base write)
+    /// failed after the transfers: the files moved, the next diff redoes the
+    /// bookkeeping. Not a file failure, so it has no path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_error: Option<String>,
 }
 
 /// `Debug` redacts `api_key` (the bearer).
