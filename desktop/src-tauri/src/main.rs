@@ -20,8 +20,8 @@ use obsink_core::{
     keychain::{delete_secret, load_secret, save_secret},
     load_local_state, normalize_server_url, prepare_sync, run_daemon, write_atomic, ApiClient,
     ApiError, AuthClient, AuthError, Conflict, ConflictResolution, CreateVaultRequest,
-    DaemonCallError, DaemonEvent, DaemonHandle, DaemonOptions, KeyBytes, ProgressEvent,
-    ProgressSink, SyncEngineError, SyncPlan, SyncResult, VaultConfig, VaultSummary,
+    DaemonCallError, DaemonEvent, DaemonHandle, DaemonOptions, KeyBytes, ManifestDiff,
+    ProgressEvent, ProgressSink, SyncEngineError, SyncPlan, SyncResult, VaultConfig, VaultSummary,
 };
 use serde::{Deserialize, Serialize};
 
@@ -805,7 +805,7 @@ async fn add_vault_inner(request: AddVaultRequest) -> Result<LocalVaultSummary, 
 }
 
 /// The pending diff for one vault, without transferring anything.
-async fn vault_diff(vault: &StoredVault) -> Result<SyncResult, CommandError> {
+async fn vault_diff(vault: &StoredVault) -> Result<ManifestDiff, CommandError> {
     let keys = derive_keys(&load_key_from_keychain(&vault.id)?);
     let local_root = Path::new(&vault.local_path);
     let config = to_vault_config(vault);
@@ -916,12 +916,6 @@ fn open_vault_folder(vault_id: String) -> Result<(), CommandError> {
         )));
     }
     Ok(())
-}
-
-#[tauri::command]
-async fn get_manifest_diff(vault_id: Option<String>) -> Result<SyncResult, CommandError> {
-    let vault = own_vault(vault_id)?;
-    vault_diff(&vault).await
 }
 
 async fn sync_vault_inner(
@@ -1676,7 +1670,6 @@ fn main() {
             list_remote_vaults,
             sign_out,
             get_conflict_preview,
-            get_manifest_diff,
             get_vault_states,
             open_vault_folder,
             open_settings,

@@ -52,8 +52,3 @@ pub struct NoProgress;
 impl ProgressSink for NoProgress {
     fn report(&self, _event: ProgressEvent) {}
 }
-
-/// Emit a helper when the sink is optional-looking; keeps call sites tidy.
-pub fn emit(sink: &dyn ProgressSink, event: ProgressEvent) {
-    sink.report(event);
-}

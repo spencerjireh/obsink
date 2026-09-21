@@ -1,8 +1,15 @@
 use std::collections::BTreeSet;
 
-use crate::types::{Conflict, FileEntry, Manifest, SyncAction, SyncActionKind, SyncResult};
+use crate::types::{Conflict, FileEntry, Manifest, SyncAction, SyncActionKind};
 
-pub type ManifestDiff = SyncResult;
+/// The three-way diff: what to upload, what to download, and what needs a
+/// decision. Nothing has been transferred yet, so there are no failures.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ManifestDiff {
+    pub upload: Vec<SyncAction>,
+    pub download: Vec<SyncAction>,
+    pub conflicts: Vec<Conflict>,
+}
 
 /// The identity of a path's content on one side. A tombstone and an absent
 /// entry are the same version: a tombstone's `hash` only exists so the next
