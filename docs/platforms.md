@@ -40,6 +40,21 @@ obsink status [--directory <path>]
 
 If you omit `--passphrase`, the CLI prompts for it interactively.
 
+## Browser
+
+The same screens as the desktop settings window, served at `/app` on the website (`web/`), for a Mac or PC without the app installed. It syncs a local folder through the File System Access API, so it works in Chrome and Edge; other browsers get a page that points at the downloads. There is no popover and no daemon: everything runs in a Web Worker while the tab is open, and stops when it closes.
+
+```bash
+wasm-pack build core-wasm --target web    # the pure core for the browser (once, and after core changes)
+docker compose up -d                       # a local server on 18080 (OBSINK_PORT)
+npm run dev -w web                         # http://localhost:5173/app/, API paths proxied to the server
+npm run typecheck -w web && npm run test -w web && npm run build -w web
+```
+
+How it maps onto the desktop app: `web/src/backend.ts` implements the `Backend` interface over a worker (`web/src/worker/`), which holds the fetch layer (`api.ts`, same-origin paths so the web container's proxy reaches the API without CORS), the account commands, the vault list and the sync driver. The folder is picked with `showDirectoryPicker`; its handle, the bearer (`bearer:<origin>`), the vault entries and the per-vault bookkeeping (base manifest, remote-manifest cache, hash cache, activity log) live in IndexedDB (`web/src/shared/db.ts`), the browser's `~/.obsink` plus keychain, minus secrets: the passphrase is never stored and the derived keys stay in worker memory for the tab's lifetime, so a reload shows `Needs passphrase` with an Unlock field on the vault page. Chrome forgets a folder grant per session; the vault then shows `Needs folder access` with an Allow access button. The sync cycle (`worker/sync.ts`) is the native `prepare_sync`/`complete_sync` in TypeScript, with every rule that core decides in code (batching, effective conflict choices, `.conflict` copy names, the checkpoint, the diff, ignore patterns, the hash-cache fingerprint) asked of `core-wasm`, so the browser and the native clients cannot drift. `worker/driver.ts` is the browser's daemon: it polls the server every 5 s within a minute of activity and every 60 s when idle, rescans the folder through the hash cache on each poll (there is no file watcher in a browser), backs off exponentially after a fatal error, and defers every conflict until the user answers on the vault page. Per-vault activity keeps the newest 200 events.
+
+`scripts/verify-web-e2e.mjs` drives two headless Chromium contexts against a running dev server and local stack as two devices: sign-in with the dev code, create and connect a vault (an OPFS folder stands in for the picked one), propagation both ways, a conflict resolved with Keep both. `npx playwright install chromium` once, then `node scripts/verify-web-e2e.mjs`.
+
 ## macOS desktop
 
 A Tauri v2 menu-bar app (`desktop/`). The React screens live in the shared `ui/` npm workspace and reach the platform through the `Backend` interface (`ui/src/backend.tsx`); `desktop/src/backend.ts` implements it with Tauri commands and events, and the browser client implements it again over a worker.

@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import type { VaultStateInfo } from '../../types'
 import type { Account } from '../../hooks/useAccount'
 import { useBackend } from '../../backend'
@@ -27,6 +28,8 @@ type Props = {
 export function VaultPage({ info, account, message, notify, onError, onSignIn, onGone }: Props) {
   const backend = useBackend()
   const runner = useSyncRunner(info.id, onError, notify)
+  const [passphrase, setPassphrase] = useState('')
+  const [unlocking, setUnlocking] = useState(false)
   const busy = runner.busy || account.busy
   const syncable = canSync(info)
   const usage = account.vaultUsage(info.id)
@@ -50,8 +53,9 @@ export function VaultPage({ info, account, message, notify, onError, onSignIn, o
   async function removal(action: () => Promise<void>, done: string): Promise<boolean> {
     try {
       await action()
-      notify(done)
+      // Resetting the selection clears the message, so the notice comes after.
       onGone()
+      notify(done)
       return true
     } catch (error) {
       onError(error)
@@ -61,6 +65,21 @@ export function VaultPage({ info, account, message, notify, onError, onSignIn, o
 
   function openFolder() {
     backend.openVaultFolder(info.id).catch(onError)
+  }
+
+  // The passphrase again where the key is not kept between launches.
+  async function unlock() {
+    if (!backend.unlockVault || passphrase.length === 0) return
+    setUnlocking(true)
+    try {
+      await backend.unlockVault(info.id, passphrase)
+      setPassphrase('')
+      notify(`Unlocked ${info.name}.`)
+    } catch (error) {
+      onError(error)
+    } finally {
+      setUnlocking(false)
+    }
   }
 
   return (
@@ -117,10 +136,57 @@ export function VaultPage({ info, account, message, notify, onError, onSignIn, o
             server. Remove it from this device, then connect it again.
           </Notice>
         ) : null}
-        {info.state.kind === 'no_key' ? (
+        {info.state.kind === 'no_key' && backend.unlockVault ? (
+          <form
+            className="form-grid"
+            onSubmit={(event) => {
+              event.preventDefault()
+              void unlock()
+            }}
+          >
+            <label>
+              <span>Passphrase</span>
+              <input
+                type="password"
+                autoComplete="off"
+                autoFocus
+                value={passphrase}
+                onChange={(event) => setPassphrase(event.target.value)}
+              />
+            </label>
+            <div className="choice-row form-grid__actions">
+              <button
+                className="button button--primary"
+                disabled={busy || unlocking || passphrase.length === 0}
+                type="submit"
+              >
+                {unlocking ? 'Working…' : 'Unlock'}
+              </button>
+            </div>
+          </form>
+        ) : info.state.kind === 'no_key' ? (
           <Notice kind="warning">
             No key for this vault on this device. Remove it, then connect it again with the
             passphrase.
+          </Notice>
+        ) : null}
+        {info.state.kind === 'needs_access' ? (
+          <Notice
+            kind="warning"
+            action={
+              backend.requestFolderAccess ? (
+                <button
+                  className="button button--ghost"
+                  disabled={busy}
+                  onClick={() => void backend.requestFolderAccess?.(info.id).catch(onError)}
+                  type="button"
+                >
+                  Allow access
+                </button>
+              ) : undefined
+            }
+          >
+            This browser needs permission to read and write the vault folder again.
           </Notice>
         ) : null}
         {info.state.kind === 'error' && info.state.error_kind !== 'unauthorized' ? (

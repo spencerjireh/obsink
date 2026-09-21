@@ -58,6 +58,9 @@ export type VaultState =
   | { kind: 'error'; error_kind: CommandErrorKind; message: string }
   | { kind: 'foreign' }
   | { kind: 'no_key' }
+  // Browser only: the folder's permission grant lapsed (Chrome forgets it
+  // per session); a click on the vault page asks again.
+  | { kind: 'needs_access' }
 
 export type VaultStateInfo = {
   id: string

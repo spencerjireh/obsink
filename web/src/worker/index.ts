@@ -1,0 +1,64 @@
+import type { WorkerRequest, WorkerResponse } from '../shared/protocol'
+import * as account from './account'
+import { listActivity } from './activity'
+import { stateChanged } from './bus'
+import { getConflictPreview, resolveConflict, syncVault } from './driver'
+import { asCommandError } from './errors'
+import { serverUrl } from './session'
+import * as vaults from './vaults'
+
+// The worker side of the Backend: one handler per method name, results and
+// errors posted back by request id, events pushed as they happen.
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const handlers: Record<string, (...args: any[]) => Promise<unknown> | unknown> = {
+  getServerUrl: () => serverUrl,
+  getAuthCapabilities: account.getAuthCapabilities,
+  authEmailStart: account.authEmailStart,
+  authEmailVerify: account.authEmailVerify,
+  getAccount: account.getAccount,
+  createInvite: account.createInvite,
+  listInvites: account.listInvites,
+  revokeSession: account.revokeSession,
+  signOut: account.signOut,
+  deleteAccount: account.deleteAccount,
+  listRemoteVaults: vaults.listRemoteVaults,
+  addVault: vaults.addVault,
+  removeVault: vaults.removeVault,
+  deleteRemoteVault: vaults.deleteRemoteVault,
+  getVaultStates: vaults.getVaultStates,
+  unlockVault: vaults.unlockVault,
+  syncVault,
+  resolveConflict,
+  getConflictPreview,
+  listActivity,
+}
+
+// Methods that change what the screens show; the worker announces it the
+// way desktop emits `state://changed` after every mutating command.
+const CHANGES_STATE = new Set([
+  'authEmailVerify',
+  'signOut',
+  'deleteAccount',
+  'addVault',
+  'removeVault',
+  'deleteRemoteVault',
+  'unlockVault',
+])
+
+self.onmessage = async (message: MessageEvent<WorkerRequest>) => {
+  const { id, method, args } = message.data
+  let response: WorkerResponse
+  try {
+    const handler = handlers[method]
+    if (!handler) throw new Error(`unknown backend method ${method}`)
+    response = { id, ok: true, value: await handler(...args) }
+  } catch (error) {
+    response = { id, ok: false, error: asCommandError(error) }
+  }
+  self.postMessage(response)
+  if (CHANGES_STATE.has(method)) {
+    const vaultId = typeof args[0] === 'string' && method !== 'authEmailVerify' ? args[0] : null
+    stateChanged(vaultId)
+  }
+}
