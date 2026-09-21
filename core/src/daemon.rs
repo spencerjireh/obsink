@@ -309,7 +309,7 @@ pub async fn run_daemon(
         backoff: Backoff::new(options.backoff_base, options.backoff_max),
         pending_plan: None,
         suppressed_until: None,
-        self_writes: BTreeSet::new(),
+        self_writes: BTreeMap::new(),
     };
     let mut last_activity = Instant::now();
     let mut last_poll = Instant::now();
@@ -349,6 +349,9 @@ pub async fn run_daemon(
                 let Some(paths) = paths else { break };
                 let now = Instant::now();
                 for path in paths {
+                    if state.is_self_write(&path, now) {
+                        continue;
+                    }
                     debouncer.observe(path.clone(), stat_of(&root, &path), now);
                 }
                 last_activity = now;
@@ -408,10 +411,14 @@ struct State {
     pending_plan: Option<SyncPlan>,
     /// No trigger runs a cycle before this instant (fatal-error backoff).
     suppressed_until: Option<Instant>,
-    /// Paths the last cycle wrote locally, so their watcher events are not
-    /// mistaken for edits.
-    self_writes: BTreeSet<String>,
+    /// Paths the last cycle wrote locally and when, so their watcher events
+    /// (which FSEvents may deliver a second later) are not mistaken for
+    /// edits.
+    self_writes: BTreeMap<String, Instant>,
 }
+
+/// How long after a cycle its own writes are still recognised as such.
+const SELF_WRITE_GRACE: Duration = Duration::from_secs(3);
 
 impl State {
     async fn cycle(&mut self, trigger: Trigger) -> Result<SyncResult, SyncEngineError> {
@@ -422,10 +429,11 @@ impl State {
                     Some(failure) => self.report_failure(failure.error.clone(), true).await,
                     None => self.backoff.reset(),
                 }
+                let written = Instant::now();
                 self.self_writes = result
                     .download
                     .iter()
-                    .map(|action| action.path.clone())
+                    .map(|action| (action.path.clone(), written))
                     .collect();
                 self.pending_plan = SyncPlan::from_late_conflicts(&result);
                 if let Some(plan) = self.pending_plan.clone() {
@@ -485,10 +493,17 @@ impl State {
             .await;
     }
 
+    fn is_self_write(&self, path: &str, now: Instant) -> bool {
+        self.self_writes
+            .get(path)
+            .is_some_and(|written| now.duration_since(*written) < SELF_WRITE_GRACE)
+    }
+
     /// The sync's own writes (downloads, local deletes) come back through
-    /// the watcher; the paths of the cycle that just ran are dropped so they
-    /// do not trigger a no-op cycle. Anything else that arrived meanwhile
-    /// stays pending (the "dirty" flag of the state machine).
+    /// the watcher; events already queued for the paths of the cycle that
+    /// just ran are dropped, and `is_self_write` keeps dropping them for a
+    /// grace period. Anything else that arrived during the cycle stays
+    /// pending (the "dirty" flag of the state machine).
     fn drop_self_writes(
         &mut self,
         watch_rx: &mut mpsc::UnboundedReceiver<Vec<String>>,
@@ -498,13 +513,12 @@ impl State {
         let now = Instant::now();
         while let Ok(paths) = watch_rx.try_recv() {
             for path in paths {
-                if self.self_writes.contains(&path) {
+                if self.is_self_write(&path, now) {
                     continue;
                 }
                 debouncer.observe(path.clone(), stat_of(root, &path), now);
             }
         }
-        self.self_writes.clear();
     }
 }
 
