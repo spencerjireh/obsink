@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="ObSink syncs Obsidian vaults through a server that never sees your notes. Downloads for macOS, the command line, iOS and the browser."
+    />
+    <title>ObSink</title>
+    <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+    <style>
+      /* Tokens from DESIGN.md; light values are the default, dark follows the system. */
+      :root {
+        color-scheme: light dark;
+        --brand-ink: #15141b;
+        --brand-amber: #e8a84a;
+        --brand-paper: #f2efe6;
+        --color-bg: #f2efe6;
+        --color-surface: #ffffff;
+        --color-border: #ddd9ce;
+        --color-text: #15141b;
+        --color-text-muted: #5f5b66;
+        --color-accent: #8a5a12;
+        --font-serif: 'Iowan Old Style', 'Palatino Linotype', 'Book Antiqua', Georgia, serif;
+        --font-mono: ui-monospace, 'SF Mono', Menlo, monospace;
+        --space-2: 8px;
+        --space-3: 12px;
+        --space-4: 16px;
+        --space-5: 24px;
+        --space-6: 32px;
+        --space-8: 64px;
+        --radius-sm: 6px;
+        --radius-md: 10px;
+        --duration: 150ms;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --color-bg: #15141b;
+          --color-surface: #1e1d26;
+          --color-border: #2c2b35;
+          --color-text: #f2efe6;
+          --color-text-muted: #a9a59b;
+          --color-accent: #e8a84a;
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        :root {
+          --duration: 0ms;
+        }
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: var(--color-bg);
+        color: var(--color-text);
+        font-family: var(--font-serif);
+        font-size: 16px;
+        line-height: 1.4;
+      }
+      main {
+        max-width: 720px;
+        margin: 0 auto;
+        padding: var(--space-8) var(--space-4);
+      }
+      header {
+        display: flex;
+        align-items: center;
+        gap: var(--space-3);
+        margin-bottom: var(--space-6);
+      }
+      header img {
+        width: 40px;
+        height: 40px;
+        border-radius: var(--radius-sm);
+      }
+      h1 {
+        font-size: 22px;
+        font-weight: 600;
+        line-height: 1.2;
+        margin: 0;
+      }
+      h2 {
+        font-size: 16px;
+        font-weight: 600;
+        line-height: 1.2;
+        margin: 0 0 var(--space-3);
+        padding-bottom: var(--space-2);
+        border-bottom: 1px solid var(--color-border);
+      }
+      section {
+        margin-bottom: var(--space-6);
+      }
+      p {
+        margin: 0 0 var(--space-3);
+      }
+      .muted {
+        color: var(--color-text-muted);
+      }
+      code,
+      pre {
+        font-family: var(--font-mono);
+        font-size: 14px;
+      }
+      pre {
+        margin: 0 0 var(--space-3);
+        padding: var(--space-3) var(--space-4);
+        background: var(--color-surface);
+        border: 1px solid var(--color-border);
+        border-radius: var(--radius-md);
+        overflow-x: auto;
+      }
+      a {
+        color: var(--color-accent);
+      }
+      .row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: var(--space-3);
+        align-items: center;
+        margin-bottom: var(--space-3);
+      }
+      .button {
+        display: inline-block;
+        padding: 8px 12px;
+        border: 1px solid var(--color-border);
+        border-radius: var(--radius-sm);
+        background: var(--color-surface);
+        color: var(--color-text);
+        font-family: var(--font-serif);
+        font-size: 14px;
+        text-decoration: none;
+        transition: border-color var(--duration) ease-out;
+      }
+      .button:hover {
+        border-color: var(--color-accent);
+      }
+      .button--primary {
+        background: var(--brand-amber);
+        border-color: var(--brand-amber);
+        color: var(--brand-ink);
+      }
+      .button:focus-visible,
+      a:focus-visible {
+        outline: 2px solid var(--color-accent);
+        outline-offset: 2px;
+      }
+      ul {
+        margin: 0 0 var(--space-3);
+        padding-left: var(--space-5);
+      }
+      footer {
+        margin-top: var(--space-8);
+        padding-top: var(--space-4);
+        border-top: 1px solid var(--color-border);
+        font-size: 14px;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <img src="/icon.svg" alt="" width="40" height="40" />
+        <h1>ObSink</h1>
+      </header>
+
+      <section>
+        <p>
+          ObSink keeps an Obsidian vault the same on every device you use, through a server that
+          only ever stores encrypted files. The key is derived from a passphrase you choose and
+          never leaves your devices; the server sees file sizes and timing, not notes, paths or
+          names. Conflicts are shown, not merged: you pick a side or keep both.
+        </p>
+        <p class="muted">
+          Accounts are invite-only. Ask someone who already uses this server for an invite code and
+          enter it the first time you sign in.
+        </p>
+      </section>
+
+      <section id="mac">
+        <h2>macOS</h2>
+        <p>A menu-bar app that watches the vault folder and syncs as you edit.</p>
+        <div class="row">
+          <a
+            class="button button--primary"
+            id="dmg"
+            href="https://github.com/spencerjireh/obsink/releases/latest"
+          >
+            Download for macOS
+          </a>
+          <span class="muted" id="version">Apple Silicon and Intel, one download.</span>
+        </div>
+        <p class="muted" id="checksum"></p>
+      </section>
+
+      <section id="cli">
+        <h2>Command line</h2>
+        <p>The same sync as a tool for scripts, servers and terminals.</p>
+        <pre><code>curl -fsSL https://obsink.spencerjireh.com/install.sh | sh</code></pre>
+        <p class="muted">
+          The script downloads the latest release, checks its SHA-256 and installs
+          <code>obsink</code> into <code>/usr/local/bin</code>. Or take the
+          <a id="cli-tar" href="https://github.com/spencerjireh/obsink/releases/latest">tarball</a>
+          yourself.
+        </p>
+      </section>
+
+      <section id="browser">
+        <h2>Browser</h2>
+        <p>
+          No install: <a href="/app/">open ObSink in the browser</a>, sign in and pick the vault
+          folder. It syncs while the tab is open. Chrome and Edge only, since the folder is read
+          through the File System Access API.
+        </p>
+      </section>
+
+      <section id="ios">
+        <h2>iOS</h2>
+        <p>
+          The iOS app puts the vault in the Files app for Obsidian to open. It is on TestFlight; ask
+          for an invite to the test group.
+        </p>
+      </section>
+
+      <section id="source">
+        <h2>Source and self-hosting</h2>
+        <p>
+          Everything is on <a href="https://github.com/spencerjireh/obsink">GitHub</a> under the MIT
+          license, including the server. Running your own is a <code>docker compose up</code> behind
+          a TLS proxy; see
+          <a href="https://github.com/spencerjireh/obsink/blob/main/docs/self-hosting.md"
+            >docs/self-hosting.md</a
+          >.
+        </p>
+      </section>
+
+      <footer class="muted">
+        The API this site talks to is <code>obsink-api.spencerjireh.com</code>.
+      </footer>
+    </main>
+
+    <script>
+      // Fill in the latest release: the DMG, its checksum and the CLI tarball.
+      // If GitHub cannot be reached the buttons keep pointing at the releases page.
+      fetch('https://api.github.com/repos/spencerjireh/obsink/releases/latest', {
+        headers: { Accept: 'application/vnd.github+json' },
+      })
+        .then((response) => (response.ok ? response.json() : null))
+        .then((release) => {
+          if (!release || !Array.isArray(release.assets)) return
+          const asset = (suffix) => release.assets.find((entry) => entry.name.endsWith(suffix))
+          const dmg = asset('-universal.dmg')
+          const sha = asset('-universal.dmg.sha256')
+          const tar = asset('-universal-apple-darwin.tar.gz')
+          if (dmg) {
+            document.getElementById('dmg').href = dmg.browser_download_url
+            document.getElementById('version').textContent =
+              `${release.tag_name} · Apple Silicon and Intel, one download.`
+          }
+          if (sha) {
+            const line = document.getElementById('checksum')
+            line.innerHTML = ''
+            const link = document.createElement('a')
+            link.href = sha.browser_download_url
+            link.textContent = 'SHA-256'
+            line.append('Checksum: ', link)
+          }
+          if (tar) document.getElementById('cli-tar').href = tar.browser_download_url
+        })
+        .catch(() => undefined)
+    </script>
+  </body>
+</html>

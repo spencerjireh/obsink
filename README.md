@@ -93,9 +93,23 @@ exponential backoff; HTTP status errors surface immediately as typed `ApiError`s
 | `web/` | Browser client at `/app` (Chrome, Edge): the same screens over a worker that syncs a local folder through the File System Access API |
 | `ios/`, `mobile/` | SwiftUI app + File Provider extension over the shared core |
 | `docker-compose.yml` | Local stack: server built from the checkout, Postgres, Mailpit |
-| `docker-compose.coolify.yml` | Production stack: server built from source by Coolify, Postgres |
+| `site/` | The landing page and `install.sh`, served by the `web` container next to the client |
+| `docker-compose.coolify.yml` | Production stack: server and website built from source by Coolify, Postgres |
 | `scripts/` | iOS build/release tooling and live verification harnesses |
 | `docs/` | Self-hosting, architecture, platform, troubleshooting |
+
+## Install
+
+The public server's site, [obsink.spencerjireh.com](https://obsink.spencerjireh.com), has the
+signed macOS app (universal DMG), the command line tool, the browser client at `/app` (Chrome,
+Edge) and the TestFlight note. The CLI installs with one line:
+
+```bash
+curl -fsSL https://obsink.spencerjireh.com/install.sh | sh
+```
+
+Accounts on that server are invite-only: ask an existing user for a code. The rest of this
+section builds the CLI from source against any server.
 
 ## Quickstart
 
@@ -160,8 +174,8 @@ clean for scripted parsing).
 
 ## Status
 
-The Rust core, CLI, server, and macOS desktop app are complete. iOS is in TestFlight; the
-on-device Files-app check is the open item. Task tracking lives in the Plane project `OBS`;
+The Rust core, CLI, server, macOS desktop app and browser client are complete. iOS is in
+TestFlight; the on-device Files-app check is the open item. Task tracking lives in the Plane project `OBS`;
 conventions are in [AGENTS.md](AGENTS.md).
 
 ## License

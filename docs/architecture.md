@@ -23,6 +23,8 @@ This document is for contributors. It describes how ObSink syncs a folder and wh
 
 The **Rust core** (`core/`) holds all the logic worth sharing across platforms. The server is deliberately thin: it treats paths and hashes as opaque strings and never decrypts vault content.
 
+The **web container** (`web/Dockerfile`, Caddy with `web/Caddyfile`) is the public site: the landing page and `install.sh` from `site/`, the browser client at `/app`, and a reverse proxy that forwards `/auth/*`, `/vaults/*`, `/healthz` and non-browser `GET /` to the server. It lets the browser client stay same-origin (no CORS on the server) and keeps the old API host answering for builds that bake it; the API itself has its own domain.
+
 The core is split along one seam: the modules that need no filesystem and no network (`crypto`, `manifest`, `ignore`, `sync_rules`, `pacing`, `server_url`, the data half of `hash_cache`) build for every target, wasm32 included; `sync_engine`, `hasher`, `api_client`, `auth`, `daemon` and `watcher` are native-only. `core-wasm/` wraps the portable half with wasm-bindgen (an opaque `VaultKeys` handle so key material stays in wasm memory; manifests, diffs and conflicts as JSON) for the browser client, whose sync driver is written in TypeScript against the same rules.
 
 ## The sync cycle

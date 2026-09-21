@@ -1,0 +1,47 @@
+# The website on the old API host. Traefik (Coolify) terminates TLS and
+# forwards plain HTTP here; the `server` container is the API.
+#
+#   /auth/*, /vaults, /vaults/*, /healthz  ->  server:8080   (also same-origin for /app)
+#   /                             ->  server:8080 for API clients (Accept: */*),
+#                                     the landing page for browsers (text/html)
+#   /app/*                        ->  the browser client (SPA)
+#   /install.sh, everything else  ->  the static site
+#
+# No request-body limit and no proxy timeouts: batch uploads are up to
+# 128 MiB and may take minutes.
+
+{
+	auto_https off
+}
+
+:80 {
+	encode gzip
+
+	@api path /auth/* /vaults /vaults/* /healthz
+	handle @api {
+		reverse_proxy server:8080 {
+			flush_interval -1
+		}
+	}
+
+	# Native clients probe GET / for the sign-in methods; browsers ask for HTML.
+	@probe {
+		path /
+		not header Accept *text/html*
+	}
+	handle @probe {
+		reverse_proxy server:8080
+	}
+
+	redir /app /app/ 301
+	handle_path /app/* {
+		root * /srv/app
+		try_files {path} /index.html
+		file_server
+	}
+
+	handle {
+		root * /srv/site
+		file_server
+	}
+}

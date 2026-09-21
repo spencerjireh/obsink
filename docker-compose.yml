@@ -38,6 +38,25 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # The website (landing page, browser client at /app, API proxy), as in
+  # production: http://localhost:8081/ is the page, curl gets the API probe.
+  web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+    image: obsink-web:dev
+    ports:
+      - "${OBSINK_WEB_PORT:-8081}:80"
+    depends_on:
+      server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
   postgres:
     image: postgres:16-alpine
     environment:
