@@ -174,6 +174,7 @@ impl TestEnv {
             api_key: bearer.to_string(),
             vault_id: vault_id.to_string(),
             local_path: String::new(),
+            ignore: Vec::new(),
         })
     }
 

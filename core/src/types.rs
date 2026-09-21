@@ -1,3 +1,4 @@
+use crate::ignore::IgnoreRules;
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -71,6 +72,16 @@ pub struct VaultConfig {
     pub api_key: String,
     pub vault_id: String,
     pub local_path: String,
+    /// Extra ignore patterns on top of [`crate::ignore::DEFAULT_IGNORE`].
+    #[serde(default)]
+    pub ignore: Vec<String>,
+}
+
+impl VaultConfig {
+    /// The built-in ignore rules plus this vault's extras.
+    pub fn ignore_rules(&self) -> IgnoreRules {
+        IgnoreRules::defaults().with_extra(self.ignore.iter().map(String::as_str))
+    }
 }
 
 impl std::fmt::Debug for VaultConfig {
@@ -80,6 +91,7 @@ impl std::fmt::Debug for VaultConfig {
             .field("api_key", &"..")
             .field("vault_id", &self.vault_id)
             .field("local_path", &self.local_path)
+            .field("ignore", &self.ignore)
             .finish()
     }
 }
@@ -145,6 +157,10 @@ pub enum ConflictResolutionChoice {
     KeepLocal,
     KeepRemote,
     KeepBoth,
+    /// Leave the conflict for the user: nothing is transferred, the path is
+    /// held back from the checkpoint and comes back on `SyncResult.conflicts`.
+    /// The daemon's answer to every conflict.
+    Defer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -191,6 +207,7 @@ mod tests {
             api_key: "secret-bearer-xyz".into(),
             vault_id: "vault_1".into(),
             local_path: "/tmp/v".into(),
+            ignore: Vec::new(),
         };
         let printed = format!("{config:?}");
         assert!(printed.contains("vault_1"));

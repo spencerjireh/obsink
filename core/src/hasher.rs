@@ -8,8 +8,8 @@ use thiserror::Error;
 use walkdir::WalkDir;
 
 use crate::crypto::{content_hmac, CryptoKeys, KeyBytes};
-use crate::fs_util::TEMP_SUFFIX;
 use crate::hash_cache::{HashCache, Stat};
+use crate::ignore::IgnoreRules;
 use crate::types::{FileEntry, Manifest};
 
 #[derive(Debug, Error)]
@@ -42,17 +42,24 @@ pub fn hash_file(mac_key: &KeyBytes, path: &Path) -> Result<String, HasherError>
 /// Every file is read and hashed. Callers that walk repeatedly use
 /// [`build_manifest_with_cache`].
 pub fn build_manifest_from_dir(root: &Path, keys: &CryptoKeys) -> Result<Manifest, HasherError> {
-    build_manifest_with_cache(root, keys, &mut HashCache::empty(keys))
+    build_manifest_with_cache(
+        root,
+        keys,
+        &mut HashCache::empty(keys),
+        &IgnoreRules::defaults(),
+    )
 }
 
-/// [`build_manifest_from_dir`] with a `(mtime, size)` memo: a file whose stat
-/// pair matches the cache keeps its memoized hash without being read. The
+/// [`build_manifest_from_dir`] with a `(mtime, size)` memo and a vault's
+/// ignore rules: a file whose stat pair matches the cache keeps its memoized
+/// hash without being read, and an ignored path is not walked at all. The
 /// cache is updated in place and pruned to the paths the walk saw; the
 /// caller decides whether to persist it.
 pub fn build_manifest_with_cache(
     root: &Path,
     keys: &CryptoKeys,
     cache: &mut HashCache,
+    ignore: &IgnoreRules,
 ) -> Result<Manifest, HasherError> {
     let mut manifest = Manifest::new();
     let mut seen = BTreeSet::new();
@@ -72,11 +79,8 @@ pub fn build_manifest_with_cache(
             })?;
         let relative_key = relative.to_string_lossy().replace('\\', "/");
 
-        if relative_key == ".obsink" || relative_key.starts_with(".obsink/") {
-            continue;
-        }
-        // A temp file left behind by an interrupted atomic write is not a note.
-        if relative_key.ends_with(TEMP_SUFFIX) {
+        // `.obsink/`, atomic-write temp files, workspace state, OS noise.
+        if ignore.is_ignored(&relative_key) {
             continue;
         }
 
@@ -121,6 +125,7 @@ mod tests {
     use crate::{
         crypto::{derive_key, derive_keys, CryptoKeys},
         hash_cache::{hash_cache_path, HashCache},
+        ignore::IgnoreRules,
     };
 
     fn test_keys() -> CryptoKeys {
@@ -195,9 +200,13 @@ mod tests {
 
         let cold = build_manifest_from_dir(dir.path(), &keys).unwrap();
         let mut cache = HashCache::empty(&keys);
-        let first = build_manifest_with_cache(dir.path(), &keys, &mut cache).unwrap();
+        let first =
+            build_manifest_with_cache(dir.path(), &keys, &mut cache, &IgnoreRules::defaults())
+                .unwrap();
         assert_eq!(cache.len(), 2);
-        let warm = build_manifest_with_cache(dir.path(), &keys, &mut cache).unwrap();
+        let warm =
+            build_manifest_with_cache(dir.path(), &keys, &mut cache, &IgnoreRules::defaults())
+                .unwrap();
         assert_eq!(cold, first);
         assert_eq!(cold, warm);
     }
@@ -214,7 +223,9 @@ mod tests {
         let original_mtime = fs::metadata(&note).unwrap().modified().unwrap();
 
         let mut cache = HashCache::empty(&keys);
-        let before = build_manifest_with_cache(dir.path(), &keys, &mut cache).unwrap();
+        let before =
+            build_manifest_with_cache(dir.path(), &keys, &mut cache, &IgnoreRules::defaults())
+                .unwrap();
         assert_eq!(
             before["note.md"].hash,
             hash_bytes(&keys.content_mac, b"aaaa")
@@ -227,7 +238,9 @@ mod tests {
             .unwrap()
             .set_modified(original_mtime)
             .unwrap();
-        let stale = build_manifest_with_cache(dir.path(), &keys, &mut cache).unwrap();
+        let stale =
+            build_manifest_with_cache(dir.path(), &keys, &mut cache, &IgnoreRules::defaults())
+                .unwrap();
         assert_eq!(
             stale["note.md"].hash, before["note.md"].hash,
             "served from the memo"
@@ -240,7 +253,9 @@ mod tests {
             .unwrap()
             .set_modified(later)
             .unwrap();
-        let fresh = build_manifest_with_cache(dir.path(), &keys, &mut cache).unwrap();
+        let fresh =
+            build_manifest_with_cache(dir.path(), &keys, &mut cache, &IgnoreRules::defaults())
+                .unwrap();
         assert_eq!(
             fresh["note.md"].hash,
             hash_bytes(&keys.content_mac, b"bbbb")
@@ -254,11 +269,13 @@ mod tests {
         fs::write(dir.path().join("a.md"), "one").unwrap();
         fs::write(dir.path().join("b.md"), "two").unwrap();
         let mut cache = HashCache::empty(&keys);
-        build_manifest_with_cache(dir.path(), &keys, &mut cache).unwrap();
+        build_manifest_with_cache(dir.path(), &keys, &mut cache, &IgnoreRules::defaults()).unwrap();
 
         fs::write(dir.path().join("a.md"), "one more byte").unwrap();
         fs::remove_file(dir.path().join("b.md")).unwrap();
-        let manifest = build_manifest_with_cache(dir.path(), &keys, &mut cache).unwrap();
+        let manifest =
+            build_manifest_with_cache(dir.path(), &keys, &mut cache, &IgnoreRules::defaults())
+                .unwrap();
         assert_eq!(
             manifest["a.md"].hash,
             hash_bytes(&keys.content_mac, b"one more byte")
@@ -273,7 +290,7 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("a.md"), "one").unwrap();
         let mut cache = HashCache::empty(&keys);
-        build_manifest_with_cache(dir.path(), &keys, &mut cache).unwrap();
+        build_manifest_with_cache(dir.path(), &keys, &mut cache, &IgnoreRules::defaults()).unwrap();
         cache.save(dir.path()).unwrap();
         assert!(hash_cache_path(dir.path()).starts_with(dir.path().join(".obsink")));
 
@@ -306,14 +323,14 @@ mod tests {
 
         let mut cache = HashCache::empty(&keys);
         let started = std::time::Instant::now();
-        build_manifest_with_cache(dir.path(), &keys, &mut cache).unwrap();
+        build_manifest_with_cache(dir.path(), &keys, &mut cache, &IgnoreRules::defaults()).unwrap();
         let cold = started.elapsed();
         let started = std::time::Instant::now();
-        build_manifest_with_cache(dir.path(), &keys, &mut cache).unwrap();
+        build_manifest_with_cache(dir.path(), &keys, &mut cache, &IgnoreRules::defaults()).unwrap();
         let warm = started.elapsed();
         fs::write(dir.path().join("folder0/note0.md"), "edited").unwrap();
         let started = std::time::Instant::now();
-        build_manifest_with_cache(dir.path(), &keys, &mut cache).unwrap();
+        build_manifest_with_cache(dir.path(), &keys, &mut cache, &IgnoreRules::defaults()).unwrap();
         let one_edit = started.elapsed();
         println!("cold {cold:?}  warm {warm:?}  one edit {one_edit:?}");
         assert!(warm < cold);

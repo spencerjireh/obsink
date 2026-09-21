@@ -468,6 +468,7 @@ mod tests {
             api_key: "secret-bearer-xyz".into(),
             vault_id: "vault_1".into(),
             local_path: "/tmp/v".into(),
+            ignore: Vec::new(),
         });
         let printed = format!("{client:?}");
         assert!(printed.contains("vault_1"));
@@ -486,6 +487,7 @@ mod tests {
             api_key: "token".to_string(),
             vault_id: "vault_123".to_string(),
             local_path: ".".to_string(),
+            ignore: Vec::new(),
         }
     }
 
