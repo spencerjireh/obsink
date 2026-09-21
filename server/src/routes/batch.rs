@@ -47,20 +47,44 @@ fn multipart_error(error: MultipartError) -> ApiError {
     }
 }
 
+/// One validated operation: the action is known, a put has its bytes, a
+/// delete has none.
+struct ParsedOp {
+    path: String,
+    parent_hash: Option<String>,
+    kind: OpKind,
+}
+
+enum OpKind {
+    Put {
+        content_hash: Option<String>,
+        enc_path: Option<String>,
+        content: Bytes,
+    },
+    Delete,
+}
+
 pub async fn batch(
     State(state): State<AppState>,
     principal: Principal,
     Path(vault_id): Path<String>,
     multipart: Result<Multipart, MultipartRejection>,
 ) -> Result<Json<BatchResponse>, ApiError> {
-    let mut multipart = multipart.map_err(|rejection| match rejection {
+    let multipart = multipart.map_err(|rejection| match rejection {
         MultipartRejection::InvalidBoundary(_) => ApiError::status(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "batch requires multipart/form-data",
         ),
         _ => ApiError::bad_request("malformed multipart body"),
     })?;
+    let ops = parse_batch(multipart).await?;
+    let results = apply_operations(&state, &principal, &vault_id, ops).await?;
+    Ok(Json(BatchResponse { results }))
+}
 
+/// Read the parts, decode the operations JSON and check the whole request
+/// before anything is applied: an invalid batch changes nothing.
+async fn parse_batch(mut multipart: Multipart) -> Result<Vec<ParsedOp>, ApiError> {
     let mut operations: Option<String> = None;
     let mut contents: HashMap<usize, Bytes> = HashMap::new();
     while let Some(field) = multipart.next_field().await.map_err(multipart_error)? {
@@ -105,66 +129,85 @@ pub async fn batch(
         })
         .collect::<Result<_, _>>()?;
 
-    for (index, op) in ops.iter().enumerate() {
-        // Only the two documented actions; anything else must not fall
-        // through to the delete branch.
-        let is_put = match op.action.as_deref() {
-            Some("put") => true,
-            Some("delete") => false,
-            other => {
-                return Err(ApiError::bad_request(format!(
-                    "operation {index}: unknown action {:?}",
-                    other.unwrap_or("")
-                )))
-            }
-        };
-        if is_put && !contents.contains_key(&index) {
-            return Err(ApiError::bad_request(format!(
-                "missing content part for operation {index}"
-            )));
-        }
-        if !is_put && contents.contains_key(&index) {
-            return Err(ApiError::bad_request(format!(
-                "operation {index} is not a put but has a content part"
-            )));
-        }
-    }
     if let Some(stray) = contents.keys().find(|index| **index >= ops.len()) {
         return Err(ApiError::bad_request(format!(
             "content part {stray} has no operation"
         )));
     }
-
-    let mut results = Vec::with_capacity(ops.len());
-    for (index, op) in ops.iter().enumerate() {
-        let path = op.path.clone().unwrap_or_default();
-        let outcome = if op.action.as_deref() == Some("put") {
-            apply_put(
-                &state,
-                &principal,
-                PutParams {
-                    vault_id: &vault_id,
-                    path: &path,
-                    parent_hash: Some(op.parent_hash.as_deref().unwrap_or("")),
-                    content_hash: op.content_hash.as_deref(),
-                    enc_path: op.enc_path.as_deref(),
+    ops.into_iter()
+        .enumerate()
+        .map(|(index, op)| {
+            // Only the two documented actions; anything else must not fall
+            // through to the delete branch.
+            let kind = match op.action.as_deref() {
+                Some("put") => OpKind::Put {
+                    content_hash: op.content_hash,
+                    enc_path: op.enc_path,
+                    content: contents.remove(&index).ok_or_else(|| {
+                        ApiError::bad_request(format!("missing content part for operation {index}"))
+                    })?,
                 },
-                &contents[&index],
-            )
-            .await
-        } else {
-            apply_delete(
-                &state,
-                &principal,
-                &vault_id,
-                &path,
-                Some(op.parent_hash.as_deref().unwrap_or("")),
-            )
-            .await
+                Some("delete") => {
+                    if contents.contains_key(&index) {
+                        return Err(ApiError::bad_request(format!(
+                            "operation {index} is not a put but has a content part"
+                        )));
+                    }
+                    OpKind::Delete
+                }
+                other => {
+                    return Err(ApiError::bad_request(format!(
+                        "operation {index}: unknown action {:?}",
+                        other.unwrap_or("")
+                    )))
+                }
+            };
+            Ok(ParsedOp {
+                path: op.path.unwrap_or_default(),
+                parent_hash: op.parent_hash,
+                kind,
+            })
+        })
+        .collect()
+}
+
+/// Run the operations in order, each in its own transaction, and map every
+/// outcome to a per-operation status; only an internal error fails the
+/// whole request.
+async fn apply_operations(
+    state: &AppState,
+    principal: &Principal,
+    vault_id: &str,
+    ops: Vec<ParsedOp>,
+) -> Result<Vec<BatchOperationResult>, ApiError> {
+    let mut results = Vec::with_capacity(ops.len());
+    for op in ops {
+        let parent_hash = Some(op.parent_hash.as_deref().unwrap_or(""));
+        let outcome = match &op.kind {
+            OpKind::Put {
+                content_hash,
+                enc_path,
+                content,
+            } => {
+                apply_put(
+                    state,
+                    principal,
+                    PutParams {
+                        vault_id,
+                        path: &op.path,
+                        parent_hash,
+                        content_hash: content_hash.as_deref(),
+                        enc_path: enc_path.as_deref(),
+                    },
+                    content,
+                )
+                .await
+            }
+            OpKind::Delete => apply_delete(state, principal, vault_id, &op.path, parent_hash).await,
         };
         let result = match outcome {
             Ok(()) => BatchOperationResult {
-                path,
+                path: op.path,
                 status: 200,
                 conflict: None,
             },
@@ -174,7 +217,7 @@ pub async fn batch(
                 conflict: Some(ServerConflict { path, current }),
             },
             Err(ApiError::Status(code, _)) => BatchOperationResult {
-                path,
+                path: op.path,
                 status: code.as_u16(),
                 conflict: None,
             },
@@ -182,5 +225,5 @@ pub async fn batch(
         };
         results.push(result);
     }
-    Ok(Json(BatchResponse { results }))
+    Ok(results)
 }
