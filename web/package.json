@@ -1,7 +1,7 @@
 {
   "name": "obsink-web",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "ObSink in the browser: the shared screens over a worker that syncs a local folder through the File System Access API",
   "scripts": {
