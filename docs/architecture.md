@@ -22,6 +22,8 @@ This document is for contributors. It describes how ObSink syncs a folder and wh
 
 The **Rust core** (`core/`) holds all the logic worth sharing across platforms. The server is deliberately thin: it treats paths and hashes as opaque strings and never decrypts vault content.
 
+The core is split along one seam: the modules that need no filesystem and no network (`crypto`, `manifest`, `ignore`, `sync_rules`, `pacing`, `server_url`, the data half of `hash_cache`) build for every target, wasm32 included; `sync_engine`, `hasher`, `api_client`, `auth`, `daemon` and `watcher` are native-only. `core-wasm/` wraps the portable half with wasm-bindgen (an opaque `VaultKeys` handle so key material stays in wasm memory; manifests, diffs and conflicts as JSON) for the browser client, whose sync driver is written in TypeScript against the same rules.
+
 ## The sync cycle
 
 `prepare_sync` → (resolve conflicts) → `complete_sync`:
@@ -130,5 +132,6 @@ The retention task (`server/src/retention.rs`) runs at startup and every `RETENT
 ## Testing
 
 - `core/` — unit tests for crypto (round-trips, sub-key separation, HMAC, path tokens), hashing, manifest diffing, the ETag cache, multipart batch encoding, and async sync flows against a mock HTTP server (`httpmock`).
+- `core-wasm/` — the bindings run natively under `cargo test` (JSON shapes, key handle round-trips against the native derivation) and inside a wasm runtime with `wasm-pack test --node --release` (the `web` CI job).
 - `server/` — unit tests for the envelope, key loading, and blob paths; integration tests (`server/tests/`) spin up the real router on a throwaway Postgres database per test and drive it with `reqwest` and the core `ApiClient`/`AuthClient`. They need `DATABASE_URL` and skip without it; CI sets `OBSINK_TEST_REQUIRE_DB=1`.
 - `scripts/verify-server-deploy.sh` (curl contract check) and `scripts/verify-cli-deployed-sync.sh` (two CLI devices) — live checks against a running server; `scripts/verify-ios-sim-e2e.sh` drives the iOS simulator against the same server.

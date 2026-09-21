@@ -84,7 +84,8 @@ exponential backoff; HTTP status errors surface immediately as typed `ApiError`s
 
 | Path | Contents |
 |---|---|
-| `core/` | Sync engine: `crypto`, `hasher`, `manifest`, `sync_engine`, `api_client`, `auth`, `types` |
+| `core/` | Sync engine: `crypto`, `hasher`, `manifest`, `sync_engine`, `api_client`, `auth`, `types`; the pure modules also build for wasm32 |
+| `core-wasm/` | wasm-bindgen bindings over the pure core (keys, diff, rules) for the browser client |
 | `cli/` | `obsink` CLI — the reference client |
 | `server/` | `obsink-server` (axum): accounts, invites, vaults, files, batch, retention; Dockerfile |
 | `desktop/` | Tauri v2 + React app (menu-bar on macOS) |
