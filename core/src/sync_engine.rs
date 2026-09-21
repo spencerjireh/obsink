@@ -44,6 +44,22 @@ pub enum SyncEngineError {
     Crypto(#[from] CryptoError),
     #[error("missing resolution for conflict at {0}")]
     MissingResolution(String),
+    #[error("blocking task failed: {0}")]
+    Blocking(#[from] tokio::task::JoinError),
+}
+
+/// Run filesystem or CPU-bound work on tokio's blocking pool. Every
+/// `std::fs` touch in this module goes through here so an `fsync` or a full
+/// vault walk never parks a reactor thread that in-flight HTTP futures need
+/// (the timeouts in `api_client` would otherwise measure scheduler latency).
+/// The closure owns its inputs; `std::fs` stays inside it rather than
+/// switching to `tokio::fs`, which is a `spawn_blocking` per call.
+async fn blocking<T, F>(f: F) -> Result<T, SyncEngineError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, SyncEngineError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(f).await?
 }
 
 pub fn load_manifest_from_disk(path: &Path) -> Result<Manifest, SyncEngineError> {
@@ -101,7 +117,11 @@ pub async fn fetch_remote_manifest(
     local_root: &Path,
     keys: &CryptoKeys,
 ) -> Result<Manifest, SyncEngineError> {
-    let cached = load_remote_cache(local_root).filter(|cache| cache.etag.is_some());
+    let cached = {
+        let root = local_root.to_path_buf();
+        blocking(move || Ok(load_remote_cache(&root))).await?
+    }
+    .filter(|cache| cache.etag.is_some());
     let etag = cached.as_ref().and_then(|cache| cache.etag.as_deref());
     match client.get_manifest_if_changed(keys, etag).await? {
         ManifestFetch::NotModified => match cached {
@@ -115,13 +135,12 @@ pub async fn fetch_remote_manifest(
         },
         ManifestFetch::Modified { manifest, etag } => {
             if etag.is_some() {
-                if let Err(error) = save_remote_cache(
-                    local_root,
-                    &RemoteManifestCache {
-                        etag,
-                        manifest: manifest.clone(),
-                    },
-                ) {
+                let root = local_root.to_path_buf();
+                let cache = RemoteManifestCache {
+                    etag,
+                    manifest: manifest.clone(),
+                };
+                if let Err(error) = blocking(move || save_remote_cache(&root, &cache)).await {
                     tracing::warn!(%error, "could not write the remote manifest cache");
                 }
             }
@@ -161,7 +180,11 @@ pub async fn prepare_sync(
     let keys = derive_keys(key);
     let client = ApiClient::new(config.clone());
     let local_root = Path::new(&config.local_path);
-    let local_state = load_local_state(local_root, &keys)?;
+    let local_state = {
+        let root = local_root.to_path_buf();
+        let keys = keys.clone();
+        blocking(move || load_local_state(&root, &keys)).await?
+    };
     let remote_manifest = fetch_remote_manifest(&client, local_root, &keys).await?;
     let diff = diff_manifests(&local_state.base, &local_state.working, &remote_manifest);
 
@@ -243,11 +266,12 @@ pub async fn complete_sync(
                     bytes,
                 });
                 pending_uploads.push(conflict_to_upload(conflict));
-                pending_uploads.push(build_upload_action_for_path(
-                    local_root,
-                    &duplicate_path,
-                    &keys,
-                )?);
+                pending_uploads.push({
+                    let root = local_root.to_path_buf();
+                    let keys = keys.clone();
+                    blocking(move || build_upload_action_for_path(&root, &duplicate_path, &keys))
+                        .await?
+                });
             }
         }
     }
@@ -349,9 +373,13 @@ pub async fn complete_sync(
         match fetch_remote_manifest(&client, local_root, &keys).await {
             Ok(remote_manifest) => {
                 let manifest_path = sync_manifest_path(local_root);
-                let previous_base = load_manifest_from_disk(&manifest_path)?;
-                let next = checkpoint_manifest(&previous_base, &remote_manifest, &hold_back);
-                save_manifest_to_disk(&manifest_path, &next)?;
+                let hold_back = hold_back.clone();
+                blocking(move || {
+                    let previous_base = load_manifest_from_disk(&manifest_path)?;
+                    let next = checkpoint_manifest(&previous_base, &remote_manifest, &hold_back);
+                    save_manifest_to_disk(&manifest_path, &next)
+                })
+                .await?;
             }
             Err(error) => {
                 failures.push(SyncFailure {
@@ -440,9 +468,7 @@ async fn apply_downloads(
                 });
                 let outcome = async {
                     let blob = client.get_file(&action.path, keys).await?;
-                    let plaintext = decrypt(&keys.content_enc, &blob)?;
-                    write_local_file(local_root, &action.path, &plaintext)?;
-                    Ok::<usize, SyncEngineError>(plaintext.len())
+                    decrypt_and_write(local_root, &action.path, keys, blob).await
                 }
                 .await;
                 match outcome {
@@ -470,7 +496,7 @@ async fn apply_downloads(
                 }
             }
             SyncActionKind::DeleteLocal => {
-                if let Err(error) = delete_local_file(local_root, &action.path) {
+                if let Err(error) = delete_local_file(local_root, &action.path).await {
                     failures.push(SyncFailure {
                         path: action.path.clone(),
                         kind: SyncActionKind::DeleteLocal,
@@ -528,13 +554,12 @@ async fn apply_keep_remote(
     conflict: &Conflict,
 ) -> Result<u64, SyncEngineError> {
     if conflict.remote.deleted {
-        delete_local_file(local_root, &conflict.path)?;
+        delete_local_file(local_root, &conflict.path).await?;
         Ok(0)
     } else {
         let blob = client.get_file(&conflict.path, keys).await?;
-        let plaintext = decrypt(&keys.content_enc, &blob)?;
-        write_local_file(local_root, &conflict.path, &plaintext)?;
-        Ok(plaintext.len() as u64)
+        let len = decrypt_and_write(local_root, &conflict.path, keys, blob).await?;
+        Ok(len as u64)
     }
 }
 
@@ -551,9 +576,8 @@ async fn write_conflict_copy(
 
     let duplicate_path = conflict_copy_path(&conflict.path);
     let blob = client.get_file(&conflict.path, keys).await?;
-    let plaintext = decrypt(&keys.content_enc, &blob)?;
-    write_local_file(local_root, &duplicate_path, &plaintext)?;
-    Ok((duplicate_path, plaintext.len() as u64))
+    let len = decrypt_and_write(local_root, &duplicate_path, keys, blob).await?;
+    Ok((duplicate_path, len as u64))
 }
 
 async fn apply_upload(
@@ -564,9 +588,15 @@ async fn apply_upload(
 ) -> Result<(), SyncEngineError> {
     match action.kind {
         SyncActionKind::Upload => {
-            let path = local_root.join(&action.path);
-            let plaintext = fs::read(path)?;
-            let ciphertext = encrypt(&keys.content_enc, &plaintext)?;
+            let ciphertext = {
+                let path = local_root.join(&action.path);
+                let content_enc = keys.content_enc;
+                blocking(move || {
+                    let plaintext = fs::read(path)?;
+                    Ok(encrypt(&content_enc, &plaintext)?)
+                })
+                .await?
+            };
             client
                 .put_file(
                     &action.path,
@@ -637,25 +667,36 @@ fn conflict_to_upload(conflict: &Conflict) -> SyncAction {
     }
 }
 
-fn write_local_file(
+/// Decrypt a downloaded blob and write it atomically, off the async runtime.
+/// Returns the plaintext length.
+async fn decrypt_and_write(
     local_root: &Path,
     relative_path: &str,
-    contents: &[u8],
-) -> Result<(), SyncEngineError> {
+    keys: &CryptoKeys,
+    blob: Vec<u8>,
+) -> Result<usize, SyncEngineError> {
     let path = local_root.join(relative_path);
-    write_atomic(&path, contents)?;
-    Ok(())
+    let content_enc = keys.content_enc;
+    blocking(move || {
+        let plaintext = decrypt(&content_enc, &blob)?;
+        write_atomic(&path, &plaintext)?;
+        Ok(plaintext.len())
+    })
+    .await
 }
 
-fn delete_local_file(local_root: &Path, relative_path: &str) -> Result<(), SyncEngineError> {
-    let path = local_root.join(relative_path);
-    if !path.exists() {
-        return Ok(());
-    }
-
-    fs::remove_file(&path)?;
-    cleanup_empty_dirs(local_root, path.parent());
-    Ok(())
+async fn delete_local_file(local_root: &Path, relative_path: &str) -> Result<(), SyncEngineError> {
+    let root = local_root.to_path_buf();
+    let path = root.join(relative_path);
+    blocking(move || {
+        if !path.exists() {
+            return Ok(());
+        }
+        fs::remove_file(&path)?;
+        cleanup_empty_dirs(&root, path.parent());
+        Ok(())
+    })
+    .await
 }
 
 fn cleanup_empty_dirs(local_root: &Path, mut current: Option<&Path>) {
