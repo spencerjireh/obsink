@@ -3,7 +3,7 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     process::Command,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant, UNIX_EPOCH},
 };
 
@@ -15,11 +15,13 @@ use tauri::{
 };
 
 use obsink_core::{
-    complete_sync, derive_key, derive_keys, diff_local_and_remote, fetch_remote_manifest,
+    complete_sync, daemon_channel, derive_key, derive_keys, diff_local_and_remote,
+    fetch_remote_manifest,
     keychain::{delete_secret, load_secret, save_secret},
-    load_local_state, normalize_server_url, prepare_sync, write_atomic, ApiClient, ApiError,
-    AuthClient, AuthError, Conflict, ConflictResolution, CreateVaultRequest, KeyBytes,
-    ProgressEvent, ProgressSink, SyncEngineError, SyncPlan, SyncResult, VaultConfig, VaultSummary,
+    load_local_state, normalize_server_url, prepare_sync, run_daemon, write_atomic, ApiClient,
+    ApiError, AuthClient, AuthError, Conflict, ConflictResolution, CreateVaultRequest,
+    DaemonCallError, DaemonEvent, DaemonHandle, DaemonOptions, KeyBytes, ProgressEvent,
+    ProgressSink, SyncEngineError, SyncPlan, SyncResult, VaultConfig, VaultSummary,
 };
 use serde::{Deserialize, Serialize};
 
@@ -38,6 +40,131 @@ struct AppState {
     /// When the popover last hid itself on focus loss. The tray click that
     /// closes it fires that first, so the click must not reopen it.
     popover_hidden_at: Mutex<Option<Instant>>,
+    /// The running daemon per vault. A vault with a daemon syncs through it
+    /// (`Sync now` and resolutions are commands to it), so no two cycles
+    /// can overlap.
+    daemons: Mutex<HashMap<String, DaemonHandle>>,
+}
+
+fn daemon_handle(state: &AppState, vault_id: &str) -> Option<DaemonHandle> {
+    state
+        .daemons
+        .lock()
+        .ok()
+        .and_then(|daemons| daemons.get(vault_id).cloned())
+}
+
+/// Start daemons for every vault that can sync (on this server, key in the
+/// keychain, signed in) and stop the ones whose vault no longer can. Called
+/// at launch and after anything that changes that set.
+fn reconcile_daemons(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let config = match load_app_config() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("daemons not started: {error}");
+            return;
+        }
+    };
+    let wanted: HashMap<String, StoredVault> = config
+        .vaults
+        .into_iter()
+        .filter(|vault| {
+            !is_foreign(vault)
+                && load_key_from_keychain(&vault.id).is_ok()
+                && load_bearer(&vault.server_url).is_ok()
+        })
+        .map(|vault| (vault.id.clone(), vault))
+        .collect();
+    let Ok(mut daemons) = state.daemons.lock() else {
+        return;
+    };
+    let stale: Vec<String> = daemons
+        .keys()
+        .filter(|id| !wanted.contains_key(*id))
+        .cloned()
+        .collect();
+    for id in stale {
+        if let Some(handle) = daemons.remove(&id) {
+            handle.stop();
+        }
+    }
+    for (id, vault) in wanted {
+        if daemons.contains_key(&id) {
+            continue;
+        }
+        let Ok(key) = load_key_from_keychain(&id) else {
+            continue;
+        };
+        let (handle, commands) = daemon_channel();
+        let (events_tx, events_rx) = tokio::sync::mpsc::channel(32);
+        let sink = TauriProgressSink {
+            app: app.clone(),
+            vault_id: id.clone(),
+        };
+        tauri::async_runtime::spawn(run_daemon(
+            to_vault_config(&vault),
+            key,
+            DaemonOptions::default(),
+            commands,
+            events_tx,
+            Arc::new(sink),
+        ));
+        tauri::async_runtime::spawn(relay_daemon_events(app.clone(), id.clone(), events_rx));
+        daemons.insert(id, handle);
+    }
+}
+
+/// Mirror a daemon's events into the state the popover reads: `in_flight`
+/// while a cycle runs (`Syncing…`), `pending_plans` for conflicts the user
+/// has to resolve, the activity log, and a `state://changed` per event.
+async fn relay_daemon_events(
+    app: AppHandle,
+    vault_id: String,
+    mut events: tokio::sync::mpsc::Receiver<DaemonEvent>,
+) {
+    let state = app.state::<AppState>();
+    while let Some(event) = events.recv().await {
+        match event {
+            DaemonEvent::Started => continue,
+            DaemonEvent::SyncStarted => {
+                if let Ok(mut in_flight) = state.in_flight.lock() {
+                    in_flight.insert(vault_id.clone());
+                }
+            }
+            DaemonEvent::SyncFinished(result) => {
+                if let Ok(mut in_flight) = state.in_flight.lock() {
+                    in_flight.remove(&vault_id);
+                }
+                let _ = set_pending_plan(&state, &vault_id, SyncPlan::from_late_conflicts(&result));
+                if let Err(io_error) = activity::record_sync(&vault_id, &result) {
+                    eprintln!("activity log for {vault_id} not written: {io_error}");
+                }
+            }
+            DaemonEvent::ConflictsPending { plan } => {
+                let _ = set_pending_plan(&state, &vault_id, Some(plan));
+            }
+            DaemonEvent::Failed { message, .. } => {
+                if let Ok(mut in_flight) = state.in_flight.lock() {
+                    in_flight.remove(&vault_id);
+                }
+                if let Err(io_error) = activity::record_error(&vault_id, &message) {
+                    eprintln!("activity log for {vault_id} not written: {io_error}");
+                }
+            }
+            DaemonEvent::Stopped => {
+                if let Ok(mut in_flight) = state.in_flight.lock() {
+                    in_flight.remove(&vault_id);
+                }
+                if let Ok(mut daemons) = state.daemons.lock() {
+                    daemons.remove(&vault_id);
+                }
+                emit_state_changed(&app, Some(&vault_id));
+                break;
+            }
+        }
+        emit_state_changed(&app, Some(&vault_id));
+    }
 }
 
 /// Marks a vault as busy for the guard's lifetime.
@@ -130,6 +257,9 @@ struct StoredVault {
     name: String,
     server_url: String,
     local_path: String,
+    /// Extra ignore patterns for this vault, on top of the built-in defaults.
+    #[serde(default)]
+    ignore: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -310,6 +440,7 @@ async fn auth_email_verify(
     app: AppHandle,
 ) -> Result<AccountState, CommandError> {
     let result = auth_email_verify_inner(email, code, invite_code).await;
+    reconcile_daemons(&app);
     emit_state_changed(&app, None);
     result
 }
@@ -427,6 +558,7 @@ async fn revoke_session(session_id: String) -> Result<AccountState, CommandError
 #[tauri::command]
 async fn sign_out(app: AppHandle) -> Result<(), CommandError> {
     let result = sign_out_inner().await;
+    reconcile_daemons(&app);
     emit_state_changed(&app, None);
     result
 }
@@ -448,6 +580,7 @@ async fn sign_out_inner() -> Result<(), CommandError> {
 #[tauri::command]
 async fn delete_account(app: AppHandle) -> Result<(), CommandError> {
     let result = delete_account_inner().await;
+    reconcile_daemons(&app);
     emit_state_changed(&app, None);
     result
 }
@@ -475,6 +608,7 @@ async fn list_remote_vaults() -> Result<Vec<VaultSummary>, CommandError> {
         api_key: bearer,
         vault_id: String::new(),
         local_path: String::new(),
+        ignore: Vec::new(),
     });
     bearer_call(&server_url, client.list_vaults()).await
 }
@@ -576,6 +710,7 @@ fn remove_vault(
     app: AppHandle,
 ) -> Result<(), CommandError> {
     let result = remove_vault_inner(&vault_id, &state);
+    reconcile_daemons(&app);
     emit_state_changed(&app, Some(&vault_id));
     result
 }
@@ -602,6 +737,7 @@ async fn delete_remote_vault(
     app: AppHandle,
 ) -> Result<(), CommandError> {
     let result = delete_remote_vault_inner(&vault_id, &state).await;
+    reconcile_daemons(&app);
     emit_state_changed(&app, Some(&vault_id));
     result
 }
@@ -612,6 +748,7 @@ async fn add_vault(
     app: AppHandle,
 ) -> Result<LocalVaultSummary, CommandError> {
     let result = add_vault_inner(request).await;
+    reconcile_daemons(&app);
     emit_state_changed(&app, result.as_ref().ok().map(|vault| vault.id.as_str()));
     result
 }
@@ -626,6 +763,7 @@ async fn add_vault_inner(request: AddVaultRequest) -> Result<LocalVaultSummary, 
         api_key: bearer,
         vault_id: String::new(),
         local_path: request.local_path.clone(),
+        ignore: Vec::new(),
     });
 
     let (vault_id, vault_name) = match request.mode {
@@ -656,6 +794,7 @@ async fn add_vault_inner(request: AddVaultRequest) -> Result<LocalVaultSummary, 
         name: vault_name.clone(),
         server_url,
         local_path: request.local_path.clone(),
+        ignore: Vec::new(),
     };
 
     validate_passphrase(&stored, &key).await?;
@@ -669,23 +808,27 @@ async fn add_vault_inner(request: AddVaultRequest) -> Result<LocalVaultSummary, 
 async fn vault_diff(vault: &StoredVault) -> Result<SyncResult, CommandError> {
     let keys = derive_keys(&load_key_from_keychain(&vault.id)?);
     let local_root = Path::new(&vault.local_path);
+    let config = to_vault_config(vault);
+    let ignore = config.ignore_rules();
     // The walk hashes every file; keep it off the async runtime.
     let local = {
         let root = local_root.to_path_buf();
         let keys = keys.clone();
-        tauri::async_runtime::spawn_blocking(move || load_local_state(&root, &keys))
+        let ignore = ignore.clone();
+        tauri::async_runtime::spawn_blocking(move || load_local_state(&root, &keys, &ignore))
             .await
             .map_err(|error| CommandError::other(error.to_string()))??
     };
     let remote_manifest = bearer_call(
         &vault.server_url,
-        fetch_remote_manifest(&ApiClient::new(to_vault_config(vault)), local_root, &keys),
+        fetch_remote_manifest(&ApiClient::new(config), local_root, &keys),
     )
     .await?;
     Ok(diff_local_and_remote(
         &local.base,
         &local.working,
         &remote_manifest,
+        &ignore,
     ))
 }
 
@@ -787,6 +930,15 @@ async fn sync_vault_inner(
     progress: &dyn ProgressSink,
 ) -> Result<SyncCommandResponse, CommandError> {
     let vault = own_vault(vault_id)?;
+    // A vault with a daemon syncs through it: the daemon serialises cycles
+    // and its event relay keeps the state and the activity log.
+    if let Some(handle) = daemon_handle(state, &vault.id) {
+        let result = bearer_call(&vault.server_url, handle.sync_and_wait()).await?;
+        return Ok(SyncCommandResponse {
+            pending_conflicts: result.conflicts.clone(),
+            completed_result: Some(result),
+        });
+    }
     let result = run_sync(&vault, state, progress).await;
     note_failure(&vault.id, &result);
     result
@@ -897,6 +1049,13 @@ async fn resolve_conflict_inner(
     progress: &dyn ProgressSink,
 ) -> Result<SyncCommandResponse, CommandError> {
     let vault = own_vault(Some(vault_id))?;
+    if let Some(handle) = daemon_handle(state, &vault.id) {
+        let result = bearer_call(&vault.server_url, handle.resolve(resolutions)).await?;
+        return Ok(SyncCommandResponse {
+            pending_conflicts: result.conflicts.clone(),
+            completed_result: Some(result),
+        });
+    }
     let result = run_resolve(&vault, resolutions, state, progress).await;
     note_failure(&vault.id, &result);
     result
@@ -1056,6 +1215,7 @@ fn to_vault_config(vault: &StoredVault) -> VaultConfig {
         api_key: load_secret(&bearer_account(&vault.server_url)).unwrap_or_default(),
         vault_id: vault.id.clone(),
         local_path: vault.local_path.clone(),
+        ignore: vault.ignore.clone(),
     }
 }
 
@@ -1284,6 +1444,15 @@ impl From<SyncEngineError> for CommandError {
         match error {
             SyncEngineError::Api(error) => error.into(),
             other => Self::other(other.to_string()),
+        }
+    }
+}
+
+impl From<DaemonCallError> for CommandError {
+    fn from(error: DaemonCallError) -> Self {
+        match error {
+            DaemonCallError::Sync(error) => error.into(),
+            DaemonCallError::Stopped => Self::other(error.to_string()),
         }
     }
 }
@@ -1522,6 +1691,7 @@ fn main() {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             setup_tray(app.handle())?;
+            reconcile_daemons(app.handle());
             Ok(())
         })
         .on_window_event(|window, event| match (window.label(), event) {
@@ -1775,6 +1945,7 @@ mod live_tests {
                     );
                     let _ = fs::remove_file(dir_a.join("notes/a.conflict.md"));
                 }
+                ConflictResolutionChoice::Defer => unreachable!("the UI never defers"),
             }
             println!("OBS-4 ({choice:?}): resolution verified");
         }
@@ -2124,6 +2295,7 @@ mod live_tests {
                 name: id.to_string(),
                 server_url: url.to_string(),
                 local_path: sandbox.join(id).to_string_lossy().into_owned(),
+                ignore: Vec::new(),
             })
             .unwrap();
             save_key_to_keychain(id, &[7_u8; 32]).unwrap();
@@ -2199,6 +2371,7 @@ mod live_tests {
             api_key: api_key.to_string(),
             vault_id: vault_id.to_string(),
             local_path: String::new(),
+            ignore: Vec::new(),
         };
         let parent = obsink_core::content_hmac(&keys.content_mac, parent_text.as_bytes());
         let content_hash = obsink_core::content_hmac(&keys.content_mac, text.as_bytes());
@@ -2217,6 +2390,7 @@ mod live_tests {
             api_key: api_key.to_string(),
             vault_id: vault_id.to_string(),
             local_path: String::new(),
+            ignore: Vec::new(),
         };
         let blob = ApiClient::new(config).get_file(path, &keys).await.unwrap();
         let bytes = obsink_core::decrypt(&keys.content_enc, &blob).unwrap();
