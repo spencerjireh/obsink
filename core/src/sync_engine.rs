@@ -2,8 +2,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs, io,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
+use futures_util::{stream, StreamExt};
 use thiserror::Error;
 
 use serde::{Deserialize, Serialize};
@@ -16,8 +18,8 @@ use crate::{
     manifest::{checkpoint_manifest, diff_manifests, ManifestDiff},
     progress::{ProgressEvent, ProgressSink, SyncPhase},
     types::{
-        Conflict, ConflictResolution, ConflictResolutionChoice, FileEntry, Manifest, SyncAction,
-        SyncActionKind, SyncFailure, SyncPlan, SyncResult, VaultConfig,
+        BatchOp, Conflict, ConflictResolution, ConflictResolutionChoice, FileEntry, Manifest,
+        SyncAction, SyncActionKind, SyncFailure, SyncPlan, SyncResult, VaultConfig,
     },
 };
 
@@ -29,6 +31,13 @@ const MANIFEST_FILE: &str = ".obsink/manifest.json";
 /// 304 instead of a full download. Distinct from `MANIFEST_FILE`, which is the
 /// checkpoint of the last *completed* sync.
 const REMOTE_MANIFEST_CACHE_FILE: &str = ".obsink/remote-manifest.json";
+/// Ciphertext per batch upload. Well under the server's 128 MiB body cap and
+/// the memory a phone can spare for one request.
+const BATCH_BYTE_BUDGET: u64 = 32 * 1024 * 1024;
+/// Operations per batch upload.
+const BATCH_MAX_OPS: usize = 64;
+/// Downloads in flight at once.
+const DOWNLOAD_CONCURRENCY: usize = 8;
 
 #[derive(Debug, Error)]
 pub enum SyncEngineError {
@@ -289,56 +298,139 @@ pub async fn complete_sync(
         .iter()
         .map(|failure| failure.path.clone())
         .collect::<BTreeSet<_>>();
-    for (index, action) in pending_uploads.iter().enumerate() {
-        progress.report(ProgressEvent::FileStarted {
-            path: action.path.clone(),
-            kind: action.kind.clone(),
-            index,
-            total,
-        });
-        match apply_upload(local_root, &keys, &client, action).await {
-            Ok(()) => {
-                successful_uploads += 1;
-                let bytes = action.local.as_ref().map(|entry| entry.size).unwrap_or(0);
-                progress.report(ProgressEvent::FileCompleted {
-                    path: action.path.clone(),
-                    bytes,
-                });
-            }
-            Err(SyncEngineError::Api(ApiError::Conflict { path, conflict })) => {
-                // A 409 without a `current` entry means the server row is gone
-                // from under us; surface it as a conflict against a tombstone
-                // rather than dropping the upload on the floor.
-                let remote = conflict.current.unwrap_or_else(|| FileEntry {
-                    deleted: true,
-                    ..FileEntry::default()
-                });
-                let local = action.local.clone().unwrap_or_default();
-                hold_back.insert(path.clone());
-                late_conflicts.push(Conflict {
-                    path,
-                    local,
-                    remote,
-                });
-            }
-            Err(error) => {
-                let fatal = is_fatal_sync_error(&error);
-                let message = error.to_string();
-                progress.report(ProgressEvent::FileFailed {
-                    path: action.path.clone(),
-                    error: message.clone(),
-                });
-                hold_back.insert(action.path.clone());
-                upload_failures.push(SyncFailure {
-                    path: action.path.clone(),
-                    kind: action.kind.clone(),
-                    error: message,
-                    fatal,
-                });
-                if fatal {
-                    break;
+    // Uploads travel in batches (`POST /vaults/:id/batch`): one round trip
+    // per `BATCH_MAX_OPS` files or `BATCH_BYTE_BUDGET` bytes instead of one per
+    // file. Each batch is read, encrypted and sent before the next is
+    // prepared, so memory holds one batch of ciphertext at a time.
+    let sizes: Vec<u64> = pending_uploads
+        .iter()
+        .map(|action| action.local.as_ref().map(|entry| entry.size).unwrap_or(0))
+        .collect();
+    'batches: for range in chunk_uploads(&sizes) {
+        let mut ops = Vec::with_capacity(range.len());
+        let mut members = Vec::with_capacity(range.len());
+        for index in range {
+            let action = &pending_uploads[index];
+            progress.report(ProgressEvent::FileStarted {
+                path: action.path.clone(),
+                kind: action.kind.clone(),
+                index,
+                total,
+            });
+            match prepare_batch_op(local_root, &keys, action).await {
+                Ok(Some(op)) => {
+                    ops.push(op);
+                    members.push(index);
+                }
+                // Nothing to send for this kind; count it like the old
+                // per-file loop did.
+                Ok(None) => {
+                    successful_uploads += 1;
+                    progress.report(ProgressEvent::FileCompleted {
+                        path: action.path.clone(),
+                        bytes: 0,
+                    });
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    progress.report(ProgressEvent::FileFailed {
+                        path: action.path.clone(),
+                        error: message.clone(),
+                    });
+                    hold_back.insert(action.path.clone());
+                    upload_failures.push(SyncFailure {
+                        path: action.path.clone(),
+                        kind: action.kind.clone(),
+                        error: message,
+                        fatal: false,
+                    });
                 }
             }
+        }
+        if ops.is_empty() {
+            continue;
+        }
+
+        let results = match client.batch(&ops, &keys).await {
+            Ok(results) => results,
+            Err(error) => {
+                // The whole request failed: every member fails alike, and a
+                // systemic error stops the remaining batches as it would have
+                // stopped the per-file loop.
+                let fatal = is_fatal_api_error(&error);
+                let message = error.to_string();
+                for &index in &members {
+                    let action = &pending_uploads[index];
+                    progress.report(ProgressEvent::FileFailed {
+                        path: action.path.clone(),
+                        error: message.clone(),
+                    });
+                    hold_back.insert(action.path.clone());
+                    upload_failures.push(SyncFailure {
+                        path: action.path.clone(),
+                        kind: action.kind.clone(),
+                        error: message.clone(),
+                        fatal,
+                    });
+                }
+                if fatal {
+                    break 'batches;
+                }
+                continue;
+            }
+        };
+
+        let mut stop = false;
+        for (&index, result) in members.iter().zip(results) {
+            let action = &pending_uploads[index];
+            match result.status {
+                200..=299 => {
+                    successful_uploads += 1;
+                    let bytes = action.local.as_ref().map(|entry| entry.size).unwrap_or(0);
+                    progress.report(ProgressEvent::FileCompleted {
+                        path: action.path.clone(),
+                        bytes,
+                    });
+                }
+                409 => {
+                    // A 409 without a `current` entry means the server row is
+                    // gone from under us; surface it as a conflict against a
+                    // tombstone rather than dropping the upload on the floor.
+                    let remote = result
+                        .conflict
+                        .and_then(|conflict| conflict.current)
+                        .unwrap_or_else(|| FileEntry {
+                            deleted: true,
+                            ..FileEntry::default()
+                        });
+                    let local = action.local.clone().unwrap_or_default();
+                    hold_back.insert(action.path.clone());
+                    late_conflicts.push(Conflict {
+                        path: action.path.clone(),
+                        local,
+                        remote,
+                    });
+                }
+                status => {
+                    let fatal = is_fatal_status(status);
+                    let message = format!("api error: batch operation answered {status}");
+                    progress.report(ProgressEvent::FileFailed {
+                        path: action.path.clone(),
+                        error: message.clone(),
+                    });
+                    hold_back.insert(action.path.clone());
+                    upload_failures.push(SyncFailure {
+                        path: action.path.clone(),
+                        kind: action.kind.clone(),
+                        error: message,
+                        fatal,
+                    });
+                    stop |= fatal;
+                }
+            }
+        }
+        if stop {
+            break;
         }
     }
 
@@ -457,59 +549,106 @@ async fn apply_downloads(
 ) -> Vec<SyncFailure> {
     let mut failures = Vec::new();
     let total = downloads.len();
-    for (index, action) in ordered_for_apply(downloads).enumerate() {
-        match action.kind {
-            SyncActionKind::Download => {
-                progress.report(ProgressEvent::FileStarted {
-                    path: action.path.clone(),
-                    kind: SyncActionKind::Download,
-                    index,
-                    total,
-                });
-                let outcome = async {
-                    let blob = client.get_file(&action.path, keys).await?;
-                    decrypt_and_write(local_root, &action.path, keys, blob).await
-                }
-                .await;
-                match outcome {
-                    Ok(len) => progress.report(ProgressEvent::FileCompleted {
-                        path: action.path.clone(),
-                        bytes: len as u64,
-                    }),
-                    Err(error) => {
-                        let fatal = is_fatal_sync_error(&error);
-                        let message = error.to_string();
-                        progress.report(ProgressEvent::FileFailed {
-                            path: action.path.clone(),
-                            error: message.clone(),
-                        });
-                        failures.push(SyncFailure {
-                            path: action.path.clone(),
-                            kind: SyncActionKind::Download,
-                            error: message,
-                            fatal,
-                        });
-                        if fatal {
-                            break;
-                        }
-                    }
-                }
-            }
-            SyncActionKind::DeleteLocal => {
-                if let Err(error) = delete_local_file(local_root, &action.path).await {
-                    failures.push(SyncFailure {
-                        path: action.path.clone(),
-                        kind: SyncActionKind::DeleteLocal,
-                        error: error.to_string(),
-                        fatal: false,
-                    });
-                }
-            }
-            _ => {}
+    let (deletes, fetches): (Vec<&SyncAction>, Vec<&SyncAction>) =
+        ordered_for_apply(downloads).partition(|action| action.kind == SyncActionKind::DeleteLocal);
+
+    // Deletes first, one by one (see `ordered_for_apply`).
+    for action in &deletes {
+        if let Err(error) = delete_local_file(local_root, &action.path).await {
+            failures.push(SyncFailure {
+                path: action.path.clone(),
+                kind: SyncActionKind::DeleteLocal,
+                error: error.to_string(),
+                fatal: false,
+            });
         }
     }
 
+    // Then the fetches, `DOWNLOAD_CONCURRENCY` at a time. A fatal error
+    // raises `stop` so no further fetch starts; the ones never started stay
+    // unrecorded, as the sequential loop's `break` left them. The futures are
+    // built up front (not in a `map` closure) so the combined future stays
+    // `Send` for callers that require it.
+    let stop = AtomicBool::new(false);
+    let offset = deletes.len();
+    let fetch_futures: Vec<_> = fetches
+        .iter()
+        .enumerate()
+        .map(|(position, action)| {
+            fetch_one(
+                local_root,
+                keys,
+                client,
+                action,
+                offset + position,
+                total,
+                progress,
+                &stop,
+            )
+        })
+        .collect();
+    let outcomes: Vec<Option<SyncFailure>> = stream::iter(fetch_futures)
+        .buffer_unordered(DOWNLOAD_CONCURRENCY)
+        .collect()
+        .await;
+    failures.extend(outcomes.into_iter().flatten());
+
     failures
+}
+
+/// One download: fetch, decrypt, write. `None` on success or when `stop`
+/// was already raised; the failure otherwise, raising `stop` if it is fatal.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_one(
+    local_root: &Path,
+    keys: &CryptoKeys,
+    client: &ApiClient,
+    action: &SyncAction,
+    index: usize,
+    total: usize,
+    progress: &dyn ProgressSink,
+    stop: &AtomicBool,
+) -> Option<SyncFailure> {
+    if action.kind != SyncActionKind::Download || stop.load(Ordering::SeqCst) {
+        return None;
+    }
+    progress.report(ProgressEvent::FileStarted {
+        path: action.path.clone(),
+        kind: SyncActionKind::Download,
+        index,
+        total,
+    });
+    let outcome = async {
+        let blob = client.get_file(&action.path, keys).await?;
+        decrypt_and_write(local_root, &action.path, keys, blob).await
+    }
+    .await;
+    match outcome {
+        Ok(len) => {
+            progress.report(ProgressEvent::FileCompleted {
+                path: action.path.clone(),
+                bytes: len as u64,
+            });
+            None
+        }
+        Err(error) => {
+            let fatal = is_fatal_sync_error(&error);
+            if fatal {
+                stop.store(true, Ordering::SeqCst);
+            }
+            let message = error.to_string();
+            progress.report(ProgressEvent::FileFailed {
+                path: action.path.clone(),
+                error: message.clone(),
+            });
+            Some(SyncFailure {
+                path: action.path.clone(),
+                kind: SyncActionKind::Download,
+                error: message,
+                fatal,
+            })
+        }
+    }
 }
 
 /// Local deletes run before downloads. On a case-insensitive volume (APFS
@@ -540,11 +679,40 @@ fn is_fatal_api_error(error: &ApiError) -> bool {
     match error {
         ApiError::Http(_) => true,
         ApiError::Unauthorized => true,
-        ApiError::UnexpectedStatus { status, .. } => {
-            matches!(status.as_u16(), 401 | 403 | 500..=599)
-        }
+        ApiError::UnexpectedStatus { status, .. } => is_fatal_status(status.as_u16()),
         ApiError::Crypto(_) | ApiError::Conflict { .. } => false,
     }
+}
+
+/// Auth failures and server errors are systemic; 4xx answers such as 413 or
+/// 404 belong to one file.
+fn is_fatal_status(status: u16) -> bool {
+    matches!(status, 401 | 403 | 500..=599)
+}
+
+/// Split uploads into consecutive batches: a batch closes when adding the
+/// next file would exceed `BATCH_BYTE_BUDGET` or `BATCH_MAX_OPS`. A file
+/// larger than the budget travels alone. Sizes are the plaintext sizes from
+/// the manifest (ciphertext adds a constant few bytes), so no file is read
+/// before its batch is due.
+fn chunk_uploads(sizes: &[u64]) -> Vec<std::ops::Range<usize>> {
+    let mut batches = Vec::new();
+    let mut start = 0usize;
+    let mut bytes = 0u64;
+    for (index, &size) in sizes.iter().enumerate() {
+        let full =
+            index > start && (bytes + size > BATCH_BYTE_BUDGET || index - start >= BATCH_MAX_OPS);
+        if full {
+            batches.push(start..index);
+            start = index;
+            bytes = 0;
+        }
+        bytes += size;
+    }
+    if start < sizes.len() {
+        batches.push(start..sizes.len());
+    }
+    batches
 }
 
 async fn apply_keep_remote(
@@ -580,15 +748,16 @@ async fn write_conflict_copy(
     Ok((duplicate_path, len as u64))
 }
 
-async fn apply_upload(
+/// Read and encrypt one upload into its batch operation, off the async
+/// runtime. `None` for kinds the batch endpoint does not carry.
+async fn prepare_batch_op(
     local_root: &Path,
     keys: &CryptoKeys,
-    client: &ApiClient,
     action: &SyncAction,
-) -> Result<(), SyncEngineError> {
+) -> Result<Option<BatchOp>, SyncEngineError> {
     match action.kind {
         SyncActionKind::Upload => {
-            let ciphertext = {
+            let content = {
                 let path = local_root.join(&action.path);
                 let content_enc = keys.content_enc;
                 blocking(move || {
@@ -597,26 +766,22 @@ async fn apply_upload(
                 })
                 .await?
             };
-            client
-                .put_file(
-                    &action.path,
-                    parent_hash(action),
-                    action
-                        .local
-                        .as_ref()
-                        .map(|entry| entry.hash.as_str())
-                        .unwrap_or_default(),
-                    ciphertext,
-                    keys,
-                )
-                .await
-                .map_err(SyncEngineError::Api)
+            Ok(Some(BatchOp::Put {
+                path: action.path.clone(),
+                parent_hash: parent_hash(action).map(str::to_string),
+                content_hash: action
+                    .local
+                    .as_ref()
+                    .map(|entry| entry.hash.clone())
+                    .unwrap_or_default(),
+                content,
+            }))
         }
-        SyncActionKind::DeleteRemote => client
-            .delete_file(&action.path, parent_hash(action), keys)
-            .await
-            .map_err(SyncEngineError::Api),
-        _ => Ok(()),
+        SyncActionKind::DeleteRemote => Ok(Some(BatchOp::Delete {
+            path: action.path.clone(),
+            parent_hash: parent_hash(action).map(str::to_string),
+        })),
+        _ => Ok(None),
     }
 }
 
@@ -744,7 +909,7 @@ fn now_seconds() -> u64 {
 mod tests {
     use std::fs;
 
-    use httpmock::{Method::DELETE, Method::GET, Method::PUT, MockServer};
+    use httpmock::{Method::DELETE, Method::GET, Method::POST, MockServer};
     use tempfile::tempdir;
 
     use super::{
@@ -759,6 +924,20 @@ mod tests {
             SyncActionKind, SyncPlan, VaultConfig,
         },
     };
+
+    /// The JSON body of a batch answer: one result per operation.
+    fn batch_results(results: &[(&str, u16, Option<serde_json::Value>)]) -> serde_json::Value {
+        serde_json::json!({
+            "results": results
+                .iter()
+                .map(|(path, status, conflict)| serde_json::json!({
+                    "path": path,
+                    "status": status,
+                    "conflict": conflict,
+                }))
+                .collect::<Vec<_>>()
+        })
+    }
 
     /// One manifest entry as the server serialises it (also the `current`
     /// body of a 409).
@@ -964,13 +1143,17 @@ mod tests {
                 then.status(200).json_body_obj(&serde_json::json!({}));
             })
             .await;
-        let put_mock = server
-            .mock_async(move |when, then| {
-                when.method(PUT)
-                    .path(format!("/vaults/vault_123/files/{token}"))
-                    .header_exists("x-content-hash")
-                    .header_exists("x-enc-path");
-                then.status(200);
+        let batch_mock = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/vaults/vault_123/batch")
+                    .header_exists("content-type")
+                    .body_contains("\"action\":\"put\"")
+                    .body_contains(format!("\"path\":\"{token}\""))
+                    .body_contains("\"encPath\":\"")
+                    .body_contains("name=\"content\"; filename=\"0\"");
+                then.status(200)
+                    .json_body_obj(&batch_results(&[(&token, 200, None)]));
             })
             .await;
         server
@@ -987,8 +1170,9 @@ mod tests {
         let result = complete_sync(&cfg, &key, &plan, &[], &NoProgress)
             .await
             .unwrap();
-        put_mock.assert_async().await;
+        batch_mock.assert_async().await;
         assert!(result.conflicts.is_empty());
+        assert!(result.failures.is_empty());
     }
 
     #[tokio::test]
@@ -1051,10 +1235,10 @@ mod tests {
 
     #[tokio::test]
     async fn upload_loop_continues_past_per_file_failure() {
-        // a.md, b.md, c.md upload in BTreeSet (alphabetical) order. b returns
-        // 413 (per-file, non-fatal): the loop records the failure and continues
-        // to c. The manifest still checkpoints because no fatal occurred, but
-        // b is held back so the next sync retries it.
+        // a.md, b.md, c.md travel in one batch (BTreeSet order). The server
+        // answers 413 for b (per-file, non-fatal): a and c count as landed,
+        // b is recorded as a failure and held back so the next sync retries
+        // it. The manifest still checkpoints because nothing fatal occurred.
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("a.md"), "aaa").unwrap();
         fs::write(dir.path().join("b.md"), "bbb").unwrap();
@@ -1072,25 +1256,18 @@ mod tests {
                 then.status(200).json_body_obj(&serde_json::json!({}));
             })
             .await;
-        let put_a = server
-            .mock_async(move |when, then| {
-                when.method(PUT)
-                    .path(format!("/vaults/vault_123/files/{token_a}"));
-                then.status(200);
-            })
-            .await;
-        let _put_b = server
-            .mock_async(move |when, then| {
-                when.method(PUT)
-                    .path(format!("/vaults/vault_123/files/{token_b}"));
-                then.status(413).body("file too large");
-            })
-            .await;
-        let put_c = server
-            .mock_async(move |when, then| {
-                when.method(PUT)
-                    .path(format!("/vaults/vault_123/files/{token_c}"));
-                then.status(200);
+        let batch = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/vaults/vault_123/batch")
+                    .body_contains(format!("\"path\":\"{token_a}\""))
+                    .body_contains(format!("\"path\":\"{token_b}\""))
+                    .body_contains(format!("\"path\":\"{token_c}\""));
+                then.status(200).json_body_obj(&batch_results(&[
+                    (&token_a, 200, None),
+                    (&token_b, 413, None),
+                    (&token_c, 200, None),
+                ]));
             })
             .await;
 
@@ -1116,9 +1293,8 @@ mod tests {
             .await
             .unwrap();
 
-        // a and c were both attempted (loop did not stop at b).
-        put_a.assert_hits_async(1).await;
-        put_c.assert_hits_async(1).await;
+        // One round trip for all three files.
+        batch.assert_hits_async(1).await;
         // Exactly one non-fatal failure, for b.md.
         assert_eq!(result.failures.len(), 1);
         assert_eq!(result.failures[0].path, "b.md");
@@ -1138,18 +1314,13 @@ mod tests {
 
     #[tokio::test]
     async fn upload_loop_stops_on_fatal_server_error() {
-        // a (200), b (500 fatal) breaks the loop; c is never attempted, and the
-        // manifest checkpoint is skipped because a fatal error occurred.
+        // The batch request itself fails with 500: every member is a fatal
+        // failure and the manifest checkpoint is skipped.
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("a.md"), "aaa").unwrap();
         fs::write(dir.path().join("b.md"), "bbb").unwrap();
-        fs::write(dir.path().join("c.md"), "ccc").unwrap();
         let server = MockServer::start_async().await;
         let key = [12_u8; 32];
-        let keys = derive_keys(&key);
-        let token_a = path_token(&keys.path_token, "a.md");
-        let token_b = path_token(&keys.path_token, "b.md");
-        let token_c = path_token(&keys.path_token, "c.md");
 
         server
             .mock_async(|when, then| {
@@ -1157,25 +1328,10 @@ mod tests {
                 then.status(200).json_body_obj(&serde_json::json!({}));
             })
             .await;
-        let put_a = server
-            .mock_async(move |when, then| {
-                when.method(PUT)
-                    .path(format!("/vaults/vault_123/files/{token_a}"));
-                then.status(200);
-            })
-            .await;
-        let _put_b = server
-            .mock_async(move |when, then| {
-                when.method(PUT)
-                    .path(format!("/vaults/vault_123/files/{token_b}"));
+        let batch = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/vaults/vault_123/batch");
                 then.status(500).body("server error");
-            })
-            .await;
-        let put_c = server
-            .mock_async(move |when, then| {
-                when.method(PUT)
-                    .path(format!("/vaults/vault_123/files/{token_c}"));
-                then.status(200);
             })
             .await;
 
@@ -1185,12 +1341,140 @@ mod tests {
             .await
             .unwrap();
 
-        put_a.assert_hits_async(1).await;
-        put_c.assert_hits_async(0).await; // loop stopped at b
+        batch.assert_hits_async(1).await;
+        assert_eq!(result.failures.len(), 2);
+        assert!(result.failures.iter().all(|failure| failure.fatal));
+        assert_eq!(
+            result
+                .failures
+                .iter()
+                .map(|failure| failure.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a.md", "b.md"]
+        );
+        assert!(!sync_manifest_path(dir.path()).exists());
+    }
+
+    #[tokio::test]
+    async fn a_fatal_per_operation_status_stops_the_remaining_batches() {
+        // Two batches (65 files); a 500 inside the first batch's results is
+        // systemic, so the second batch is never sent.
+        let dir = tempdir().unwrap();
+        let mut paths = Vec::new();
+        for i in 0..65 {
+            let name = format!("f{i:03}.md");
+            fs::write(dir.path().join(&name), "x").unwrap();
+            paths.push(name);
+        }
+        let server = MockServer::start_async().await;
+        let key = [13_u8; 32];
+        let keys = derive_keys(&key);
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path("/vaults/vault_123/manifest");
+                then.status(200).json_body_obj(&serde_json::json!({}));
+            })
+            .await;
+        let tokens: Vec<String> = paths
+            .iter()
+            .map(|path| path_token(&keys.path_token, path))
+            .collect();
+        let first_results: Vec<(&str, u16, Option<serde_json::Value>)> = tokens[..64]
+            .iter()
+            .enumerate()
+            .map(|(i, token)| (token.as_str(), if i == 3 { 500 } else { 200 }, None))
+            .collect();
+        let batch = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/vaults/vault_123/batch");
+                then.status(200)
+                    .json_body_obj(&batch_results(&first_results));
+            })
+            .await;
+
+        let cfg = config(server.base_url(), dir.path().display().to_string());
+        let plan = prepare_sync(&cfg, &key, &NoProgress).await.unwrap();
+        assert_eq!(plan.upload.len(), 65);
+        let result = complete_sync(&cfg, &key, &plan, &[], &NoProgress)
+            .await
+            .unwrap();
+
+        batch.assert_hits_async(1).await;
         assert_eq!(result.failures.len(), 1);
-        assert_eq!(result.failures[0].path, "b.md");
+        assert_eq!(result.failures[0].path, "f003.md");
         assert!(result.failures[0].fatal);
         assert!(!sync_manifest_path(dir.path()).exists());
+    }
+
+    #[tokio::test]
+    async fn batch_results_map_per_operation() {
+        // 200, 409 (late conflict), 413 (per-file failure) in one answer.
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.md"), "aaa").unwrap();
+        fs::write(dir.path().join("b.md"), "bbb").unwrap();
+        fs::write(dir.path().join("c.md"), "ccc").unwrap();
+        let server = MockServer::start_async().await;
+        let key = [14_u8; 32];
+        let keys = derive_keys(&key);
+        let token_a = path_token(&keys.path_token, "a.md");
+        let token_b = path_token(&keys.path_token, "b.md");
+        let token_c = path_token(&keys.path_token, "c.md");
+        let other = server_entry(&keys, "b.md", b"other device", 2, false);
+
+        let empty_manifest = server
+            .mock_async(|when, then| {
+                when.method(GET).path("/vaults/vault_123/manifest");
+                then.status(200).json_body_obj(&serde_json::json!({}));
+            })
+            .await;
+        server
+            .mock_async(|when, then| {
+                when.method(POST).path("/vaults/vault_123/batch");
+                then.status(200).json_body_obj(&batch_results(&[
+                    (&token_a, 200, None),
+                    (
+                        &token_b,
+                        409,
+                        Some(serde_json::json!({ "path": token_b, "current": other })),
+                    ),
+                    (&token_c, 413, None),
+                ]));
+            })
+            .await;
+
+        let cfg = config(server.base_url(), dir.path().display().to_string());
+        let plan = prepare_sync(&cfg, &key, &NoProgress).await.unwrap();
+        empty_manifest.delete_async().await;
+        let after = merge_manifests(vec![
+            server_manifest(&keys, "a.md", b"aaa", 5, false),
+            server_manifest(&keys, "b.md", b"other device", 2, false),
+        ]);
+        server
+            .mock_async(move |when, then| {
+                when.method(GET).path("/vaults/vault_123/manifest");
+                then.status(200).json_body_obj(&after);
+            })
+            .await;
+        let result = complete_sync(&cfg, &key, &plan, &[], &NoProgress)
+            .await
+            .unwrap();
+
+        assert_eq!(result.conflicts.len(), 1);
+        assert_eq!(result.conflicts[0].path, "b.md");
+        assert_eq!(
+            result.conflicts[0].remote.hash,
+            content_hmac(&keys.content_mac, b"other device")
+        );
+        assert_eq!(result.failures.len(), 1);
+        assert_eq!(result.failures[0].path, "c.md");
+        assert!(!result.failures[0].fatal);
+        let checkpoint = load_manifest_from_disk(&sync_manifest_path(dir.path())).unwrap();
+        assert!(checkpoint.contains_key("a.md"));
+        assert!(
+            !checkpoint.contains_key("b.md"),
+            "conflicted path held back"
+        );
+        assert!(!checkpoint.contains_key("c.md"), "failed path held back");
     }
 
     #[tokio::test]
@@ -1428,12 +1712,15 @@ mod tests {
             .await;
         let current = server_entry(&keys, "note.md", b"other device", 2, false);
         let conflict_put = server
-            .mock_async(move |when, then| {
-                when.method(PUT)
-                    .path(format!("/vaults/vault_123/files/{token}"))
-                    .header("x-parent-hash", base_hash.clone());
-                then.status(409)
-                    .json_body(serde_json::json!({ "path": "note.md", "current": current }));
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/vaults/vault_123/batch")
+                    .body_contains(format!("\"parentHash\":\"{base_hash}\""));
+                then.status(200).json_body_obj(&batch_results(&[(
+                    &token,
+                    409,
+                    Some(serde_json::json!({ "path": token, "current": current })),
+                )]));
             })
             .await;
 
@@ -1465,13 +1752,13 @@ mod tests {
         assert!(reentrant.upload.is_empty());
 
         conflict_put.delete_async().await;
-        let token = path_token(&keys.path_token, "note.md");
         let winning_put = server
-            .mock_async(move |when, then| {
-                when.method(PUT)
-                    .path(format!("/vaults/vault_123/files/{token}"))
-                    .header("x-parent-hash", other_hash.clone());
-                then.status(200);
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/vaults/vault_123/batch")
+                    .body_contains(format!("\"parentHash\":\"{other_hash}\""));
+                then.status(200)
+                    .json_body_obj(&batch_results(&[(&token, 200, None)]));
             })
             .await;
         let result = complete_sync(
@@ -1513,11 +1800,13 @@ mod tests {
             })
             .await;
         let put = server
-            .mock_async(move |when, then| {
-                when.method(PUT)
-                    .path(format!("/vaults/vault_123/files/{token}"))
-                    .header("x-parent-hash", base_hash.clone());
-                then.status(200);
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/vaults/vault_123/batch")
+                    .body_contains("\"action\":\"put\"")
+                    .body_contains(format!("\"parentHash\":\"{base_hash}\""));
+                then.status(200)
+                    .json_body_obj(&batch_results(&[(&token, 200, None)]));
             })
             .await;
 
@@ -1717,8 +2006,8 @@ mod tests {
             .await;
         let writes = server
             .mock_async(|when, then| {
-                when.method(PUT);
-                then.status(200);
+                when.method(POST).path("/vaults/vault_123/batch");
+                then.status(200).json_body_obj(&batch_results(&[]));
             })
             .await;
 
@@ -1730,5 +2019,126 @@ mod tests {
             .await
             .unwrap();
         writes.assert_hits_async(0).await;
+    }
+
+    #[test]
+    fn chunk_uploads_splits_by_bytes_and_op_count() {
+        use super::{chunk_uploads, BATCH_BYTE_BUDGET, BATCH_MAX_OPS};
+
+        assert!(chunk_uploads(&[]).is_empty());
+        assert_eq!(chunk_uploads(&[1, 2, 3]), vec![0..3]);
+
+        // Op count: 64 per batch.
+        let sizes = vec![1u64; BATCH_MAX_OPS * 2 + 1];
+        assert_eq!(chunk_uploads(&sizes), vec![0..64, 64..128, 128..129]);
+
+        // Byte budget: the file that would overflow starts the next batch.
+        let half = BATCH_BYTE_BUDGET / 2;
+        assert_eq!(chunk_uploads(&[half, half, 1, half]), vec![0..2, 2..4]);
+
+        // An oversize file travels alone, and does not drag its neighbours.
+        let huge = BATCH_BYTE_BUDGET + 1;
+        assert_eq!(chunk_uploads(&[1, huge, 1]), vec![0..1, 1..2, 2..3]);
+        assert_eq!(chunk_uploads(&[huge]), vec![0..1]);
+
+        // Deletes cost nothing.
+        let sizes = vec![0u64; 10];
+        assert_eq!(chunk_uploads(&sizes), vec![0..10]);
+    }
+
+    #[tokio::test]
+    async fn downloads_run_concurrently() {
+        // Eight files, each served after 300 ms: sequential would take 2.4 s,
+        // eight-wide takes one delay.
+        let dir = tempdir().unwrap();
+        let server = MockServer::start_async().await;
+        let key = [21_u8; 32];
+        let keys = derive_keys(&key);
+        let names: Vec<String> = (0..8).map(|i| format!("n{i}.md")).collect();
+        let manifest = merge_manifests(
+            names
+                .iter()
+                .map(|name| server_manifest(&keys, name, name.as_bytes(), 1, false))
+                .collect(),
+        );
+        server
+            .mock_async(move |when, then| {
+                when.method(GET).path("/vaults/vault_123/manifest");
+                then.status(200).json_body_obj(&manifest);
+            })
+            .await;
+        for name in &names {
+            let token = path_token(&keys.path_token, name);
+            let body = encrypt(&keys.content_enc, name.as_bytes()).unwrap();
+            server
+                .mock_async(move |when, then| {
+                    when.method(GET)
+                        .path(format!("/vaults/vault_123/files/{token}"));
+                    then.status(200)
+                        .delay(std::time::Duration::from_millis(300))
+                        .body(body.clone());
+                })
+                .await;
+        }
+
+        let cfg = config(server.base_url(), dir.path().display().to_string());
+        let started = std::time::Instant::now();
+        let plan = prepare_sync(&cfg, &key, &NoProgress).await.unwrap();
+        let elapsed = started.elapsed();
+        assert!(plan.failures.is_empty());
+        assert_eq!(plan.download.len(), 8);
+        for name in &names {
+            assert_eq!(fs::read_to_string(dir.path().join(name)).unwrap(), *name);
+        }
+        assert!(
+            elapsed < std::time::Duration::from_millis(1500),
+            "eight 300 ms downloads took {elapsed:?}; they ran one at a time"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fatal_download_stops_launching_more() {
+        // Twenty files; the first GET is a 500 that arrives after a delay,
+        // so at most the eight in flight are started before `stop` is set.
+        let dir = tempdir().unwrap();
+        let server = MockServer::start_async().await;
+        let key = [22_u8; 32];
+        let keys = derive_keys(&key);
+        let names: Vec<String> = (0..20).map(|i| format!("n{i:02}.md")).collect();
+        let manifest = merge_manifests(
+            names
+                .iter()
+                .map(|name| server_manifest(&keys, name, name.as_bytes(), 1, false))
+                .collect(),
+        );
+        server
+            .mock_async(move |when, then| {
+                when.method(GET).path("/vaults/vault_123/manifest");
+                then.status(200).json_body_obj(&manifest);
+            })
+            .await;
+        let failing_token = path_token(&keys.path_token, &names[0]);
+        server
+            .mock_async(move |when, then| {
+                when.method(GET)
+                    .path(format!("/vaults/vault_123/files/{failing_token}"));
+                then.status(500).body("server error");
+            })
+            .await;
+        let others = server
+            .mock_async(|when, then| {
+                when.method(GET).path_contains("/vaults/vault_123/files/");
+                then.status(200)
+                    .delay(std::time::Duration::from_millis(200))
+                    .body(b"not a valid blob");
+            })
+            .await;
+
+        let cfg = config(server.base_url(), dir.path().display().to_string());
+        let plan = prepare_sync(&cfg, &key, &NoProgress).await.unwrap();
+        assert!(plan.failures.iter().any(|failure| failure.fatal));
+        // The fatal one plus whatever was already in flight; never all twenty.
+        assert!(others.hits_async().await < 19, "every fetch was launched");
+        assert!(plan.failures.len() < 20);
     }
 }
