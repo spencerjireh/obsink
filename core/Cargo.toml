@@ -19,7 +19,8 @@ thiserror = "1"
 tokio = { version = "1", features = ["fs", "rt-multi-thread", "macros", "time"] }
 tracing = "0.1"
 walkdir = "2"
-urlencoding = "2"
+# Wipes the derived sub-keys on drop; already in the dependency tree via aes-gcm.
+zeroize = "1"
 
 # `keychain`: macOS login-keychain access for the CLI and desktop app, via the
 # Security framework so secrets never travel on a `security` argv.

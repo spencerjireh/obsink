@@ -64,12 +64,24 @@ pub struct SyncResult {
     pub failures: Vec<SyncFailure>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `Debug` redacts `api_key` (the bearer).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VaultConfig {
     pub server_url: String,
     pub api_key: String,
     pub vault_id: String,
     pub local_path: String,
+}
+
+impl std::fmt::Debug for VaultConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VaultConfig")
+            .field("server_url", &self.server_url)
+            .field("api_key", &"..")
+            .field("vault_id", &self.vault_id)
+            .field("local_path", &self.local_path)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,4 +178,23 @@ impl SyncPlan {
 
 const fn default_max_file_size() -> u64 {
     50 * 1024 * 1024
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VaultConfig;
+
+    #[test]
+    fn vault_config_debug_redacts_the_bearer() {
+        let config = VaultConfig {
+            server_url: "https://s.test".into(),
+            api_key: "secret-bearer-xyz".into(),
+            vault_id: "vault_1".into(),
+            local_path: "/tmp/v".into(),
+        };
+        let printed = format!("{config:?}");
+        assert!(printed.contains("vault_1"));
+        assert!(printed.contains("api_key: \"..\""));
+        assert!(!printed.contains("secret-bearer-xyz"));
+    }
 }

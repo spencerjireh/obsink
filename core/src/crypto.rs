@@ -8,6 +8,7 @@ use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use thiserror::Error;
+use zeroize::Zeroize;
 
 pub type KeyBytes = [u8; 32];
 
@@ -23,7 +24,10 @@ type HmacSha256 = Hmac<Sha256>;
 /// The master key (Argon2id output) is only ever used as HKDF input keying
 /// material; every concrete operation uses a dedicated sub-key so a weakness in
 /// one domain can't bleed into another.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is hand-written so a stray `tracing::debug!(?keys)` never writes
+/// key material to a log, and the sub-keys are wiped on drop.
+#[derive(Clone)]
 pub struct CryptoKeys {
     /// Encrypts file *contents* (AES-256-GCM).
     pub content_enc: KeyBytes,
@@ -33,6 +37,21 @@ pub struct CryptoKeys {
     pub path_token: KeyBytes,
     /// Encrypts the real path so a fresh device can recover filenames.
     pub path_enc: KeyBytes,
+}
+
+impl std::fmt::Debug for CryptoKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CryptoKeys(..)")
+    }
+}
+
+impl Drop for CryptoKeys {
+    fn drop(&mut self) {
+        self.content_enc.zeroize();
+        self.content_mac.zeroize();
+        self.path_token.zeroize();
+        self.path_enc.zeroize();
+    }
 }
 
 /// Derive the purpose-separated sub-keys from a master key.
@@ -155,6 +174,23 @@ mod tests {
         content_hmac, decrypt, decrypt_path, derive_key, derive_keys, encrypt, encrypt_path,
         path_token,
     };
+
+    #[test]
+    fn debug_output_carries_no_key_material() {
+        let master = [0x41u8; 32];
+        let keys = derive_keys(&master);
+        let printed = format!("{keys:?}");
+        assert_eq!(printed, "CryptoKeys(..)");
+        for key in [
+            &keys.content_enc,
+            &keys.content_mac,
+            &keys.path_token,
+            &keys.path_enc,
+        ] {
+            assert!(!printed.contains(&hex::encode(key)));
+            assert!(!printed.contains(&format!("{}, {}", key[0], key[1])));
+        }
+    }
 
     #[test]
     fn encrypt_round_trip() {
