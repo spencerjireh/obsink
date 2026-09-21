@@ -14,7 +14,8 @@ use crate::{
     api_client::{ApiClient, ApiError, ManifestFetch},
     crypto::{decrypt, derive_keys, encrypt, CryptoError, CryptoKeys, KeyBytes},
     fs_util::write_atomic,
-    hasher::{build_manifest_from_dir, hash_file, HasherError},
+    hash_cache::HashCache,
+    hasher::{build_manifest_with_cache, hash_file, HasherError},
     manifest::{checkpoint_manifest, diff_manifests, ManifestDiff},
     progress::{ProgressEvent, ProgressSink, SyncPhase},
     types::{
@@ -177,7 +178,13 @@ pub fn load_local_state(
     keys: &CryptoKeys,
 ) -> Result<LocalState, SyncEngineError> {
     let base = load_manifest_from_disk(&sync_manifest_path(local_root))?;
-    let working = build_working_manifest(local_root, &base, keys)?;
+    // The hash memo makes a repeat walk a stat per file; a failed save only
+    // costs the next walk its speed.
+    let mut cache = HashCache::load(local_root, keys);
+    let working = build_working_manifest(local_root, &base, keys, &mut cache)?;
+    if let Err(error) = cache.save(local_root) {
+        tracing::warn!(%error, "could not write the hash cache");
+    }
     Ok(LocalState { base, working })
 }
 
@@ -516,8 +523,9 @@ fn build_working_manifest(
     local_root: &Path,
     previous_manifest: &Manifest,
     keys: &CryptoKeys,
+    cache: &mut HashCache,
 ) -> Result<Manifest, SyncEngineError> {
-    let mut current = build_manifest_from_dir(local_root, keys)?;
+    let mut current = build_manifest_with_cache(local_root, keys, cache)?;
     let seen_paths = current.keys().cloned().collect::<BTreeSet<_>>();
 
     for (path, previous_entry) in previous_manifest {
