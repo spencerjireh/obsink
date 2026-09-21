@@ -141,6 +141,7 @@ impl From<MobileVaultConfig> for VaultConfig {
             api_key: value.api_key,
             vault_id: value.vault_id,
             local_path: value.local_path,
+            ignore: Vec::new(),
         }
     }
 }
@@ -293,6 +294,7 @@ fn server_only(server_url: String, api_key: String) -> VaultConfig {
         api_key,
         vault_id: String::new(),
         local_path: String::new(),
+        ignore: Vec::new(),
     }
 }
 
@@ -613,6 +615,7 @@ pub fn delete_vault(
         api_key,
         vault_id,
         local_path: String::new(),
+        ignore: Vec::new(),
     };
     block_on(ApiClient::new(config).delete_vault()).map_err(from_api)
 }
@@ -806,15 +809,16 @@ impl VaultClient {
     /// any files. Powers the stale-vault warning on open (spec §3.4, OBS-33).
     pub fn vault_status(&self) -> Result<MobileVaultStatus, MobileError> {
         let keys = derive_keys(&self.key);
-        let local =
-            load_local_state(Path::new(&self.config.local_path), &keys).map_err(from_sync)?;
+        let ignore = self.config.ignore_rules();
+        let local = load_local_state(Path::new(&self.config.local_path), &keys, &ignore)
+            .map_err(from_sync)?;
         let remote = block_on(fetch_remote_manifest(
             &ApiClient::new(self.config.clone()),
             Path::new(&self.config.local_path),
             &keys,
         ))
         .map_err(from_sync)?;
-        let diff = diff_local_and_remote(&local.base, &local.working, &remote);
+        let diff = diff_local_and_remote(&local.base, &local.working, &remote, &ignore);
         Ok(MobileVaultStatus {
             pending_uploads: diff.upload.len() as u32,
             pending_downloads: diff.download.len() as u32,
