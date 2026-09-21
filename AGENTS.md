@@ -73,9 +73,13 @@ obsink/
    lets a fresh device recover filenames. **Never** put plaintext content hashes
    or plaintext paths on the wire (that was v1's information leak — do not
    reintroduce it).
-2. **Manual sync only.** No file watching, no background sync, no daemons. One
-   button triggers the full pull→diff→download→resolve→upload cycle. Do not add
-   auto-sync.
+2. **Sync is driven, not ambient.** The engine (`prepare_sync` /
+   `complete_sync`) stays a pure, caller-triggered cycle with no timers and no
+   watcher inside it: one call runs the full pull→diff→download→resolve→upload
+   cycle. Automatic syncing lives in drivers outside the engine (the iOS
+   foreground and background refresh; the desktop/CLI daemon) that decide
+   *when* to call it. Nothing in `core/src/sync_engine.rs` may grow a clock or
+   a file watcher, and no driver may resolve a conflict on its own.
 3. **Conflict-aware — never silently overwrite.** `PUT`/`DELETE` require
    `X-Parent-Hash`; on mismatch the server returns `409` and the client surfaces
    the conflict to the UI (keep local / keep remote / keep both). The check runs

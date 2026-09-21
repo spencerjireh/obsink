@@ -5,8 +5,9 @@ core builds and diffs manifests, encrypts locally, and talks to a small Rust ser
 `docker compose up` (Postgres for metadata, a volume for blobs). The server stores ciphertext, path
 tokens, and keyed hashes — it holds no vault key material and performs no decryption.
 
-Sync is explicit: clients push and pull on demand rather than watching the filesystem. Obsidian
-opens the synced directory as a normal vault; no plugin is involved.
+Sync is driven, not ambient: one engine call runs a full cycle, and the clients make that call on
+a tap, when the iOS app comes to the foreground or gets a background refresh, or from the
+desktop/CLI daemon. Obsidian opens the synced directory as a normal vault; no plugin is involved.
 
 ## Design
 
