@@ -32,6 +32,7 @@ enum BackgroundRefresh {
     }
 
     static func handle(_ task: BGAppRefreshTask) {
+        NSLog("ObSink: background refresh started")
         schedule()
         let completion = OnceCompletion(task)
         let work = Task { @MainActor in
@@ -64,6 +65,7 @@ enum BackgroundRefresh {
             defer { lock.unlock() }
             guard !done else { return }
             done = true
+            NSLog("ObSink: background refresh finished success=%d", success ? 1 : 0)
             task.setTaskCompleted(success: success)
         }
     }
