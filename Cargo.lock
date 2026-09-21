@@ -3398,6 +3398,7 @@ dependencies = [
  "aes-gcm",
  "argon2",
  "base64 0.22.1",
+ "futures-util",
  "hex",
  "hkdf",
  "hmac",

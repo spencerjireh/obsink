@@ -22,6 +22,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// Total attempts (1 initial + retries) for transient network failures.
 const MAX_ATTEMPTS: u32 = 3;
+/// Whole-request ceiling for a batch upload: up to 32 MiB of ciphertext that
+/// the server applies operation by operation.
+const BATCH_REQUEST_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Clone)]
 pub struct ApiClient {
@@ -259,14 +262,76 @@ impl ApiClient {
 
     /// Send several puts/deletes in one `multipart/form-data` request: an
     /// `operations` JSON part plus one `content` part per put, named by
-    /// operation index. Results come back keyed by real path. Sent once (a
-    /// multipart body cannot be cloned for the retry loop); the per-operation
-    /// parent-hash gate makes a resend safe anyway.
+    /// operation index. Results come back keyed by real path, one per
+    /// operation in order. A multipart body cannot be cloned, so the form is
+    /// rebuilt for each attempt of the transient-failure retry; the
+    /// per-operation parent-hash gate makes a resend land or 409, never
+    /// duplicate.
     pub async fn batch(
         &self,
         operations: &[BatchOp],
         keys: &CryptoKeys,
     ) -> Result<Vec<BatchOperationResult>, ApiError> {
+        let mut attempt: u32 = 0;
+        let response = loop {
+            let (form, _) = self.build_batch_form(operations, keys)?;
+            debug!(operations = operations.len(), attempt, "sending batch");
+            let request = self
+                .client
+                .post(self.vault_url("batch"))
+                .timeout(BATCH_REQUEST_TIMEOUT)
+                .bearer_auth(&self.config.api_key)
+                .multipart(form);
+            match request.send().await {
+                Ok(response) => break response,
+                Err(error) => {
+                    attempt += 1;
+                    let transient = error.is_timeout() || error.is_connect();
+                    if attempt >= MAX_ATTEMPTS || !transient {
+                        return Err(error.into());
+                    }
+                    let backoff = Duration::from_millis(100 * 2_u64.pow(attempt));
+                    warn!(attempt, %error, ?backoff, "transient batch failure; retrying");
+                    tokio::time::sleep(backoff).await;
+                }
+            }
+        };
+        let real_paths: Vec<String> = operations
+            .iter()
+            .map(|op| match op {
+                BatchOp::Put { path, .. } | BatchOp::Delete { path, .. } => path.clone(),
+            })
+            .collect();
+        let parsed: BatchResponse = parse_json(response).await?;
+        if parsed.results.len() != operations.len() {
+            return Err(ApiError::UnexpectedStatus {
+                status: StatusCode::BAD_GATEWAY,
+                body: format!(
+                    "batch answered {} results for {} operations",
+                    parsed.results.len(),
+                    operations.len()
+                ),
+            });
+        }
+        Ok(parsed
+            .results
+            .into_iter()
+            .enumerate()
+            .map(|(index, result)| BatchOperationResult {
+                path: real_paths.get(index).cloned().unwrap_or(result.path),
+                status: result.status,
+                conflict: result.conflict,
+            })
+            .collect())
+    }
+
+    /// The multipart form for one batch attempt, plus the real paths in
+    /// operation order.
+    fn build_batch_form(
+        &self,
+        operations: &[BatchOp],
+        keys: &CryptoKeys,
+    ) -> Result<(reqwest::multipart::Form, Vec<String>), ApiError> {
         let mut wire = Vec::with_capacity(operations.len());
         let mut form = reqwest::multipart::Form::new();
         let mut real_paths = Vec::with_capacity(operations.len());
@@ -317,25 +382,7 @@ impl ApiClient {
                 .mime_str("application/json")
                 .map_err(ApiError::Http)?,
         );
-        debug!(operations = operations.len(), "sending batch");
-        let response = self
-            .client
-            .post(self.vault_url("batch"))
-            .bearer_auth(&self.config.api_key)
-            .multipart(form)
-            .send()
-            .await?;
-        let parsed: BatchResponse = parse_json(response).await?;
-        Ok(parsed
-            .results
-            .into_iter()
-            .enumerate()
-            .map(|(index, result)| BatchOperationResult {
-                path: real_paths.get(index).cloned().unwrap_or(result.path),
-                status: result.status,
-                conflict: result.conflict,
-            })
-            .collect())
+        Ok((form, real_paths))
     }
 }
 
@@ -631,5 +678,27 @@ mod tests {
         assert_eq!(results[0].status, 200);
         assert_eq!(results[1].path, "old.md");
         assert_eq!(results[1].status, 409);
+    }
+
+    #[tokio::test]
+    async fn batch_retries_a_connection_failure_before_giving_up() {
+        // Nothing listens on port 1: each attempt fails to connect, the form
+        // is rebuilt and resent after the backoff (200 ms + 400 ms), and the
+        // third failure is returned.
+        let keys = test_keys();
+        let client = ApiClient::new(config("http://127.0.0.1:1".to_string()));
+        let started = std::time::Instant::now();
+        let error = client
+            .batch(
+                &[BatchOp::Delete {
+                    path: "old.md".to_string(),
+                    parent_hash: None,
+                }],
+                &keys,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ApiError::Http(_)), "{error}");
+        assert!(started.elapsed() >= std::time::Duration::from_millis(600));
     }
 }
