@@ -151,6 +151,11 @@ export function VaultPage({ info, account, message, notify, onError, onSignIn, o
         {runner.syncResult?.failures?.length ? (
           <FailureNotice failures={runner.syncResult.failures} />
         ) : null}
+        {runner.syncResult?.checkpoint_error ? (
+          <Notice kind="danger">
+            <strong>Checkpoint failed:</strong> {runner.syncResult.checkpoint_error}. Sync again.
+          </Notice>
+        ) : null}
         {!plainMessage && !sessionNotice && !stale && info.state.kind === 'up_to_date' ? (
           <p className="empty-state">Nothing to sync.</p>
         ) : null}

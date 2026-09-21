@@ -139,10 +139,27 @@ pub fn record_sync(vault_id: &str, result: &SyncResult) -> io::Result<()> {
         } else {
             failure.error.clone()
         };
-        let path = (!failure.path.is_empty()).then_some(failure.path.as_str());
         push(
             &mut log,
-            event(vault_id, at, ActivityKind::Error, path, Some(detail)),
+            event(
+                vault_id,
+                at,
+                ActivityKind::Error,
+                Some(&failure.path),
+                Some(detail),
+            ),
+        );
+    }
+    if let Some(error) = &result.checkpoint_error {
+        push(
+            &mut log,
+            event(
+                vault_id,
+                at,
+                ActivityKind::Error,
+                None,
+                Some(format!("checkpoint: {error}")),
+            ),
         );
     }
     push(
@@ -259,6 +276,7 @@ mod tests {
                 error: "boom".to_string(),
                 fatal: true,
             }],
+            checkpoint_error: Some("api error: offline".to_string()),
         };
         record_sync("vault_a", &result).unwrap();
 
@@ -269,6 +287,7 @@ mod tests {
             kinds,
             vec![
                 (ActivityKind::Synced, None),
+                (ActivityKind::Error, None),
                 (ActivityKind::Error, Some("notes/d.md")),
                 (ActivityKind::Conflict, Some("notes/c.md")),
                 (ActivityKind::DeletedHere, Some("notes/old.md")),
@@ -278,7 +297,11 @@ mod tests {
             ]
         );
         assert_eq!(events[0].detail.as_deref(), Some("↑2 ↓2"));
-        assert_eq!(events[1].detail.as_deref(), Some("FATAL boom"));
+        assert_eq!(
+            events[1].detail.as_deref(),
+            Some("checkpoint: api error: offline")
+        );
+        assert_eq!(events[2].detail.as_deref(), Some("FATAL boom"));
         assert!(last_synced("vault_a").is_some());
         assert!(Path::new(&dir)
             .join(".obsink/activity/vault_a.json")

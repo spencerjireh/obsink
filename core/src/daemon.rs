@@ -425,8 +425,19 @@ impl State {
         let _ = self.events.send(DaemonEvent::SyncStarted).await;
         match self.execute(trigger).await {
             Ok(result) => {
-                match result.failures.iter().find(|failure| failure.fatal) {
-                    Some(failure) => self.report_failure(failure.error.clone(), true).await,
+                let fatal = result
+                    .failures
+                    .iter()
+                    .find(|failure| failure.fatal)
+                    .map(|failure| failure.error.clone())
+                    .or_else(|| {
+                        result
+                            .checkpoint_error
+                            .as_ref()
+                            .map(|error| format!("checkpoint: {error}"))
+                    });
+                match fatal {
+                    Some(message) => self.report_failure(message, true).await,
                     None => self.backoff.reset(),
                 }
                 let written = Instant::now();

@@ -117,9 +117,20 @@ struct VaultCard: View {
                 .accessibilityIdentifier(isActive || model.entries.count == 1 ? "syncButton" : "syncButton-\(entry.vaultID)")
             }
 
-            if isActive && !model.failures.isEmpty {
+            if isActive && (!model.failures.isEmpty || model.checkpointError != nil) {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Failed this sync").font(.subheadline.weight(.semibold))
+                    if let error = model.checkpointError {
+                        HStack(alignment: .top, spacing: 6) {
+                            Text("FATAL")
+                                .font(.caption2.weight(.bold))
+                                .foregroundStyle(.red)
+                            VStack(alignment: .leading) {
+                                Text("Checkpoint").font(.caption.monospaced())
+                                Text(error).font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                    }
                     ForEach(model.failures, id: \.path) { failure in
                         HStack(alignment: .top, spacing: 6) {
                             Text(failure.fatal ? "FATAL" : "skipped")

@@ -29,7 +29,7 @@ final class VaultStateTests: XCTestCase {
     func testCompletedOutcomeRecordsTheSyncAndClearsWhatItPulled() {
         var s = state { $0.staleDownloads = 4; $0.conflicts = 1; $0.phase = .syncing }
         let now = Date(timeIntervalSince1970: 1_800_000_000)
-        s.apply(outcome: SyncOutcome(uploaded: 1, downloaded: 4, conflicts: [], failures: [], completed: true), now: now)
+        s.apply(outcome: SyncOutcome(uploaded: 1, downloaded: 4, conflicts: [], failures: [], completed: true, checkpointError: nil), now: now)
         XCTAssertEqual(s.phase, .idle)
         XCTAssertEqual(s.lastSyncedAt, now)
         XCTAssertEqual(s.staleDownloads, 0)
@@ -43,7 +43,7 @@ final class VaultStateTests: XCTestCase {
             path: "a.md", localModified: 1, remoteModified: 2, localSize: 3, remoteSize: 4,
             localDeleted: false, remoteDeleted: false
         )
-        s.apply(outcome: SyncOutcome(uploaded: 0, downloaded: 0, conflicts: [conflict], failures: [], completed: false), now: Date())
+        s.apply(outcome: SyncOutcome(uploaded: 0, downloaded: 0, conflicts: [conflict], failures: [], completed: false, checkpointError: nil), now: Date())
         XCTAssertEqual(s.conflicts, 1)
         XCTAssertNil(s.lastSyncedAt)
         XCTAssertEqual(s.phase, .idle)

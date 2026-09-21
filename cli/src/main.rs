@@ -455,6 +455,9 @@ async fn run_watch(config: &CliConfig, key: &KeyBytes) -> Result<(), Box<dyn std
                     let tag = if failure.fatal { "FATAL" } else { "skipped" };
                     println!("  [{tag}] {}: {}", failure.path, failure.error);
                 }
+                if let Some(error) = &result.checkpoint_error {
+                    println!("  checkpoint failed: {error}");
+                }
             }
             DaemonEvent::ConflictsPending { plan } => {
                 println!(
@@ -597,6 +600,9 @@ async fn run_sync_for_config(
             if fatal {
                 eprintln!("a fatal error stopped the sync early; re-run `obsink sync` to resume");
             }
+        }
+        if let Some(error) = &result.checkpoint_error {
+            eprintln!("checkpoint failed: {error}; run `obsink sync` again");
         }
 
         if result.conflicts.is_empty() {

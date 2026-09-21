@@ -246,6 +246,9 @@ pub struct SyncOutcome {
     pub conflicts: Vec<MobileConflict>,
     pub failures: Vec<MobileSyncFailure>,
     pub completed: bool,
+    /// The files moved but the checkpoint failed; the next sync redoes the
+    /// bookkeeping. Shown as its own row, not as a file failure.
+    pub checkpoint_error: Option<String>,
 }
 
 /// A vault the host can list/create/connect to (OBS-28).
@@ -844,6 +847,7 @@ impl VaultClient {
             conflicts: plan.conflicts.iter().map(to_mobile_conflict).collect(),
             failures: to_mobile_failures(&plan.failures),
             completed: false,
+            checkpoint_error: None,
         };
         *self.pending.lock().expect("pending lock") = Some(plan);
         Ok(outcome)
@@ -887,6 +891,7 @@ impl VaultClient {
             conflicts: result.conflicts.iter().map(to_mobile_conflict).collect(),
             failures: to_mobile_failures(&result.failures),
             completed: result.conflicts.is_empty(),
+            checkpoint_error: result.checkpoint_error.clone(),
         })
     }
 }
