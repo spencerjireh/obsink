@@ -354,13 +354,18 @@ The main app and File Provider extension share data through an **App Group** con
 
 ### 11.3 Extension Responsibilities
 
-- `enumerateChanges` — reports items added/modified/deleted since last enumeration, driven by database state
+- `enumerateItems` — a folder's live children (or, for the working set, every live item; the trash is always empty), in pages of 500 rows so a large vault's metadata never sits in one array inside the extension's memory budget
+- `enumerateChanges` — reports items added/modified/deleted since last enumeration, driven by database state (`rowVersion` anchor, tombstones as deletes), also in pages with `moreComing` and the last delivered row as the next anchor
 - `fetchContents` — serves decrypted files from local cache as a staged copy (the system consumes the file it is handed, so the vault copy is never returned directly)
-- `createItem` / `modifyItem` — accepts writes from Obsidian, saves to local cache, sets `pendingUpload = true` in database
+- `createItem` / `modifyItem` — accepts writes from Obsidian, saves to local cache, sets `pendingUpload = true` in database; a folder rename or move rewrites the paths of everything under it
+- `deleteItem` — removes the cache file or folder and tombstones the row and, for a folder, every descendant, each with its own `rowVersion`
+- Item versions: the content version is the bytes' (size, mtime) and the metadata version is `rowVersion`, so a rename or a pending flag never makes the system re-fetch unchanged contents
+- If the database cannot be opened (a data-protection-locked container before first unlock, a stale `-wal`), every request answers `NSFileProviderError.cannotSynchronize` instead of crashing the extension
+- `NSExtensionFileProviderSupportsPickingFolders` is set so Obsidian's folder picker can select the vault
 
 ### 11.4 The Extension Does NOT Touch the Network
 
-All networking lives in the main app's sync engine. The extension is a passive passthrough to local storage. On sync completion, the main app calls `NSFileProviderManager.signalEnumerator(for:)` to notify the extension of new data.
+All networking lives in the main app's sync engine. The extension is a passive passthrough to local storage. After a sync (completed, or paused on conflicts after its downloads were applied), the main app reconciles the database and calls `NSFileProviderManager.signalEnumerator(for:)` on the vault's working set and root container to notify the extension of new data.
 
 ### 11.5 Item Database Schema
 
@@ -369,13 +374,15 @@ CREATE TABLE items (
     identifier       TEXT PRIMARY KEY,
     parentIdentifier TEXT NOT NULL,
     filename         TEXT NOT NULL,
-    contentHash      TEXT,
+    contentHash      TEXT,            -- reserved; the extension has no keys, so it is not populated yet
     localPath        TEXT,
     isDirectory      INTEGER NOT NULL DEFAULT 0,
     size             INTEGER,
     modified         INTEGER,
     pendingUpload    INTEGER NOT NULL DEFAULT 0,
-    pendingDeletion  INTEGER NOT NULL DEFAULT 0
+    pendingDeletion  INTEGER NOT NULL DEFAULT 0,
+    isDeleted        INTEGER NOT NULL DEFAULT 0,  -- tombstone reported by enumerateChanges
+    rowVersion       INTEGER NOT NULL DEFAULT 0   -- monotonic change anchor
 );
 ```
 
