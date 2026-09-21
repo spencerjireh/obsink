@@ -127,6 +127,14 @@ final class SyncModel: ObservableObject {
     /// `Added vault X`, `Error: …`). Shown on that vault's card.
     @Published var status: String = "Not synced"
     @Published var busy: Bool = false
+    /// The live model, for the background refresh handler.
+    static weak var shared: SyncModel?
+    /// Set by the background task's expiration handler; the auto-sync
+    /// routine stops before its next vault.
+    var cancelRequested = false
+    private var lastAutoSyncAttempt: Date?
+    /// Resumed by `apply`/`fail` so `syncAndWait` can run vaults in turn.
+    private var syncCompletion: CheckedContinuation<Void, Never>?
     @Published var conflicts: [MobileConflict] = []
     @Published var choices: [String: MobileChoice] = [:]
     @Published var previews: [String: MobileConflictPreview] = [:]
@@ -177,10 +185,24 @@ final class SyncModel: ObservableObject {
         }
 
         Self.migrateLegacyStorage(activeVaultID: activeVaultID, defaults: defaults)
+        migrateKeychainAccessibility()
         rebuildVaultStates()
         loadBearerState()
         syncFileProviderDomains()
         finishPendingRemovals()
+        Self.shared = self
+    }
+
+    /// Items saved before OBS-107 are `WhenUnlocked`; the background refresh
+    /// runs with the device locked, so re-save them once as
+    /// `AfterFirstUnlock`.
+    private func migrateKeychainAccessibility() {
+        let flag = "keychainAfterFirstUnlock"
+        guard !defaults.bool(forKey: flag) else { return }
+        var accounts = entries.map(\.vaultID)
+        accounts.append(KeychainStore.bearerAccount(for: serverURL))
+        let ok = accounts.allSatisfy { KeychainStore.resave(account: $0) }
+        if ok { defaults.set(true, forKey: flag) } else { NSLog("ObSink: keychain accessibility migration incomplete") }
     }
 
     var activeEntry: VaultEntry? {
@@ -474,7 +496,7 @@ final class SyncModel: ObservableObject {
                 if case .error = state.phase { vaultStates[id]?.phase = .idle }
             }
             refreshAccount()
-            checkStale()
+            Task { await checkStale() }
         }
     }
 
@@ -712,6 +734,7 @@ final class SyncModel: ObservableObject {
     }
 
     private func apply(outcome: SyncOutcome, client: VaultClient, vaultID: String) {
+        defer { finishSyncWait() }
         self.client = client
         conflicts = outcome.conflicts
         choices = Dictionary(uniqueKeysWithValues: outcome.conflicts.map { ($0.path, .keepLocal) })
@@ -838,7 +861,7 @@ final class SyncModel: ObservableObject {
     /// syncing, one vault after another (each call blocks a thread). Only
     /// vaults on this build's server with a stored key take part; a 401 on
     /// any of them ends the session once.
-    func checkStale() {
+    func checkStale() async {
         guard !busy else { return }
         let bearer = self.bearer
         let targets: [(String, MobileVaultConfig, Data)] = entries.compactMap { entry in
@@ -852,7 +875,7 @@ final class SyncModel: ObservableObject {
             return (entry.vaultID, config, key)
         }
         guard !targets.isEmpty else { return }
-        Task.detached { [weak self] in
+        await Task.detached { [weak self] in
             for (vaultID, config, key) in targets {
                 // Retry a couple of times: a transient network error on open
                 // would otherwise silently suppress the warning until the next
@@ -891,10 +914,52 @@ final class SyncModel: ObservableObject {
                 }
                 if stop { return }
             }
+        }.value
+    }
+
+    // MARK: Automatic sync (OBS-107)
+
+    /// Sync every vault `AutoSyncPolicy` picks, one at a time, after a fresh
+    /// stale check. Runs on launch, on activation and from the background
+    /// refresh; foreground runs within a minute of each other are skipped.
+    func autoSync(reason: AutoSyncReason, now: Date = Date()) async {
+        guard hasBearer, !sessionExpired else { return }
+        if reason != .background, let last = lastAutoSyncAttempt, now.timeIntervalSince(last) < 60 {
+            return
+        }
+        lastAutoSyncAttempt = now
+        refreshAllPending()
+        await checkStale()
+        for entry in entries {
+            if cancelRequested { break }
+            guard let state = vaultStates[entry.vaultID],
+                  AutoSyncPolicy.shouldSync(state, now: Date()) else { continue }
+            await syncAndWait(vaultID: entry.vaultID)
         }
     }
 
+    /// `sync(vaultID:passphrase:)` with the stored key, returning when the
+    /// cycle has applied or failed. Returns at once when the sync is declined
+    /// (busy, foreign, missing vault).
+    func syncAndWait(vaultID: String) async {
+        guard !busy else { return }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            syncCompletion = continuation
+            sync(vaultID: vaultID, passphrase: "")
+            if !busy {
+                syncCompletion = nil
+                continuation.resume()
+            }
+        }
+    }
+
+    private func finishSyncWait() {
+        syncCompletion?.resume()
+        syncCompletion = nil
+    }
+
     private func fail(_ error: Error, vaultID: String) {
+        defer { finishSyncWait() }
         busy = false
         progress = nil
         if error.isUnauthorized {
