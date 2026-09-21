@@ -3,17 +3,19 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     process::Command,
+    sync::Arc,
 };
 
 use clap::{Parser, Subcommand};
 use dirs::home_dir;
 use obsink_core::{
-    complete_sync, derive_key, derive_keys, diff_local_and_remote, fetch_remote_manifest,
+    complete_sync, daemon_channel, derive_key, derive_keys, diff_local_and_remote,
+    fetch_remote_manifest,
     keychain::{delete_secret, load_secret, save_secret},
-    load_local_state, normalize_server_url, prepare_sync, sync_manifest_path, write_atomic,
-    ApiClient, AuthClient, Conflict, ConflictResolution, ConflictResolutionChoice,
-    CreateVaultRequest, KeyBytes, ProgressEvent, ProgressSink, SyncActionKind, SyncPhase, SyncPlan,
-    VaultConfig,
+    load_local_state, normalize_server_url, prepare_sync, run_daemon, sync_manifest_path,
+    write_atomic, ApiClient, AuthClient, Conflict, ConflictResolution, ConflictResolutionChoice,
+    CreateVaultRequest, DaemonEvent, DaemonOptions, KeyBytes, ProgressEvent, ProgressSink,
+    SyncActionKind, SyncPhase, SyncPlan, VaultConfig,
 };
 use rpassword::prompt_password;
 use serde::{Deserialize, Serialize};
@@ -125,6 +127,10 @@ enum Commands {
         directory: Option<PathBuf>,
     },
     Sync,
+    /// Keep the vault in sync: watch the folder, poll the server, run a
+    /// cycle whenever either side changes. Conflicts are reported and left
+    /// for `obsink sync`. Ctrl-C stops.
+    Watch,
 }
 
 /// On-disk config. The bearer (session token or operator API key) is NOT
@@ -136,6 +142,10 @@ struct CliConfig {
     server_url: String,
     vault_id: String,
     local_path: String,
+    /// Extra ignore patterns for this vault (`ignore = ["drafts/", "*.tmp"]`),
+    /// on top of the built-in defaults.
+    #[serde(default)]
+    ignore: Vec<String>,
 }
 
 fn main() {
@@ -300,6 +310,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 api_key: bearer,
                 vault_id: String::new(),
                 local_path: String::new(),
+                ignore: Vec::new(),
             });
             let vaults = client.list_vaults().await?;
 
@@ -320,6 +331,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 api_key: bearer,
                 vault_id: String::new(),
                 local_path: directory.display().to_string(),
+                ignore: Vec::new(),
             });
             let response = client
                 .create_vault(&CreateVaultRequest {
@@ -336,6 +348,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 server_url: url,
                 vault_id,
                 local_path: directory.display().to_string(),
+                ignore: Vec::new(),
             };
             save_config(&config)?;
             run_sync_for_config(&config, &key).await?;
@@ -357,6 +370,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 server_url: url,
                 vault_id,
                 local_path: directory.display().to_string(),
+                ignore: Vec::new(),
             };
 
             validate_passphrase(&config, &key).await?;
@@ -373,7 +387,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 Some(directory) => resolve_vault_dir(&directory)?,
                 None => PathBuf::from(&stored.local_path),
             };
-            let local = load_local_state(&directory, &keys)?;
+            let vault_config = to_vault_config(&stored)?;
+            let ignore = vault_config.ignore_rules();
+            let local = load_local_state(&directory, &keys, &ignore)?;
             let live = local.working.values().filter(|entry| !entry.deleted);
             let total_size: u64 = live.clone().map(|entry| entry.size).sum();
 
@@ -381,13 +397,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("files: {}", live.count());
             println!("bytes: {total_size}");
 
-            let remote = fetch_remote_manifest(
-                &ApiClient::new(to_vault_config(&stored)?),
-                &directory,
-                &keys,
-            )
-            .await?;
-            let diff = diff_local_and_remote(&local.base, &local.working, &remote);
+            let remote =
+                fetch_remote_manifest(&ApiClient::new(vault_config), &directory, &keys).await?;
+            let diff = diff_local_and_remote(&local.base, &local.working, &remote, &ignore);
             println!("upload: {}", diff.upload.len());
             println!("download: {}", diff.download.len());
             println!("conflicts: {}", diff.conflicts.len());
@@ -397,8 +409,77 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let key = load_key_from_keychain(&config.vault_id)?;
             run_sync_for_config(&config, &key).await?;
         }
+        Commands::Watch => {
+            let config = load_config()?;
+            let key = load_key_from_keychain(&config.vault_id)?;
+            run_watch(&config, &key).await?;
+        }
     }
 
+    Ok(())
+}
+
+/// `obsink watch`: the daemon with the stderr progress sink, one line per
+/// event on stdout. Stops on Ctrl-C after the cycle in flight finishes.
+async fn run_watch(config: &CliConfig, key: &KeyBytes) -> Result<(), Box<dyn std::error::Error>> {
+    let vault_config = to_vault_config(config)?;
+    let (handle, commands) = daemon_channel();
+    let (events_tx, mut events) = tokio::sync::mpsc::channel(32);
+    let daemon = tokio::spawn(run_daemon(
+        vault_config,
+        *key,
+        DaemonOptions::default(),
+        commands,
+        events_tx,
+        Arc::new(CliProgress),
+    ));
+    let stop_handle = handle.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            eprintln!("stopping after the current cycle");
+            stop_handle.stop();
+        }
+    });
+    while let Some(event) = events.recv().await {
+        match event {
+            DaemonEvent::Started => println!("watching {}", config.local_path),
+            DaemonEvent::SyncStarted => println!("sync started"),
+            DaemonEvent::SyncFinished(result) => {
+                println!(
+                    "sync finished: {} uploaded, {} downloaded, {} failed",
+                    result.upload.len(),
+                    result.download.len(),
+                    result.failures.len()
+                );
+                for failure in &result.failures {
+                    let tag = if failure.fatal { "FATAL" } else { "skipped" };
+                    println!("  [{tag}] {}: {}", failure.path, failure.error);
+                }
+            }
+            DaemonEvent::ConflictsPending { plan } => {
+                println!(
+                    "{} conflict(s) waiting; run `obsink sync` to resolve:",
+                    plan.conflicts.len()
+                );
+                for conflict in &plan.conflicts {
+                    println!("  {}", conflict.path);
+                }
+            }
+            DaemonEvent::Failed {
+                message,
+                fatal,
+                retry_in,
+            } => match retry_in {
+                Some(wait) => println!("error: {message} (retrying in {}s)", wait.as_secs()),
+                None => println!("{}: {message}", if fatal { "error" } else { "skipped" }),
+            },
+            DaemonEvent::Stopped => {
+                println!("stopped");
+                break;
+            }
+        }
+    }
+    daemon.await??;
     Ok(())
 }
 
@@ -644,6 +725,7 @@ fn to_vault_config(config: &CliConfig) -> Result<VaultConfig, Box<dyn std::error
         api_key: bearer,
         vault_id: config.vault_id.clone(),
         local_path: config.local_path.clone(),
+        ignore: config.ignore.clone(),
     })
 }
 
