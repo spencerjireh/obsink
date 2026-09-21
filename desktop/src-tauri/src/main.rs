@@ -17,7 +17,7 @@ use tauri::{
 use obsink_core::{
     complete_sync, daemon_channel, derive_key, derive_keys, diff_local_and_remote,
     fetch_remote_manifest,
-    keychain::{delete_secret, load_secret, save_secret},
+    keychain::{delete_secret, load_bearer as load_stored_bearer, load_secret, save_secret},
     load_local_state, normalize_server_url, prepare_sync, run_daemon, write_atomic, ApiClient,
     ApiError, AuthClient, AuthError, Conflict, ConflictResolution, CreateVaultRequest,
     DaemonCallError, DaemonEvent, DaemonHandle, DaemonOptions, KeyBytes, ManifestDiff,
@@ -285,7 +285,7 @@ impl LocalVaultSummary {
 
 /// The public server every build talks to unless `OBSINK_SERVER_URL` says
 /// otherwise at build time (self-hosters) or at launch (tests, harnesses).
-const FALLBACK_SERVER_URL: &str = "https://obsink.spencerjireh.com";
+const FALLBACK_SERVER_URL: &str = "https://obsink-api.spencerjireh.com";
 
 /// The one server this app talks to. The UI never shows or edits it.
 fn default_server_url() -> String {
@@ -323,9 +323,10 @@ fn bearer_account(server_url: &str) -> String {
     format!("bearer:{}", normalize_server_url(server_url))
 }
 
-/// The bearer stored for a server, or a "sign in first" error.
+/// The bearer stored for a server (an entry under a legacy host is moved
+/// forward by core), or a "sign in first" error.
 fn load_bearer(server_url: &str) -> Result<String, CommandError> {
-    load_secret(&bearer_account(server_url))
+    load_stored_bearer(server_url)
         .map_err(|_| CommandError::other(format!("not signed in to {server_url} — sign in first")))
 }
 
@@ -1206,7 +1207,7 @@ fn selected_vault(vault_id: Option<String>) -> Result<StoredVault, io::Error> {
 fn to_vault_config(vault: &StoredVault) -> VaultConfig {
     VaultConfig {
         server_url: vault.server_url.clone(),
-        api_key: load_secret(&bearer_account(&vault.server_url)).unwrap_or_default(),
+        api_key: load_stored_bearer(&vault.server_url).unwrap_or_default(),
         vault_id: vault.id.clone(),
         local_path: vault.local_path.clone(),
         ignore: vault.ignore.clone(),

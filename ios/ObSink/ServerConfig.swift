@@ -6,7 +6,7 @@ import Foundation
 /// `OBSINK_UITEST_SERVER_URL` in the launch environment. Never shown as a
 /// field: self-hosters build with their own URL.
 enum ServerConfig {
-    static let fallbackURL = "https://obsink.spencerjireh.com"
+    static let fallbackURL = "https://obsink-api.spencerjireh.com"
     static let infoKey = "ObSinkServerURL"
     static let overrideEnv = "OBSINK_UITEST_SERVER_URL"
 

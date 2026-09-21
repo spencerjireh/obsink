@@ -12,6 +12,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::server_url::{legacy_server_urls, normalize_server_url};
+
 pub const KEYCHAIN_SERVICE: &str = "obsink";
 
 fn keyring_dir() -> Option<PathBuf> {
@@ -63,6 +65,32 @@ pub fn delete_secret(account: &str) {
         return;
     }
     native::delete(account);
+}
+
+/// Keychain account for a server's bearer: `bearer:<canonical url>`.
+pub fn bearer_account(server_url: &str) -> String {
+    format!("bearer:{}", normalize_server_url(server_url))
+}
+
+/// The bearer for a server. A bearer an older build stored under a legacy
+/// host (`LEGACY_SERVER_ALIASES`) is moved to the canonical entry the first
+/// time it is read, so the host move needs no sign-in.
+pub fn load_bearer(server_url: &str) -> io::Result<String> {
+    let canonical = normalize_server_url(server_url);
+    let account = format!("bearer:{canonical}");
+    let missing = match load_secret(&account) {
+        Ok(token) => return Ok(token),
+        Err(error) => error,
+    };
+    for legacy in legacy_server_urls(&canonical) {
+        let legacy_account = format!("bearer:{legacy}");
+        if let Ok(token) = load_secret(&legacy_account) {
+            save_secret(&account, &token)?;
+            delete_secret(&legacy_account);
+            return Ok(token);
+        }
+    }
+    Err(missing)
 }
 
 #[cfg(target_os = "macos")]
@@ -123,7 +151,10 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{keyring_file, write_private};
+    use super::{
+        bearer_account, delete_secret, keyring_file, load_bearer, load_secret, save_secret,
+        write_private,
+    };
 
     #[test]
     fn file_fallback_is_private() {
@@ -140,5 +171,34 @@ mod tests {
             path.file_name().unwrap().to_str().unwrap(),
             "bearer_https___example.com"
         );
+    }
+
+    // The file keyring under a private directory, so the test never touches
+    // the login keychain. `OBSINK_KEYRING_DIR` is process-wide; this is the
+    // only core test that sets it.
+    #[test]
+    fn a_legacy_bearer_moves_to_the_canonical_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("OBSINK_KEYRING_DIR", dir.path());
+
+        save_secret("bearer:https://obsink.spencerjireh.com", "os_old").unwrap();
+        assert_eq!(
+            bearer_account("https://obsink.spencerjireh.com/"),
+            "bearer:https://obsink-api.spencerjireh.com"
+        );
+        assert_eq!(
+            load_bearer("https://obsink-api.spencerjireh.com").unwrap(),
+            "os_old"
+        );
+        // Moved: the canonical entry exists, the legacy one is gone.
+        assert_eq!(
+            load_secret("bearer:https://obsink-api.spencerjireh.com").unwrap(),
+            "os_old"
+        );
+        assert!(load_secret("bearer:https://obsink.spencerjireh.com").is_err());
+        assert!(load_bearer("https://elsewhere.test").is_err());
+
+        delete_secret("bearer:https://obsink-api.spencerjireh.com");
+        std::env::remove_var("OBSINK_KEYRING_DIR");
     }
 }
