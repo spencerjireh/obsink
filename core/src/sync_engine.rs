@@ -295,14 +295,105 @@ pub async fn complete_sync(
     let client = ApiClient::new(config.clone());
     let local_root = Path::new(&config.local_path);
 
+    let resolved =
+        apply_resolutions(local_root, &keys, &client, plan, resolutions, progress).await?;
+
+    // Paths whose checkpoint entry must not advance: a failed transfer keeps
+    // its old base so the next diff retries it, and a late or deferred
+    // conflict keeps it so the next diff still sees "both changed" instead
+    // of clobbering.
+    let mut hold_back: BTreeSet<String> = plan
+        .failures
+        .iter()
+        .map(|failure| failure.path.clone())
+        .chain(
+            resolved
+                .deferred
+                .iter()
+                .map(|conflict| conflict.path.clone()),
+        )
+        .collect();
+
+    progress.report(ProgressEvent::Phase(SyncPhase::Uploading));
+    let uploads = run_uploads(
+        local_root,
+        &keys,
+        &client,
+        &resolved.uploads,
+        &mut hold_back,
+        progress,
+    )
+    .await;
+
+    // Carry download-side failures from prepare into the final result.
+    let mut failures = plan.failures.clone();
+    failures.extend(uploads.failures);
+    let mut conflicts = resolved.deferred;
+    conflicts.extend(uploads.late_conflicts);
+
+    let downloaded = plan
+        .download
+        .iter()
+        .filter(|action| matches!(action.kind, SyncActionKind::Download))
+        .count()
+        .saturating_sub(
+            failures
+                .iter()
+                .filter(|failure| matches!(failure.kind, SyncActionKind::Download))
+                .count(),
+        );
+    progress.report(ProgressEvent::Done {
+        uploaded: uploads.succeeded,
+        downloaded,
+        failed: failures.len(),
+    });
+
+    // Skip the checkpoint when a fatal error already proved the network is
+    // gone; otherwise a checkpoint failure is reported on its own channel
+    // rather than as a file failure.
+    let checkpoint_error = if failures.iter().any(|failure| failure.fatal) {
+        None
+    } else {
+        checkpoint(local_root, &keys, &client, &hold_back)
+            .await
+            .err()
+            .map(|error| error.to_string())
+    };
+
+    Ok(SyncResult {
+        upload: resolved.uploads,
+        download: plan.download.clone(),
+        conflicts,
+        failures,
+        checkpoint_error,
+    })
+}
+
+/// What resolving a plan's conflicts leaves to upload, and which conflicts
+/// the caller deferred.
+struct Resolved {
+    uploads: Vec<SyncAction>,
+    deferred: Vec<Conflict>,
+}
+
+/// Apply the caller's choice to every conflict in the plan: `KeepLocal`
+/// queues an upload, `KeepRemote` writes the server version, `KeepBoth`
+/// writes a `.conflict` copy and queues both, `Defer` leaves the path
+/// alone. A conflict without a choice is an error.
+async fn apply_resolutions(
+    local_root: &Path,
+    keys: &CryptoKeys,
+    client: &ApiClient,
+    plan: &SyncPlan,
+    resolutions: &[ConflictResolution],
+    progress: &dyn ProgressSink,
+) -> Result<Resolved, SyncEngineError> {
     let resolution_map = resolutions
         .iter()
         .map(|resolution| (resolution.path.clone(), resolution.choice.clone()))
         .collect::<BTreeMap<_, _>>();
 
-    let mut pending_uploads = plan.upload.clone();
-    // Conflicts the caller chose to leave for later: nothing moves, the path
-    // is held back from the checkpoint, and it comes back on the result.
+    let mut uploads = plan.upload.clone();
     let mut deferred = Vec::new();
 
     if !plan.conflicts.is_empty() {
@@ -319,7 +410,7 @@ pub async fn complete_sync(
                 deferred.push(conflict.clone());
             }
             ConflictResolutionChoice::KeepLocal => {
-                pending_uploads.push(conflict_to_upload(conflict));
+                uploads.push(conflict_to_upload(conflict));
             }
             ConflictResolutionChoice::KeepRemote => {
                 progress.report(ProgressEvent::FileStarted {
@@ -328,7 +419,7 @@ pub async fn complete_sync(
                     index: 0,
                     total: 1,
                 });
-                let bytes = apply_keep_remote(local_root, &keys, &client, conflict).await?;
+                let bytes = apply_keep_remote(local_root, keys, client, conflict).await?;
                 progress.report(ProgressEvent::FileCompleted {
                     path: conflict.path.clone(),
                     bytes,
@@ -342,13 +433,13 @@ pub async fn complete_sync(
                     total: 1,
                 });
                 let (duplicate_path, bytes) =
-                    write_conflict_copy(local_root, &keys, &client, conflict).await?;
+                    write_conflict_copy(local_root, keys, client, conflict).await?;
                 progress.report(ProgressEvent::FileCompleted {
                     path: conflict.path.clone(),
                     bytes,
                 });
-                pending_uploads.push(conflict_to_upload(conflict));
-                pending_uploads.push({
+                uploads.push(conflict_to_upload(conflict));
+                uploads.push({
                     let root = local_root.to_path_buf();
                     let keys = keys.clone();
                     blocking(move || build_upload_action_for_path(&root, &duplicate_path, &keys))
@@ -358,26 +449,55 @@ pub async fn complete_sync(
         }
     }
 
-    progress.report(ProgressEvent::Phase(SyncPhase::Uploading));
-    let total = pending_uploads.len();
-    let mut late_conflicts = Vec::new();
-    let mut upload_failures = Vec::new();
-    let mut successful_uploads = 0usize;
-    // Paths whose checkpoint entry must not advance: a failed transfer keeps
-    // its old base so the next diff retries it, and a late conflict keeps it
-    // so the next diff still sees "both changed" instead of clobbering.
-    let mut hold_back = plan
-        .failures
-        .iter()
-        .map(|failure| failure.path.clone())
-        .collect::<BTreeSet<_>>();
-    hold_back.extend(deferred.iter().map(|conflict| conflict.path.clone()));
-    late_conflicts.extend(deferred);
-    // Uploads travel in batches (`POST /vaults/:id/batch`): one round trip
-    // per `BATCH_MAX_OPS` files or `BATCH_BYTE_BUDGET` bytes instead of one per
-    // file. Each batch is read, encrypted and sent before the next is
-    // prepared, so memory holds one batch of ciphertext at a time.
-    let sizes: Vec<u64> = pending_uploads
+    Ok(Resolved { uploads, deferred })
+}
+
+/// What the upload phase produced. Paths that failed or hit a late 409 are
+/// also added to the caller's `hold_back`.
+struct UploadOutcome {
+    succeeded: usize,
+    failures: Vec<SyncFailure>,
+    late_conflicts: Vec<Conflict>,
+}
+
+/// Upload in batches (`POST /vaults/:id/batch`): one round trip per
+/// `BATCH_MAX_OPS` files or `BATCH_BYTE_BUDGET` bytes instead of one per
+/// file. Each batch is read, encrypted and sent before the next is prepared,
+/// so memory holds one batch of ciphertext at a time. A fatal error (whole
+/// request, or a 5xx inside the answer) stops the remaining batches.
+async fn run_uploads(
+    local_root: &Path,
+    keys: &CryptoKeys,
+    client: &ApiClient,
+    uploads: &[SyncAction],
+    hold_back: &mut BTreeSet<String>,
+    progress: &dyn ProgressSink,
+) -> UploadOutcome {
+    let total = uploads.len();
+    let mut outcome = UploadOutcome {
+        succeeded: 0,
+        failures: Vec::new(),
+        late_conflicts: Vec::new(),
+    };
+    let fail = |outcome: &mut UploadOutcome,
+                hold_back: &mut BTreeSet<String>,
+                action: &SyncAction,
+                message: String,
+                fatal: bool| {
+        progress.report(ProgressEvent::FileFailed {
+            path: action.path.clone(),
+            error: message.clone(),
+        });
+        hold_back.insert(action.path.clone());
+        outcome.failures.push(SyncFailure {
+            path: action.path.clone(),
+            kind: action.kind.clone(),
+            error: message,
+            fatal,
+        });
+    };
+
+    let sizes: Vec<u64> = uploads
         .iter()
         .map(|action| action.local.as_ref().map(|entry| entry.size).unwrap_or(0))
         .collect();
@@ -385,14 +505,14 @@ pub async fn complete_sync(
         let mut ops = Vec::with_capacity(range.len());
         let mut members = Vec::with_capacity(range.len());
         for index in range {
-            let action = &pending_uploads[index];
+            let action = &uploads[index];
             progress.report(ProgressEvent::FileStarted {
                 path: action.path.clone(),
                 kind: action.kind.clone(),
                 index,
                 total,
             });
-            match prepare_batch_op(local_root, &keys, action).await {
+            match prepare_batch_op(local_root, keys, action).await {
                 Ok(Some(op)) => {
                     ops.push(op);
                     members.push(index);
@@ -400,33 +520,20 @@ pub async fn complete_sync(
                 // Nothing to send for this kind; count it like the old
                 // per-file loop did.
                 Ok(None) => {
-                    successful_uploads += 1;
+                    outcome.succeeded += 1;
                     progress.report(ProgressEvent::FileCompleted {
                         path: action.path.clone(),
                         bytes: 0,
                     });
                 }
-                Err(error) => {
-                    let message = error.to_string();
-                    progress.report(ProgressEvent::FileFailed {
-                        path: action.path.clone(),
-                        error: message.clone(),
-                    });
-                    hold_back.insert(action.path.clone());
-                    upload_failures.push(SyncFailure {
-                        path: action.path.clone(),
-                        kind: action.kind.clone(),
-                        error: message,
-                        fatal: false,
-                    });
-                }
+                Err(error) => fail(&mut outcome, hold_back, action, error.to_string(), false),
             }
         }
         if ops.is_empty() {
             continue;
         }
 
-        let results = match client.batch(&ops, &keys).await {
+        let results = match client.batch(&ops, keys).await {
             Ok(results) => results,
             Err(error) => {
                 // The whole request failed: every member fails alike, and a
@@ -435,18 +542,13 @@ pub async fn complete_sync(
                 let fatal = is_fatal_api_error(&error);
                 let message = error.to_string();
                 for &index in &members {
-                    let action = &pending_uploads[index];
-                    progress.report(ProgressEvent::FileFailed {
-                        path: action.path.clone(),
-                        error: message.clone(),
-                    });
-                    hold_back.insert(action.path.clone());
-                    upload_failures.push(SyncFailure {
-                        path: action.path.clone(),
-                        kind: action.kind.clone(),
-                        error: message.clone(),
+                    fail(
+                        &mut outcome,
+                        hold_back,
+                        &uploads[index],
+                        message.clone(),
                         fatal,
-                    });
+                    );
                 }
                 if fatal {
                     break 'batches;
@@ -457,10 +559,10 @@ pub async fn complete_sync(
 
         let mut stop = false;
         for (&index, result) in members.iter().zip(results) {
-            let action = &pending_uploads[index];
+            let action = &uploads[index];
             match result.status {
                 200..=299 => {
-                    successful_uploads += 1;
+                    outcome.succeeded += 1;
                     let bytes = action.local.as_ref().map(|entry| entry.size).unwrap_or(0);
                     progress.report(ProgressEvent::FileCompleted {
                         path: action.path.clone(),
@@ -480,7 +582,7 @@ pub async fn complete_sync(
                         });
                     let local = action.local.clone().unwrap_or_default();
                     hold_back.insert(action.path.clone());
-                    late_conflicts.push(Conflict {
+                    outcome.late_conflicts.push(Conflict {
                         path: action.path.clone(),
                         local,
                         remote,
@@ -488,18 +590,13 @@ pub async fn complete_sync(
                 }
                 status => {
                     let fatal = is_fatal_status(status);
-                    let message = format!("api error: batch operation answered {status}");
-                    progress.report(ProgressEvent::FileFailed {
-                        path: action.path.clone(),
-                        error: message.clone(),
-                    });
-                    hold_back.insert(action.path.clone());
-                    upload_failures.push(SyncFailure {
-                        path: action.path.clone(),
-                        kind: action.kind.clone(),
-                        error: message,
+                    fail(
+                        &mut outcome,
+                        hold_back,
+                        action,
+                        format!("api error: batch operation answered {status}"),
                         fatal,
-                    });
+                    );
                     stop |= fatal;
                 }
             }
@@ -509,62 +606,28 @@ pub async fn complete_sync(
         }
     }
 
-    // Carry download-side failures from prepare into the final result.
-    let mut failures = plan.failures.clone();
-    failures.extend(upload_failures);
+    outcome
+}
 
-    let downloaded = plan
-        .download
-        .iter()
-        .filter(|action| matches!(action.kind, SyncActionKind::Download))
-        .count()
-        .saturating_sub(
-            failures
-                .iter()
-                .filter(|failure| matches!(failure.kind, SyncActionKind::Download))
-                .count(),
-        );
-
-    progress.report(ProgressEvent::Done {
-        uploaded: successful_uploads,
-        downloaded,
-        failed: failures.len(),
-    });
-
-    // Checkpoint the server manifest so local state advances past every file
-    // that did transfer (the resume point); held-back paths keep their old base
-    // entry. Runs even with late conflicts pending, so the paths that did land
-    // do not turn into false conflicts if a third device edits them next. Skip
-    // the re-fetch when a fatal error already proved the network is gone.
-    if !failures.iter().any(|failure| failure.fatal) {
-        match fetch_remote_manifest(&client, local_root, &keys).await {
-            Ok(remote_manifest) => {
-                let manifest_path = sync_manifest_path(local_root);
-                let hold_back = hold_back.clone();
-                blocking(move || {
-                    let previous_base = load_manifest_from_disk(&manifest_path)?;
-                    let next = checkpoint_manifest(&previous_base, &remote_manifest, &hold_back);
-                    save_manifest_to_disk(&manifest_path, &next)
-                })
-                .await?;
-            }
-            Err(error) => {
-                failures.push(SyncFailure {
-                    path: String::new(),
-                    kind: SyncActionKind::Upload,
-                    error: error.to_string(),
-                    fatal: true,
-                });
-            }
-        }
-    }
-
-    Ok(SyncResult {
-        upload: pending_uploads,
-        download: plan.download.clone(),
-        conflicts: late_conflicts,
-        failures,
+/// Checkpoint the server manifest so local state advances past every file
+/// that did transfer (the resume point); held-back paths keep their old base
+/// entry. Runs even with late conflicts pending, so the paths that did land
+/// do not turn into false conflicts if a third device edits them next.
+async fn checkpoint(
+    local_root: &Path,
+    keys: &CryptoKeys,
+    client: &ApiClient,
+    hold_back: &BTreeSet<String>,
+) -> Result<(), SyncEngineError> {
+    let remote_manifest = fetch_remote_manifest(client, local_root, keys).await?;
+    let manifest_path = sync_manifest_path(local_root);
+    let hold_back = hold_back.clone();
+    blocking(move || {
+        let previous_base = load_manifest_from_disk(&manifest_path)?;
+        let next = checkpoint_manifest(&previous_base, &remote_manifest, &hold_back);
+        save_manifest_to_disk(&manifest_path, &next)
     })
+    .await
 }
 
 /// `KeepBoth` needs two live versions. When one side is a deletion there is
@@ -754,7 +817,11 @@ pub(crate) fn is_fatal_sync_error(error: &SyncEngineError) -> bool {
 
 fn is_fatal_api_error(error: &ApiError) -> bool {
     match error {
-        ApiError::Http(_) => true,
+        // Not reaching the server is systemic. A response that did arrive
+        // but could not be decoded (bad JSON, a body cut mid-stream, a
+        // builder slip) belongs to that one request, so the rest of the
+        // batch is still worth trying.
+        ApiError::Http(error) => error.is_timeout() || error.is_connect() || error.is_request(),
         ApiError::Unauthorized => true,
         ApiError::UnexpectedStatus { status, .. } => is_fatal_status(status.as_u16()),
         ApiError::Crypto(_) | ApiError::Conflict { .. } => false,
@@ -2420,5 +2487,126 @@ mod tests {
         );
         let _ = complete_sync(&cfg, &key, &plan, &[], &NoProgress).await;
         batch.assert_hits_async(1).await;
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_failure_is_reported_on_its_own_channel() {
+        // The upload lands; the manifest re-fetch afterwards fails. The
+        // result carries no file failure, `checkpoint_error` is set, and the
+        // base is untouched so the next diff redoes the bookkeeping.
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("note.md"), "hello").unwrap();
+        let server = MockServer::start_async().await;
+        let key = [26_u8; 32];
+        let keys = derive_keys(&key);
+        let token = path_token(&keys.path_token, "note.md");
+
+        let manifest = server
+            .mock_async(|when, then| {
+                when.method(GET).path("/vaults/vault_123/manifest");
+                then.status(200).json_body_obj(&serde_json::json!({}));
+            })
+            .await;
+        let batch = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/vaults/vault_123/batch");
+                then.status(200)
+                    .json_body_obj(&batch_results(&[(&token, 200, None)]));
+            })
+            .await;
+
+        let cfg = config(server.base_url(), dir.path().display().to_string());
+        let plan = prepare_sync(&cfg, &key, &NoProgress).await.unwrap();
+        manifest.delete_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path("/vaults/vault_123/manifest");
+                then.status(503).body("maintenance");
+            })
+            .await;
+
+        let result = complete_sync(&cfg, &key, &plan, &[], &NoProgress)
+            .await
+            .unwrap();
+        batch.assert_hits_async(1).await;
+        assert!(result.failures.is_empty());
+        assert_eq!(result.upload.len(), 1);
+        let error = result.checkpoint_error.clone().expect("checkpoint error");
+        assert!(error.contains("503"), "{error}");
+        assert!(!sync_manifest_path(dir.path()).exists());
+        let serialized = serde_json::to_value(&result).unwrap();
+        assert!(serialized["checkpoint_error"].is_string());
+    }
+
+    #[tokio::test]
+    async fn a_response_that_cannot_be_decoded_is_not_fatal() {
+        // Two downloads; the first blob's GET answers with a body that is
+        // not a valid ciphertext (a per-file crypto error) and the manifest
+        // is fine. The second download still happens and nothing is fatal.
+        // Plus the predicate itself on a decode error from reqwest.
+        let dir = tempdir().unwrap();
+        let server = MockServer::start_async().await;
+        let key = [27_u8; 32];
+        let keys = derive_keys(&key);
+        let manifest = merge_manifests(vec![
+            server_manifest(&keys, "a.md", b"file a", 1, false),
+            server_manifest(&keys, "b.md", b"file b", 1, false),
+        ]);
+        server
+            .mock_async(move |when, then| {
+                when.method(GET).path("/vaults/vault_123/manifest");
+                then.status(200).json_body_obj(&manifest);
+            })
+            .await;
+        let token_a = path_token(&keys.path_token, "a.md");
+        let token_b = path_token(&keys.path_token, "b.md");
+        let good = encrypt(&keys.content_enc, b"file b").unwrap();
+        server
+            .mock_async(move |when, then| {
+                when.method(GET)
+                    .path(format!("/vaults/vault_123/files/{token_a}"));
+                then.status(200).body(b"not ciphertext");
+            })
+            .await;
+        server
+            .mock_async(move |when, then| {
+                when.method(GET)
+                    .path(format!("/vaults/vault_123/files/{token_b}"));
+                then.status(200).body(good.clone());
+            })
+            .await;
+
+        let cfg = config(server.base_url(), dir.path().display().to_string());
+        let plan = prepare_sync(&cfg, &key, &NoProgress).await.unwrap();
+        assert_eq!(plan.failures.len(), 1);
+        assert_eq!(plan.failures[0].path, "a.md");
+        assert!(!plan.failures[0].fatal);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("b.md")).unwrap(),
+            "file b"
+        );
+
+        // A JSON body that is not JSON: reqwest's decode error, not fatal.
+        let bad_json = MockServer::start_async().await;
+        bad_json
+            .mock_async(|when, then| {
+                when.method(GET).path("/vaults/vault_123/manifest");
+                then.status(200).body("{not json");
+            })
+            .await;
+        let error = crate::api_client::ApiClient::new(config(bad_json.base_url(), ".".into()))
+            .get_manifest(&keys)
+            .await
+            .unwrap_err();
+        assert!(matches!(&error, crate::api_client::ApiError::Http(e) if e.is_decode()));
+        assert!(!super::is_fatal_api_error(&error));
+
+        // Nobody listening: a connect error stays fatal.
+        let error =
+            crate::api_client::ApiClient::new(config("http://127.0.0.1:1".into(), ".".into()))
+                .get_manifest(&keys)
+                .await
+                .unwrap_err();
+        assert!(super::is_fatal_api_error(&error));
     }
 }
