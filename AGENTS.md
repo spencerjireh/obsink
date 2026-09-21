@@ -221,7 +221,12 @@ P8 pivot are decommissioned; nothing in the repo references them.
   `desktop/src-tauri/tauri.conf.json`. After the rebase-merge:
   `git fetch origin && git tag vX.Y.Z origin/main && git push origin vX.Y.Z`.
   The Release workflow fails if the three versions differ from the tag, then
-  builds and publishes the macOS arm64 CLI with generated notes.
+  builds and publishes the universal (Apple Silicon + Intel) CLI tarball and the
+  Developer ID signed, notarized universal DMG with generated notes. It needs
+  the `APPLE_CERTIFICATE` (base64 .p12), `APPLE_CERTIFICATE_PASSWORD`,
+  `APPLE_SIGNING_IDENTITY`, `APPLE_API_KEY`, `APPLE_API_ISSUER` and
+  `APPLE_API_KEY_P8` repository secrets; every release build bakes
+  `https://obsink-api.spencerjireh.com`.
   `ios/project.yml` `MARKETING_VERSION` is separate (TestFlight,
   `scripts/release-ios.sh`) and not checked.
 
