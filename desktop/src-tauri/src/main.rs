@@ -669,7 +669,14 @@ async fn add_vault_inner(request: AddVaultRequest) -> Result<LocalVaultSummary, 
 async fn vault_diff(vault: &StoredVault) -> Result<SyncResult, CommandError> {
     let keys = derive_keys(&load_key_from_keychain(&vault.id)?);
     let local_root = Path::new(&vault.local_path);
-    let local = load_local_state(local_root, &keys)?;
+    // The walk hashes every file; keep it off the async runtime.
+    let local = {
+        let root = local_root.to_path_buf();
+        let keys = keys.clone();
+        tauri::async_runtime::spawn_blocking(move || load_local_state(&root, &keys))
+            .await
+            .map_err(|error| CommandError::other(error.to_string()))??
+    };
     let remote_manifest = bearer_call(
         &vault.server_url,
         fetch_remote_manifest(&ApiClient::new(to_vault_config(vault)), local_root, &keys),
