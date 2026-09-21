@@ -1,5 +1,5 @@
 [workspace]
-members = ["core", "cli", "desktop/src-tauri", "mobile", "server"]
+members = ["core", "core-wasm", "cli", "desktop/src-tauri", "mobile", "server"]
 resolver = "2"
 
 [workspace.package]
