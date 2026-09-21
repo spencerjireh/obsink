@@ -12,8 +12,9 @@
 //! length and the same nanosecond mtime is served its old hash. Asserted by
 //! `a_matching_stat_pair_serves_the_memoized_hash` so it stays a decision.
 
+use std::collections::{BTreeMap, BTreeSet};
+#[cfg(not(target_arch = "wasm32"))]
 use std::{
-    collections::{BTreeMap, BTreeSet},
     fs, io,
     path::{Path, PathBuf},
     time::UNIX_EPOCH,
@@ -21,12 +22,21 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    crypto::{content_hmac, CryptoKeys},
-    fs_util::write_atomic,
-};
+use crate::crypto::{content_hmac, CryptoKeys, KeyBytes};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::fs_util::write_atomic;
 
+#[cfg(not(target_arch = "wasm32"))]
 const HASH_CACHE_FILE: &str = ".obsink/hash-cache.json";
+
+/// The label whose HMAC under `content_mac` fingerprints a cache to its key.
+pub const HASH_CACHE_KEY_LABEL: &[u8] = b"obsink:hash-cache:v1";
+
+/// The `key_id` a cache written under this `content_mac` key carries. The
+/// browser client keeps its cache in IndexedDB and uses the same fingerprint.
+pub fn hash_cache_key_id(content_mac: &KeyBytes) -> String {
+    content_hmac(content_mac, HASH_CACHE_KEY_LABEL)
+}
 
 /// What the memo is keyed by: the file's mtime at nanosecond resolution and
 /// its length.
@@ -37,6 +47,7 @@ pub struct Stat {
     pub size: u64,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl TryFrom<&fs::Metadata> for Stat {
     type Error = io::Error;
 
@@ -67,12 +78,13 @@ pub struct HashCache {
     entries: BTreeMap<String, CacheEntry>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn hash_cache_path(local_root: &Path) -> PathBuf {
     local_root.join(HASH_CACHE_FILE)
 }
 
 fn key_id(keys: &CryptoKeys) -> String {
-    content_hmac(&keys.content_mac, b"obsink:hash-cache:v1")
+    hash_cache_key_id(&keys.content_mac)
 }
 
 impl HashCache {
@@ -86,6 +98,7 @@ impl HashCache {
 
     /// The cache on disk, or an empty one when it is missing, unreadable,
     /// corrupt or written under another key.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn load(local_root: &Path, keys: &CryptoKeys) -> Self {
         let expected = key_id(keys);
         fs::read(hash_cache_path(local_root))
@@ -95,6 +108,7 @@ impl HashCache {
             .unwrap_or_else(|| HashCache::empty(keys))
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn save(&self, local_root: &Path) -> io::Result<()> {
         let bytes = serde_json::to_vec(self)?;
         write_atomic(&hash_cache_path(local_root), &bytes)
