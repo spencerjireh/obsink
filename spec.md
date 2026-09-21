@@ -51,7 +51,7 @@ The sync engine has no clock and no file watcher: one call runs the full cycle b
 
 - the user tapping "Sync";
 - on iOS, the app coming to the foreground and an OS-scheduled `BGAppRefreshTask` (`AutoSyncPolicy`: a vault with File Provider writes waiting, a server that is ahead, or no sync in the last 15 minutes; never a vault that is syncing, keyless, on another server, or holding conflicts);
-- on desktop and the CLI, a daemon that debounces filesystem events and polls the server manifest (§1 of the roadmap; `core/src/daemon.rs`).
+- on desktop and the CLI, a daemon (`core/src/daemon.rs`, `docs/architecture.md`) that debounces filesystem events (750 ms quiet per path, 2 s batch window, a stat gate for files still being written) and polls the server manifest ETag (5 s after activity, 60 s idle), one cycle at a time per vault, backing off on fatal errors. Paths in the shared ignore list (`.obsink/`, atomic-write temp files, `.obsidian/workspace*.json`, `.trash/`, `.DS_Store`, `.git/`, plus per-vault patterns) never sync and never wake it.
 
 Drivers never resolve a conflict. A conflicted path stays pending for the user and everything else keeps syncing.
 

@@ -26,13 +26,16 @@ obsink connect --vault-id <id>     --directory <path> [--passphrase <p>]
 obsink logout
 
 obsink sync                       # full sync cycle; prompts to resolve conflicts
+obsink watch                      # keep syncing: watch the folder, poll the server; Ctrl-C stops
 obsink status [--directory <path>]
 ```
 
 - `--server-url` also reads `OBSINK_SERVER_URL`; after the first command it defaults to the URL in the saved config. `--api-key` (`OBSINK_API_KEY`) supplies the operator bearer for scripts and harnesses; normal use is `login`.
 - Config lives at `~/.obsink/config.toml` (server URL, vault ID, local path — **no secrets**). Set `OBSINK_HOME` to relocate it (used for per-device isolation in tests). Configs written before the server pivot (`worker_url`) still load.
 - The macOS Keychain (service `obsink`) holds the encryption key (account = vault ID) and the server bearer (account = `bearer:<server url>`). `OBSINK_KEYRING_DIR=<dir>` swaps it for a directory of files (CI, harnesses).
-- Each vault directory keeps `.obsink/manifest.json` (last completed sync) and `.obsink/remote-manifest.json` (last server manifest + ETag, so an unchanged manifest costs a `304`).
+- Each vault directory keeps `.obsink/manifest.json` (last completed sync), `.obsink/remote-manifest.json` (last server manifest + ETag, so an unchanged manifest costs a `304`) and `.obsink/hash-cache.json` (the `(mtime, size) → hash` memo).
+- `obsink watch` runs the daemon (`docs/architecture.md`, "The daemon") for the configured vault: a filesystem watcher plus a debounce (750 ms quiet per path, 2 s batch window, a stat gate for files still being written), an ETag poll of the server every 5 s after activity and every 60 s when idle, exponential backoff on fatal errors (5 s to 5 min), and one line per event on stdout (`sync started`, `sync finished: n uploaded, n downloaded, n failed`, `n conflict(s) waiting; run \`obsink sync\` to resolve:` with the paths). Conflicts are never resolved by the daemon: the conflicted paths stay pending while everything else keeps syncing.
+- Paths that never sync: `.obsink/`, `*.obsink-tmp`, `.obsidian/workspace.json`, `.obsidian/workspace-mobile.json`, `.trash/`, `.DS_Store`, `.git/`. Add a vault's own patterns with `ignore = ["drafts/", "*.tmp"]` in `config.toml` (`dir/`, `*.ext`, an exact `a/b.md`, or a bare name at any depth). A path already on the server when it becomes ignored is left there untouched; it just stops taking part in the diff.
 - `RUST_LOG=obsink_core=debug obsink sync` prints request/sync logging to stderr.
 
 If you omit `--passphrase`, the CLI prompts for it interactively.
@@ -53,6 +56,8 @@ App, dock, and menu-bar icons are generated from `design/icon.svg` and
 editing either SVG and commit the rasters.
 
 The app lives in the menu bar (no Dock icon). The server it talks to is baked in at build time from `OBSINK_SERVER_URL` (fallback `https://obsink.spencerjireh.com`); there is no URL field in the UI. Setting `OBSINK_SERVER_URL` at launch overrides it, which is how the live tests and the compose smoke point a build at a local server. Self-hosters build the clients with their own URL.
+
+Every vault that can sync (on this server, key in the Keychain, signed in) gets a **daemon** at launch and whenever that set changes (sign-in, add, remove, delete, sign-out): the same driver as `obsink watch`, so an edit in Obsidian is on the server a couple of seconds later and a change from another device lands within the poll interval. `Sync now` and conflict resolutions are commands to the vault's daemon, so no two cycles overlap; the daemon's events feed the same state the popover reads (`Syncing…` while a cycle runs, `n conflicts` for what it left for you, the activity log). A vault without a daemon (no key yet) still syncs through the manual path. Extra ignore patterns go in `~/.obsink/app.json` as `"ignore": ["drafts/"]` on the vault entry.
 
 Left-clicking the tray icon toggles a **popover** under it: one row per vault with a state dot and the shared state text (`Up to date`, `n to upload`, `n to download`, `n conflicts`, `Syncing…`, `Offline`, `Session expired`, `On another server`, `Needs passphrase`), an **Open folder** button per row, a **Recent** list of the last activity events, **Sync now** (syncs every vault in turn, skipping one that is waiting for a conflict decision) and **Settings**. Clicking a row opens the settings window at that vault; the popover hides when it loses focus. The tray menu (right-click) has **Sync now / Open settings / Quit ObSink**.
 
