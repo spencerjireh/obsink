@@ -56,6 +56,9 @@ pub struct TestEnv {
     admin_url: String,
     db_name: String,
     server: tokio::task::JoinHandle<()>,
+    /// Set by `finish()`; `Drop` cleans up only when it was skipped (a
+    /// panicking test), so no `obsink_test_<hex>` database is orphaned.
+    finished: bool,
 }
 
 pub fn test_config(data_dir: &std::path::Path, database_url: String) -> Config {
@@ -144,7 +147,29 @@ impl TestEnv {
             admin_url,
             db_name,
             server,
+            finished: false,
         })
+    }
+
+    /// The name of this environment's database (tests of the cleanup).
+    pub fn db_name(&self) -> &str {
+        &self.db_name
+    }
+
+    /// Whether a database of that name exists on the admin server.
+    pub async fn database_exists(admin_url: &str, db_name: &str) -> bool {
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(admin_url)
+            .await
+            .expect("connect to DATABASE_URL");
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_database WHERE datname = $1")
+            .bind(db_name)
+            .fetch_one(&admin)
+            .await
+            .expect("query pg_database");
+        admin.close().await;
+        count > 0
     }
 
     pub fn url(&self, path: &str) -> String {
@@ -260,21 +285,60 @@ impl TestEnv {
     }
 
     /// Drop the database. Call at the end of a passing test.
-    pub async fn finish(self) {
+    pub async fn finish(mut self) {
+        self.finished = true;
         self.server.abort();
         self.state.pool.close().await;
-        let admin = PgPoolOptions::new()
-            .max_connections(1)
-            .connect(&self.admin_url)
-            .await
-            .expect("connect to DATABASE_URL");
-        let _ = sqlx::query(&format!(
-            "DROP DATABASE IF EXISTS {} WITH (FORCE)",
-            self.db_name
-        ))
+        drop_database(&self.admin_url, &self.db_name).await;
+    }
+}
+
+/// `WITH (FORCE)` closes the test pool's connections, so a leaked pool does
+/// not keep the database alive.
+async fn drop_database(admin_url: &str, db_name: &str) {
+    let admin = match PgPoolOptions::new()
+        .max_connections(1)
+        .connect(admin_url)
+        .await
+    {
+        Ok(admin) => admin,
+        Err(error) => {
+            eprintln!("test database {db_name} not dropped: {error}");
+            return;
+        }
+    };
+    if let Err(error) = sqlx::query(&format!("DROP DATABASE IF EXISTS {db_name} WITH (FORCE)"))
         .execute(&admin)
-        .await;
-        admin.close().await;
+        .await
+    {
+        eprintln!("test database {db_name} not dropped: {error}");
+    }
+    admin.close().await;
+}
+
+impl Drop for TestEnv {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.server.abort();
+        // sqlx needs a runtime and the test's own runtime cannot be entered
+        // from `Drop`, so the cleanup runs on a thread with a runtime of
+        // its own and is waited for, so the database is gone before the
+        // next test starts.
+        let admin_url = self.admin_url.clone();
+        let db_name = self.db_name.clone();
+        let worker =
+            std::thread::spawn(move || {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime.block_on(drop_database(&admin_url, &db_name)),
+                    Err(error) => eprintln!("test database {db_name} not dropped: {error}"),
+                }
+            });
+        let _ = worker.join();
     }
 }
 
