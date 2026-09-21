@@ -128,7 +128,7 @@ iOS uses the system font with Dynamic Type (`.body`, `.caption`,
 | Stepper | done, current, todo | Numbered step chips; the current step has the accent border and `aria-current="step"`. Steps already passed are plain text; steps to come are muted. |
 | Icon button | idle, hover | 28px square, no border, muted glyph that turns to `--color-text` on hover; always carries an `aria-label`. |
 | Status counts | uploads, downloads, conflicts as three counts | iOS only. Always rendered; zero is shown as `0`. Count in `--font-mono` at 20px, label in muted text. |
-| Notice | info, warning, danger | One line of text; a `FATAL` or `skipped` tag leads a failure line. Warning is used for the stale banner and pending local changes. |
+| Notice | info, warning, danger | One line of text; a `FATAL` or `skipped` tag leads a failure line. Warning is used for the stale banner and pending local changes. Danger for `Checkpoint failed: <message>. Sync again.` (the files moved, the bookkeeping did not). |
 | Vault row (list) | active, inactive, disabled while busy | State dot and name in the display face, state text in mono below. Active row has a 2px accent left border and `aria-current="page"`. |
 | Conflict card | selected, unselected | Path in mono; two rows `This device` / `Other device` with size and modified time; a segmented choice of `Keep local`, `Keep remote`, `Keep both` (or `Delete on server` / `Delete here` when one side is deleted). |
 | Preview | text, deleted, empty, loading | Two columns titled `This device` and `Other device`; body in mono, max height 280px, scrolls. |
