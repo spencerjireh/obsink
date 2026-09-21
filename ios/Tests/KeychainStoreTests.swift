@@ -34,4 +34,17 @@ final class KeychainStoreTests: XCTestCase {
         XCTAssertEqual(KeychainStore.load(account: account), Data(repeating: 2, count: 32))
         XCTAssertTrue(KeychainStore.delete(account: account))
     }
+
+    // OBS-107: the background refresh reads keys while the device is locked.
+    func testItemsAreSavedAfterFirstUnlock() throws {
+        try skipIfKeychainUnavailable()
+        let account = "obsink-test-\(UUID().uuidString)"
+        XCTAssertTrue(KeychainStore.save(Data(repeating: 3, count: 32), account: account))
+        XCTAssertEqual(KeychainStore.accessibility(of: account), kSecAttrAccessibleAfterFirstUnlock as String)
+        XCTAssertTrue(KeychainStore.resave(account: account))
+        XCTAssertEqual(KeychainStore.load(account: account), Data(repeating: 3, count: 32))
+        XCTAssertTrue(KeychainStore.delete(account: account))
+        XCTAssertTrue(KeychainStore.resave(account: account), "a missing item is fine")
+    }
+
 }

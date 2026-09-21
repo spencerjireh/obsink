@@ -73,6 +73,8 @@ struct SettingsView: View {
                 Section("About") {
                     LabeledContent("Version", value: Self.version)
                         .accessibilityIdentifier("appVersionText")
+                    LabeledContent("Background refresh", value: Self.backgroundRefreshText)
+                        .accessibilityIdentifier("backgroundRefreshText")
                 }
             }
             .navigationTitle("Settings")
@@ -90,6 +92,18 @@ struct SettingsView: View {
                     model.deleteAccount()
                 }
             }
+        }
+    }
+
+    /// Whether iOS lets this app refresh in the background (Settings >
+    /// General > Background App Refresh). Read-only: there is no toggle in
+    /// the app.
+    private static var backgroundRefreshText: String {
+        switch UIApplication.shared.backgroundRefreshStatus {
+        case .available: return "On"
+        case .denied: return "Off in Settings"
+        case .restricted: return "Restricted"
+        @unknown default: return "Unknown"
         }
     }
 
