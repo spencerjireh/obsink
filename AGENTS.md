@@ -49,6 +49,8 @@ obsink/
   DESIGN.md              # UI rules: principles, brand, tokens, components, copy, platform mapping
   design/                # icon.svg + tray.svg (icon sources; rasters come from scripts/gen-icons.sh)
   core/                  # Rust sync engine: crypto, hasher, manifest, api_client, auth, sync_engine
+                         #   (crypto, manifest, ignore, sync_rules, pacing, server_url also build for wasm32)
+  core-wasm/             # wasm-bindgen bindings over the pure core modules for the browser client
   cli/                   # `obsink` CLI (reference client)
   server/                # obsink-server (axum): accounts, vaults, files, batch, retention; Dockerfile
   desktop/               # Tauri v2 + React app (src-tauri/ + src/)
@@ -113,6 +115,10 @@ cargo test --workspace
 
 # Lints CI enforces
 cargo clippy --workspace --all-targets -- -D warnings && cargo deny check
+
+# The core for the browser (wasm32 comes from rust-toolchain.toml; pin matches ci.yml)
+cargo install wasm-pack --locked --version 0.15.0
+wasm-pack build core-wasm --target web && wasm-pack test --node --release core-wasm
 
 # Server integration tests need Postgres (any throwaway instance):
 docker run -d --name obsink-test-pg -e POSTGRES_PASSWORD=postgres -p 5433:5432 postgres:16-alpine
@@ -194,9 +200,9 @@ P8 pivot are decommissioned; nothing in the repo references them.
   onto `main`; merge commits fail the check.
 - **PRs:** fill in `.github/pull_request_template.md` (Plane item, summary, how
   tested, spec impact). Rebase merge only; the branch is deleted on merge.
-  Required checks are the six CI jobs by display name (`commits`,
-  `core + CLI + mobile`, `cargo deny`, `server (postgres)`, `desktop (macOS)`,
-  `ios (simulator)`); renaming a job means updating `rulesets/main.json` and
+  Required checks are the seven CI jobs by display name (`commits`,
+  `core + CLI + mobile`, `cargo deny`, `server (postgres)`, `web`,
+  `desktop (macOS)`, `ios (simulator)`); renaming or adding a job means updating `rulesets/main.json` and
   re-applying it (`gh api -X PUT repos/spencerjireh/obsink/rulesets/<id> --input .github/rulesets/main.json`).
 - **Hooks:** `brew install lefthook && lefthook install` once per clone.
 - **Version bump and release:** in one PR (`build: bump version to X.Y.Z (OBS-<n>)`),
