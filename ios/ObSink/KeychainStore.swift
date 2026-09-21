@@ -71,16 +71,36 @@ enum KeychainStore {
         "bearer:" + canonicalServerURL(serverURL)
     }
 
+    /// Hosts the server moved away from, mapped to where it lives now (core
+    /// `LEGACY_SERVER_ALIASES`): an entry written by an older build against
+    /// the old host still matches the server this build talks to.
+    static let legacyServerAliases: [String: String] = [
+        "https://obsink.spencerjireh.com": "https://obsink-api.spencerjireh.com"
+    ]
+
     static func canonicalServerURL(_ url: String) -> String {
         var trimmed = url.trimmingCharacters(in: .whitespacesAndNewlines)
         while trimmed.hasSuffix("/") { trimmed.removeLast() }
         guard let range = trimmed.range(of: "://") else { return trimmed }
         let scheme = trimmed[..<range.lowerBound].lowercased()
         let rest = trimmed[range.upperBound...]
+        let host: String
+        let path: Substring
         if let slash = rest.firstIndex(of: "/") {
-            return scheme + "://" + rest[..<slash].lowercased() + rest[slash...]
+            host = rest[..<slash].lowercased()
+            path = rest[slash...]
+        } else {
+            host = rest.lowercased()
+            path = ""
         }
-        return scheme + "://" + rest.lowercased()
+        let origin = legacyServerAliases[scheme + "://" + host] ?? (scheme + "://" + host)
+        return origin + path
+    }
+
+    /// The legacy spellings that canonicalise to `canonical`: where an older
+    /// build may have stored the bearer for this server.
+    static func legacyServerURLs(of canonical: String) -> [String] {
+        legacyServerAliases.filter { $0.value == canonical }.map(\.key)
     }
 
     @discardableResult
@@ -88,8 +108,21 @@ enum KeychainStore {
         save(Data(token.utf8), account: bearerAccount(for: serverURL))
     }
 
+    /// The bearer for a server. A bearer an older build stored under a legacy
+    /// host is moved to the canonical entry the first time it is read.
     static func loadBearer(serverURL: String) -> String? {
-        load(account: bearerAccount(for: serverURL)).flatMap { String(data: $0, encoding: .utf8) }
+        let canonical = canonicalServerURL(serverURL)
+        if let token = load(account: "bearer:" + canonical).flatMap({ String(data: $0, encoding: .utf8) }) {
+            return token
+        }
+        for legacy in legacyServerURLs(of: canonical) {
+            let account = "bearer:" + legacy
+            guard let token = load(account: account).flatMap({ String(data: $0, encoding: .utf8) }) else { continue }
+            saveBearer(token, serverURL: canonical)
+            delete(account: account)
+            return token
+        }
+        return nil
     }
 
     @discardableResult

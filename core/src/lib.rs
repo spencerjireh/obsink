@@ -55,7 +55,7 @@ pub use ignore::{IgnoreRules, DEFAULT_IGNORE};
 pub use manifest::{checkpoint_manifest, diff_manifests, ManifestDiff};
 pub use pacing::{backoff_wait, Backoff, PollPacing};
 pub use progress::{NoProgress, ProgressEvent, ProgressSink, SyncPhase};
-pub use server_url::normalize_server_url;
+pub use server_url::{legacy_server_urls, normalize_server_url, LEGACY_SERVER_ALIASES};
 #[cfg(not(target_arch = "wasm32"))]
 pub use sync_engine::{
     complete_sync, diff_local_and_remote, fetch_remote_manifest, load_local_state,

@@ -11,7 +11,7 @@ use dirs::home_dir;
 use obsink_core::{
     complete_sync, daemon_channel, derive_key, derive_keys, diff_local_and_remote,
     fetch_remote_manifest,
-    keychain::{delete_secret, load_secret, save_secret},
+    keychain::{delete_secret, load_bearer, load_secret, save_secret},
     load_local_state, normalize_server_url, prepare_sync, run_daemon, sync_manifest_path,
     write_atomic, ApiClient, AuthClient, Conflict, ConflictResolution, ConflictResolutionChoice,
     CreateVaultRequest, DaemonEvent, DaemonOptions, KeyBytes, ProgressEvent, ProgressSink,
@@ -182,7 +182,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Logout { server_url } => {
             let url = resolve_server_url(server_url.as_deref())?;
             let account = bearer_account(&url);
-            match load_secret(&account) {
+            match load_bearer(&url) {
                 Ok(token) => {
                     if let Err(error) = AuthClient::new(&url).logout(&token).await {
                         eprintln!("warning: could not revoke the session server-side: {error}");
@@ -199,7 +199,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Whoami { server_url } => run_whoami(server_url).await?,
         Commands::Invite { server_url, list } => {
             let url = resolve_server_url(server_url.as_deref())?;
-            let token = load_secret(&bearer_account(&url))
+            let token = load_bearer(&url)
                 .map_err(|_| format!("not signed in to {url}; run `obsink login`"))?;
             let auth = AuthClient::new(&url);
             if list {
@@ -339,8 +339,8 @@ async fn run_login(
 /// `obsink whoami`: the account, its devices and its usage.
 async fn run_whoami(server_url: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
     let url = resolve_server_url(server_url.as_deref())?;
-    let token = load_secret(&bearer_account(&url))
-        .map_err(|_| format!("not signed in to {url}; run `obsink login`"))?;
+    let token =
+        load_bearer(&url).map_err(|_| format!("not signed in to {url}; run `obsink login`"))?;
     let me = AuthClient::new(&url).me(&token).await?;
     println!("server: {url}");
     match me.user {
@@ -529,7 +529,7 @@ fn resolve_server(server: &ServerArgs) -> Result<(String, String), Box<dyn std::
         save_secret(&account, api_key)?;
         return Ok((url, api_key.to_string()));
     }
-    match load_secret(&account) {
+    match load_bearer(&url) {
         Ok(bearer) => Ok((url, bearer)),
         Err(_) => Err(format!(
             "no credential for {url}: run `obsink login --server-url {url}` (or pass --api-key for the operator bearer)"
