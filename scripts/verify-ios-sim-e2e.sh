@@ -152,11 +152,16 @@ else
     fail "OBS-30: app sync failed"
 fi
 
-# ---------- OBS-33: stale-vault warning ----------
-step "OBS-33: stale banner when server is ahead"
+# ---------- OBS-33 / OBS-107: server ahead on open → auto-sync pulls it ----------
+step "OBS-107: launch auto-sync pulls a file made while iOS was away"
 echo "made while iOS away" > "$A_VAULT/notes/late.md"
 cli sync >"$WORK/cli-obs33.log" 2>&1
-if run_test testStaleBanner; then pass "OBS-33: stale-vault warning"; else fail "OBS-33: stale-vault warning"; fi
+if run_test testAutoSyncPullsRemote \
+    && [ "$(cat "$B_VAULT/notes/late.md" 2>/dev/null)" = "made while iOS away" ]; then
+    pass "OBS-107: auto-sync on launch pulled the server's file"
+else
+    fail "OBS-107: auto-sync on launch did not pull the server's file"
+fi
 
 # ---------- OBS-32: deletion propagates (both directions) ----------
 step "OBS-32: delete on Mac → gone on iOS"

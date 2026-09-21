@@ -54,8 +54,23 @@ final class SyncE2ETests: XCTestCase {
         return app
     }
 
+    /// Wait for a launch auto-sync (OBS-107) to finish: the Sync button is
+    /// disabled while a cycle runs, and enabled (or replaced by the
+    /// passphrase field) once the model is idle.
+    private func settle(_ app: XCUIApplication, timeout: TimeInterval = 180) {
+        let sync = app.buttons["syncButton"]
+        let field = app.secureTextFields["passphraseField"]
+        let idle = NSPredicate { _, _ in sync.isEnabled || field.exists }
+        let result = XCTWaiter().wait(
+            for: [XCTNSPredicateExpectation(predicate: idle, object: nil)],
+            timeout: timeout
+        )
+        XCTAssertEqual(result, XCTWaiter.Result.completed, "the app never went idle")
+    }
+
     /// Type the passphrase into the root form if the vault has no stored key yet.
     private func enterPassphraseIfNeeded(_ app: XCUIApplication) {
+        settle(app)
         let sync = app.buttons["syncButton"]
         guard !sync.isEnabled else { return }
         let field = app.secureTextFields["passphraseField"]
@@ -70,6 +85,7 @@ final class SyncE2ETests: XCTestCase {
     private func syncAndWait(_ app: XCUIApplication, expect prefix: String = "Synced ·") {
         let sync = app.buttons["syncButton"]
         XCTAssertTrue(sync.waitForExistence(timeout: 10))
+        settle(app)
         XCTAssertTrue(sync.isEnabled, "Sync button disabled — no key/passphrase?")
         sync.tap()
         waitForStatus(app, prefix: prefix)
@@ -157,6 +173,7 @@ final class SyncE2ETests: XCTestCase {
     /// gone from the app-group container.
     func testRemoveVaultFromDevice() throws {
         let app = launchSeeded()
+        settle(app)
         let manage = anyElement(app, "manageVaultButton")
         XCTAssertTrue(manage.waitForExistence(timeout: 10), "Manage vault link missing")
         manage.tap()
@@ -176,17 +193,20 @@ final class SyncE2ETests: XCTestCase {
         XCTAssertFalse(anyElement(app, "vaultCard").exists)
     }
 
-    /// Stale-vault warning on open (OBS-33): server is ahead, banner appears
-    /// without syncing.
-    func testStaleBanner() throws {
+    /// Server ahead on open (OBS-33 → OBS-107): the launch auto-sync pulls
+    /// the new file without a tap; the harness then checks it landed in the
+    /// container. The stale banner still exists for the window before the
+    /// sync starts and for vaults that hold conflicts.
+    func testAutoSyncPullsRemote() throws {
         let app = launchSeeded()
-        let banner = anyElement(app, "staleBanner")
-        XCTAssertTrue(banner.waitForExistence(timeout: 120), "stale banner never appeared")
-        // The Label's icon and text are separate children; check the text child.
-        let text = app.staticTexts.matching(
-            NSPredicate(format: "label CONTAINS 'changed on another device'")
-        ).firstMatch
-        XCTAssertTrue(text.waitForExistence(timeout: 10), "banner text missing")
+        waitForStatus(app, prefix: "Synced ·")
+        let state = anyElement(app, "vaultStateText")
+        let upToDate = NSPredicate(format: "label == 'Up to date'")
+        let result = XCTWaiter().wait(
+            for: [XCTNSPredicateExpectation(predicate: upToDate, object: state)],
+            timeout: 30
+        )
+        XCTAssertEqual(result, XCTWaiter.Result.completed, "card did not settle on Up to date — last: \(state.label)")
     }
 
     /// Conflict resolution (OBS-31): sync surfaces the conflict, choose the
