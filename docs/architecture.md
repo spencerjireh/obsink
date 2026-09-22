@@ -55,13 +55,18 @@ The engine **never auto-resolves** a conflict — that's a UI decision. The one 
 - **Failures** that are fatal (network down, auth, 5xx) suppress every trigger for `5 s × 2^n`, capped at 5 min, until a cycle succeeds.
 - **Ignore rules** (`core/src/ignore.rs`) are shared by the walker, the watcher and the diff: `.obsink/`, `*.obsink-tmp`, `.obsidian/workspace.json`, `.obsidian/workspace-mobile.json`, `.trash/`, `.DS_Store`, `.git/`, plus a vault's own `ignore` patterns. `diff_local_and_remote` filters base, local and remote alike, so a path that was synced before it became ignored is simply invisible rather than deleted.
 
-## Wire format (v2)
+## Wire format (v3)
 
-`PROTOCOL_VERSION = 2`. The guiding principle: **the server learns nothing about your vault**.
+`PROTOCOL_VERSION = 3`. The guiding principle: **the server learns nothing about your vault**.
 
-### Key derivation
+### Key hierarchy
 
-The passphrase + vault ID (salt) go through Argon2id (64 MiB / 3 iterations / 1 lane) to produce a 32-byte **master key**. The master key is never used directly — it's HKDF-SHA256 input keying material for four purpose-separated sub-keys (`derive_keys`):
+One passphrase per account, one random key per vault, and the server holds only wrapped keys (spec §6.1 has the full table):
+
+- **KEK** = Argon2id(passphrase, 16 random bytes of salt; 64 MiB / 3 iterations / 1 lane). Derived on demand, never stored.
+- **Account key**: 32 random bytes, generated when the passphrase is first set. Stored on the server as `AES-256-GCM(KEK, account key)` with the user id as AAD, next to the salt and a `key_id`; kept unwrapped in the client's keychain. A wrong passphrase is a failed GCM tag on the client. A server-side verifier, `HMAC(HKDF(account key, "obsink:v3:verify"), user id)`, gates a rewrap (passphrase change) and is never returned.
+- **Vault key**: 32 random bytes per vault. Stored per member as `AES-256-GCM(HKDF(account key, "obsink:v3:vault-wrap"), vault key)` with the vault id as AAD (`vault_members.wrapped_key`); kept unwrapped in the keychain under the vault id. Because it does not derive from the account key, a later "share vault" only has to wrap it for another member.
+- **Sub-keys**: the vault key is HKDF-SHA256 input keying material for four purpose-separated sub-keys (`derive_keys`), unchanged from v2:
 
 | Sub-key | Used for |
 |---|---|
@@ -89,6 +94,7 @@ The server stores a manifest per vault, keyed by **path token** (not the real pa
 - **Why a token, not the path?** So the server (and anyone with access to its storage) cannot see filenames. The token is deterministic, so two devices independently compute the same token for the same path — which is what makes diffing work without coordination.
 - **Why `encPath`?** A freshly-connected device pulls a manifest of tokens it can't reverse (the token is a one-way HMAC). `encPath` is reversible AES-GCM, so the client recovers the real filename and re-keys the manifest by real path locally.
 - **Why HMAC the content, not SHA-256?** A plaintext SHA-256 would let the server confirm whether you store a known file. A keyed HMAC reveals nothing without the key, while still being a stable equality check for conflict detection.
+- **Why wrap keys instead of deriving them?** Argon2id runs once per unlock, not once per vault; `Download` on a new device is one action; a passphrase change is a rewrap, not a re-encryption; and a vault key can later be handed to another member. The cost: the wrapped account key travels to any session holder, so the passphrase (12 characters minimum) and the Argon2id parameters are the defence.
 
 ### Conflict gating
 
@@ -114,10 +120,13 @@ Sync is observable through a `ProgressSink` trait (`Phase` / `FileStarted` / `Fi
 
 Postgres tables (`server/migrations/0001_init.sql`):
 
-- `users` — id, sealed email, sealed Apple subject, keyed-HMAC lookup columns
-- `sessions` — id, `sha256(token)`, sealed device name, created, expires (180 days)
+- `users` — id, sealed email, sealed Apple subject, keyed-HMAC lookup columns, the wrapped account key with its salt, `key_id` and verifier
+- `devices` — `(user_id, id)`, sealed name, platform, created, last_seen; one session per device
+- `sessions` — id, user, device, `sha256(token)`, created, expires (180 days)
 - `email_codes`, `invites` — one-time codes (keyed HMAC, attempts, cooldown) and invite codes
-- `vaults` — id, tenant (`default` for the operator, else the user id), sealed name, `max_file_size`, `revision`
+- `vaults` — id, owner, sealed name, `max_file_size`, `revision`, `last_write`
+- `vault_members` — `(vault_id, user_id)`, role, the vault key wrapped for that member
+- `device_vaults` — which devices hold a vault, with the last synced revision (reported best-effort after each checkpoint)
 - `files` — one row per manifest entry: `(vault_id, path token, hash, modified, size, deleted, enc_path)`
 
 Blob volume (`OBSINK_DATA_DIR/blobs`), file names are `sha256(path token)`:
@@ -126,9 +135,9 @@ Blob volume (`OBSINK_DATA_DIR/blobs`), file names are `sha256(path token)`:
 - Version (on overwrite): `_versions/<vaultId>/<hash>/<unixSeconds>[-n]`
 - Trash (on delete): `_trash/<vaultId>/<hash>/<unixSeconds>[-n]`
 
-Every write (`PUT`, `DELETE`, each batch operation) is one transaction: lock the vault row `FOR UPDATE`, read the current entry, check size and quota, compare `X-Parent-Hash`, move the old blob aside, write the new one, upsert the row, bump `revision`. Two devices racing on one path get exactly one `200` and one `409`. `revision` is the manifest `ETag`.
+Every write (`PUT`, `DELETE`, each batch operation) is one transaction: check membership, lock the vault row `FOR UPDATE`, read the current entry, check size and quota, compare `X-Parent-Hash`, move the old blob aside, write the new one, upsert the row, bump `revision`. Two devices racing on one path get exactly one `200` and one `409`. `revision` is the manifest `ETag`. Version and trash blobs are readable through `GET …/versions` and `GET …/trash` (spec §4.3); restore is a client operation, since only a client can compute the manifest `hash` of a restored file.
 
-Envelope encryption (`server/src/crypto.rs`): `OBSINK_SERVER_KEY` is HKDF input for three sub-keys — blob wrapping, column sealing (AES-GCM with a `<table>.<column>:<row id>` AAD so ciphertexts cannot be moved between rows), and keyed lookup HMACs. Path tokens, content hashes, and `encPath` are stored as the client sent them: they are already HMACs or ciphertext under the vault key.
+Envelope encryption (`server/src/crypto.rs`): `OBSINK_SERVER_KEY` is HKDF input for three sub-keys — blob wrapping, column sealing (AES-GCM with a `<table>.<column>:<row id>` AAD so ciphertexts cannot be moved between rows), and keyed lookup HMACs. Path tokens, content hashes, `encPath`, and the wrapped account and vault keys are stored as the client sent them: they are already HMACs or ciphertext under keys the server never has.
 
 The retention task (`server/src/retention.rs`) runs at startup and every `RETENTION_INTERVAL_SECS`: prune `_versions/` (keep newest 10 per file / 14 days) and `_trash/` (30 days), delete expired sessions and day-old codes, and remove blob directories whose vault row is gone.
 

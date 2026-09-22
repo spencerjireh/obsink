@@ -2,7 +2,7 @@
 
 > *Because things will go wrong.*
 
-ObSink is a free, self-hosted, end-to-end encrypted sync engine for Obsidian vaults on macOS and iOS. It replaces paid sync services with a "Sync" button that the clients also press for you (on iOS when the app comes to the foreground or in a background refresh; on desktop and the CLI through a daemon), a shared Rust core, and a small Rust server you run yourself with `docker compose up`.
+ObSink is a free, self-hosted, end-to-end encrypted sync engine for Obsidian vaults on macOS and iOS. It replaces paid sync services with a "Sync" button that the clients also press for you (on iOS when the app comes to the foreground or in a background refresh; on desktop and the CLI through a daemon), a shared Rust core, and a small Rust server you run yourself with `docker compose up`. Every vault an account owns is listed on every device the account is signed in to; one passphrase unlocks them all, and a vault that is not on a device yet is one `Download` away.
 
 ---
 
@@ -12,11 +12,12 @@ ObSink is a free, self-hosted, end-to-end encrypted sync engine for Obsidian vau
 ┌──────────────────┐        ┌──────────────────────────────┐        ┌──────────────────┐
 │  Desktop client  │        │   Self-hosted server (Rust)  │        │   Mobile client  │
 │  (Tauri + Rust)  │        │   docker compose             │        │                  │
-│                  │ HTTPS  │  axum      (API, accounts)   │ HTTPS  │  iOS (Swift)     │
-│  macOS           │◄──────►│  Postgres  (manifest/meta)   │◄──────►│  + File Provider │
-│  CLI             │ (proxy)│  volume    (encrypted blobs) │ (proxy)│                  │
-│  Browser (/app)  │        │  retention task              │        │                  │
-└──────────────────┘        │  web: site + /app + proxy    │        └──────────────────┘
+│                  │ HTTPS  │  axum      (API, accounts,   │ HTTPS  │  iOS (Swift)     │
+│  macOS           │◄──────►│             devices, keys)   │◄──────►│  + File Provider │
+│  CLI             │ (proxy)│  Postgres  (manifest/meta)   │ (proxy)│                  │
+│  Browser (/app)  │        │  volume    (encrypted blobs) │        │                  │
+└──────────────────┘        │  retention task              │        └──────────────────┘
+                            │  web: site + /app + proxy    │
                             └──────────────────────────────┘
 ```
 
@@ -26,8 +27,8 @@ TLS is terminated by the operator's reverse proxy (Coolify's Traefik in the refe
 
 | Component | Language | Purpose |
 |---|---|---|
-| `core/` | Rust | Shared sync engine: encryption, hashing, manifest diffing, conflict detection, API client |
-| `server/` | Rust (axum) | Self-hosted API: accounts and invites, vault storage, manifest, conflict gating, version retention |
+| `core/` | Rust | Shared sync engine: key hierarchy, encryption, hashing, manifest diffing, conflict detection, API client |
+| `server/` | Rust (axum) | Self-hosted API: accounts, devices, wrapped keys, invites, vault storage, manifest, conflict gating, version retention |
 | `cli/` | Rust | `obsink` reference client |
 | `ui/` | TypeScript (React) | The screens shared by the desktop app and the browser client, over the `Backend` interface |
 | `desktop/` | Rust + Web (Tauri) | macOS menu-bar app. Thin shell: the shared screens plus Tauri commands into Rust core |
@@ -38,7 +39,7 @@ TLS is terminated by the operator's reverse proxy (Coolify's Traefik in the refe
 
 ## 2. Tech Stack
 
-- **Rust** — core sync library (encryption, hashing, manifest diffing, conflict detection, API client) and the server (axum, sqlx, lettre)
+- **Rust** — core sync library (key hierarchy, encryption, hashing, manifest diffing, conflict detection, API client) and the server (axum, sqlx, lettre)
 - **Postgres + a filesystem volume** — metadata and encrypted blobs, wrapped with a server-side envelope key
 - **Docker Compose** — one `docker compose up` for the server, Postgres, and (locally) a mail catcher; production on Coolify behind Traefik
 - **Tauri v2 + React** — macOS desktop app; UI in HTML/CSS/TS
@@ -53,7 +54,7 @@ TLS is terminated by the operator's reverse proxy (Coolify's Traefik in the refe
 The sync engine has no clock and no file watcher: one call runs the full cycle below, and nothing happens between calls. What triggers a call is a driver outside the engine:
 
 - the user tapping "Sync";
-- on iOS, the app coming to the foreground and an OS-scheduled `BGAppRefreshTask` (`AutoSyncPolicy`: a vault with File Provider writes waiting, a server that is ahead, or no sync in the last 15 minutes; never a vault that is syncing, keyless, on another server, or holding conflicts);
+- on iOS, the app coming to the foreground and an OS-scheduled `BGAppRefreshTask` (`AutoSyncPolicy`: a vault with File Provider writes waiting, a server that is ahead, or no sync in the last 15 minutes; never a vault that is syncing, locked, or holding conflicts);
 - on desktop and the CLI, a daemon (`core/src/daemon.rs`, `docs/architecture.md`) that debounces filesystem events (750 ms quiet per path, 2 s batch window, a stat gate for files still being written) and polls the server manifest ETag (5 s after activity, 60 s idle), one cycle at a time per vault, backing off on fatal errors. Paths in the shared ignore list (`.obsink/`, atomic-write temp files, `.obsidian/workspace*.json`, `.trash/`, `.DS_Store`, `.git/`, plus per-vault patterns) never sync and never wake it.
 
 Drivers never resolve a conflict. A conflicted path stays pending for the user and everything else keeps syncing.
@@ -73,7 +74,7 @@ When a sync starts (tap, foreground, background refresh, or daemon):
 4. **Resolve conflicts** — If any conflicts exist, pause sync and present the conflict resolution UI. User picks a winner per file (see §5).
 5. **Upload local changes** — `POST /batch` (or individual `PUT /files/:path`) for all locally-changed files plus resolved conflicts.
 6. **Handle late 409s** — If any uploads return `409 Conflict` (edge case: another device synced between steps 1 and 5), return them as a conflict-only plan and resolve those too.
-7. **Update local manifest** — Re-fetch the server manifest and save it as the new base, except that paths which failed to transfer or are still in conflict keep their previous base entry, so the next sync retries them. Sync complete.
+7. **Update local manifest** — Re-fetch the server manifest and save it as the new base, except that paths which failed to transfer or are still in conflict keep their previous base entry, so the next sync retries them. Then report the checkpoint: `PUT /vaults/:id/devices/self { revision }` with the manifest revision just saved. The report is best-effort; a failure is logged and never fails the sync or holds a path back. Sync complete.
 
 ### 3.3 Change Detection (Content Hashing)
 
@@ -97,45 +98,51 @@ This prevents most accidental conflicts. On iOS the same check feeds the auto-sy
 
 ## 4. Server API
 
-### 4.1 Authentication and accounts
+### 4.1 Authentication, accounts, devices
 
-Every vault request carries `Authorization: Bearer <token>`. The server resolves the bearer to a **principal**, and every vault route is scoped to that principal's tenant:
+Every vault request carries `Authorization: Bearer <token>`. The bearer is an `os_…` session token minted by `/auth/*`, stored as SHA-256, with a 180-day absolute expiry. The server resolves it to a **user** and a **device**; every vault route is scoped to the vaults that user is a member of. There is no other principal: scripts and harnesses sign in as ordinary accounts (`AUTH_DEV_RETURN_CODE=1` on a dev server returns the one-time code inline; against production they keep a minted session token).
 
-| Principal | Bearer | Tenant | Who uses it |
-|---|---|---|---|
-| operator | the `OBSINK_API_KEY` environment value (compared in constant time) | `default` | the admin CLI, `scripts/verify-*`, harnesses |
-| user | an `os_…` session token minted by `/auth/*`, stored as SHA-256, 180-day absolute expiry | the user id | every app user |
+Clients offer one setup flow: sign in with an emailed 6-digit one-time code (all platforms) or Sign in with Apple (iOS), then unlock with the account passphrase (§6, §12); the server is baked into each build (the CLI also takes `--server-url`), never a field in the UI. Apple sign-in needs no per-server Apple configuration because the identity token's audience is the ObSink app's bundle id (`APPLE_CLIENT_IDS`, default `com.obsink.ios`).
 
-Clients offer one setup flow: sign in with an emailed 6-digit one-time code (all platforms) or Sign in with Apple (iOS); the server is baked into each build (the CLI also takes `--server-url`), never a field in the UI. The operator bearer has no UI; it exists for scripts. Apple sign-in needs no per-server Apple configuration because the identity token's audience is the ObSink app's bundle id (`APPLE_CLIENT_IDS`, default `com.obsink.ios`).
+**Devices.** A device is a physical machine, identified by a client-generated UUID that the client keeps for good (macOS Keychain, shared by the desktop app and the CLI; iOS Keychain; IndexedDB in the browser, where a cleared site profile is a new device). Every sign-in carries `device: { id, name, platform }` with `platform` one of `macos`, `ios`, `browser`, `cli`; the field is required, and a sign-in without it is `400 { "error": "update ObSink to continue" }` (this is what keeps protocol-2 clients out, §6.1). A sign-in for a device id the account already knows replaces that device's session, so a device has exactly one session and signing in twice on one Mac does not produce two rows. `name` is free text (80 characters), sealed at rest, and can be changed from any device.
 
-**Invite-only signup.** The first account on a fresh server signs up without an invite. After that, creating a new account requires an unused, unexpired invite code; existing accounts sign in freely. A code stays spent after the account that redeemed it is deleted. Any signed-in user (and the operator) can mint codes: 8 characters from `ABCDEFGHJKLMNPQRSTUVWXYZ23456789`, single-use, valid 7 days. Redemption failures are rate-limited process-wide (20 per minute).
+**Invite-only signup.** The first account on a fresh server signs up without an invite. After that, creating a new account requires an unused, unexpired invite code; existing accounts sign in freely. A code stays spent after the account that redeemed it is deleted. Any signed-in user can mint codes, and `obsink-server invite` mints one from the server's shell with no creator (bootstrap and operator use): 8 characters from `ABCDEFGHJKLMNPQRSTUVWXYZ23456789`, single-use, valid 7 days. Redemption failures are rate-limited process-wide (20 per minute). Invites create accounts; they are not vault sharing.
 
-Per-account quotas: `MAX_VAULTS_PER_USER` (default 10) and `MAX_VAULT_BYTES` per vault (default 1 GiB). The operator has no quotas.
+Per-account quotas: `MAX_VAULTS_PER_USER` (default 10) and `MAX_VAULT_BYTES` per vault (default 1 GiB), counted against the vault's owner.
 
-Accounts decide only *which encrypted vaults* a bearer may list and write. They never touch vault content: rule §6 (server never sees plaintext) is unaffected, and the vault ID stays the KDF salt.
+Accounts decide only *which encrypted vaults* a bearer may list and write. They never touch vault content: rule §6 (server never sees plaintext) is unaffected.
 
 Auth endpoints (no bearer unless noted):
 
-- `GET /` → `{ service, auth: { email, apple, api_key }, invite_required }` — which sign-in methods are configured and whether new sign-ups need an invite.
+- `GET /` → `{ service, protocol: 3, auth: { email, apple }, invite_required }` — the wire format the server speaks, which sign-in methods are configured, and whether new sign-ups need an invite. A client built for another protocol shows `Update ObSink` and stops.
 - `POST /auth/email/start { email }` → sends the code over SMTP. One per email per 60 s; code valid 10 min, 5 attempts. A failed send does not consume the cooldown. `AUTH_DEV_RETURN_CODE=1` (dev only) returns the code in the response.
-- `POST /auth/email/verify { email, code, device_name?, invite_code? }` → `{ token, session, user }`.
-- `POST /auth/apple { identity_token, device_name?, email?, code?, invite_code? }` → same; verifies the RS256 JWT against Apple's JWKS (`iss`, `aud ∈ APPLE_CLIENT_IDS`, `exp`) and links to an existing email account when the token's `email` claim matches. Apple includes that claim only in the first token it issues for an app, so a client may forward the credential's email as `email`; because the hint is unverified, the server honours it only together with `code`, a one-time code from `/auth/email/start` for that address (consumed on success). A hint without a code is `403 { "error": "email verification required: …" }` and the client prompts for the code; a token with no claim and no hint signs in by Apple subject alone (a new account then has no email).
-- `GET /auth/me` (bearer) → `{ kind, user, sessions[], usage: { vaults: [{ id, bytes }], total_bytes, max_vault_bytes, max_vaults } }` (limits are `null` for the operator).
-- `DELETE /auth/session` (bearer) → sign out this device; `DELETE /auth/sessions/:id` → sign out another device.
-- `DELETE /auth/account` (bearer) → delete the account, its sessions, its invites, and every vault it owns (blobs, versions, trash, manifests). Required by App Store guideline 5.1.1(v).
+- `POST /auth/email/verify { email, code, device, invite_code? }` → `{ token, session, user }`.
+- `POST /auth/apple { identity_token, device, email?, code?, invite_code? }` → same; verifies the RS256 JWT against Apple's JWKS (`iss`, `aud ∈ APPLE_CLIENT_IDS`, `exp`) and links to an existing email account when the token's `email` claim matches. Apple includes that claim only in the first token it issues for an app, so a client may forward the credential's email as `email`; because the hint is unverified, the server honours it only together with `code`, a one-time code from `/auth/email/start` for that address (consumed on success). A hint without a code is `403 { "error": "email verification required: …" }` and the client prompts for the code; a token with no claim and no hint signs in by Apple subject alone (a new account then has no email).
+- `GET /auth/keys` (bearer) → `{ account_key: null }` for an account that has not set a passphrase, else `{ account_key: { key_id, wrapped, salt } }` (§6.1). The verifier is never returned.
+- `PUT /auth/keys { wrapped, salt, verifier }` (bearer) → `201 { key_id }`. Create-only: when the account already has a key the answer is `409 { account_key: { key_id, wrapped, salt } }` and the client unlocks with that instead (two devices setting up the same new account at once cannot fork it). `wrapped` is base64 of `[12-byte nonce][32-byte ciphertext][16-byte tag]`, `salt` base64 of 16 bytes; anything else is `400`.
+- `PUT /auth/keys/rewrap { wrapped, salt, verifier }` (bearer) → `200`. A passphrase change: the same account key wrapped under the new passphrase. `verifier` must equal the stored one (constant-time compare), which only a client holding the unwrapped account key can compute, so a stolen session cannot lock the owner out. `key_id` does not change.
+- `GET /auth/me` (bearer) → `{ user, devices: [{ id, name, platform, created, last_seen, current, vault_ids }], usage: { vaults: [{ id, bytes }], total_bytes, max_vault_bytes, max_vaults } }`. `last_seen` is updated at sign-in and by the checkpoint report, not on every request.
+- `PATCH /auth/devices/:id { name }` (bearer) → `200`. Rename a device of this account from any device.
+- `DELETE /auth/devices/:id` (bearer) → sign out another device: its session, its `device_vaults` rows and the device row go in one transaction. The revoked device gets `401` on its next request and shows `Session expired`; its folders and keys stay where they are (there is no remote wipe). A later sign-in from the same machine registers it again.
+- `DELETE /auth/session` (bearer) → sign out this device (the same effect on this device's row).
+- `DELETE /auth/account` (bearer) → delete the account, its devices and sessions, its invites, its wrapped keys, and every vault it owns (blobs, versions, trash, manifests). Required by App Store guideline 5.1.1(v).
 - `POST /auth/invites` (bearer) → `201 { invite: { code, created, expires } }`; `GET /auth/invites` → `{ invites: [{ code, created, expires, status, used_at }] }`.
-- `DELETE /vaults/:id` (bearer) → delete one vault and its data.
 
 A new account without a valid invite gets `403 { "error": "an invite code is required to create an account" }` or `403 { "error": "invite code is invalid, used, or expired" }`; clients show the message and focus the invite field.
 
-Clients keep the bearer in the OS keychain (service `obsink`, account `bearer:<canonical server URL>`), never in a config file. A `401` surfaces as "sign in again".
+Clients keep the bearer in the OS keychain (service `obsink`, account `bearer:<canonical server URL>`) next to the device id (`device:<canonical server URL>`), never in a config file. A `401` surfaces as "sign in again".
 
 ### 4.2 Data Model
 
 **Postgres** holds metadata:
 
-- `users` (id, sealed email, sealed Apple subject, keyed-HMAC lookup columns), `sessions` (SHA-256 of the token, sealed device name, expiry), `email_codes`, `invites`
-- `vaults` (id, tenant, sealed name, `max_file_size`, `revision`) — `revision` increments on every manifest change and is the manifest ETag
+- `users` (id, sealed email, sealed Apple subject, keyed-HMAC lookup columns, `account_key_enc`, `account_key_salt`, `account_key_id`, `account_key_verifier`) — the account key columns are null until the first `PUT /auth/keys`; `account_key_enc` is client ciphertext stored as sent, the verifier a 32-byte HMAC
+- `devices` (user_id, id, sealed name, platform, created, last_seen; primary key `(user_id, id)`, so two accounts on one machine never collide)
+- `sessions` (id, user_id, device_id, SHA-256 of the token, created, expires; unique on `(user_id, device_id)`)
+- `email_codes`, `invites` (`created_by` null for codes minted from the server's shell)
+- `vaults` (id, `owner` → users, sealed name, created, `max_file_size`, `revision`, `last_write`) — `revision` increments on every manifest change and is the manifest ETag; `last_write` is the time of that change
+- `vault_members` (vault_id, user_id, role, `wrapped_key`, created) — one row per account that holds the vault key, with the vault key wrapped under that account's key (§6.1); v1 writes exactly one row, role `owner`. This is the seam a later "share vault" feature fills in.
+- `device_vaults` (user_id, device_id, vault_id, attached, last_synced, last_revision) — which devices hold a vault and how far each has synced; rows go with their device or vault
 - `files` — one row per manifest entry: `(vault_id, path token, hash, modified, size, deleted, enc_path)`
 
 **Filesystem volume** (`OBSINK_DATA_DIR`, default `/data`) holds the blobs:
@@ -148,7 +155,7 @@ blobs/_trash/<vault_id>/<sha256(path token)>/<unix>[-n]      soft-deleted blobs 
 
 File names are hashes of the client's path token, so nothing a client sends can escape the store.
 
-**Envelope encryption.** `OBSINK_SERVER_KEY` (32 bytes; generated on first run and written to `<data>/server.key` when unset) is HKDF input for three sub-keys: blobs are wrapped again with AES-GCM (they are already client ciphertext), sensitive columns (emails, Apple subjects, device names, vault names) are sealed with a per-row AAD, and lookups by email or Apple subject go through keyed HMAC indexes. Losing the key makes the metadata unreadable; the vault passphrase is still required to read any content.
+**Envelope encryption.** `OBSINK_SERVER_KEY` (32 bytes; generated on first run and written to `<data>/server.key` when unset) is HKDF input for three sub-keys: blobs are wrapped again with AES-GCM (they are already client ciphertext), sensitive columns (emails, Apple subjects, device names, vault names) are sealed with a per-row AAD, and lookups by email or Apple subject go through keyed HMAC indexes. Wrapped account and vault keys are already ciphertext under keys the server never has and are stored as sent. Losing the server key makes the metadata unreadable; the account passphrase is still required to read any content.
 
 **Manifest structure** (as served; keys are path tokens, `encPath` recovers the real path):
 
@@ -167,10 +174,31 @@ File names are hashes of the client's path token, so nothing a client sends can 
 ### 4.3 Endpoints
 
 **`GET /vaults`**
-Returns the vaults the principal owns. Used during setup to select which vault to connect to.
+Returns every vault the account is a member of, with what each device needs to show the list and unlock the vault:
+
+```json
+{ "vaults": [ {
+  "id": "…", "name": "notes", "created": 1713100800, "max_file_size": 52428800,
+  "revision": 412, "last_write": 1713200000, "bytes": 431000000,
+  "wrapped_key": "<AES-GCM(vault key) under this account's key>",
+  "devices": [ { "id": "…", "name": "MacBook", "platform": "macos", "last_synced": 1713199000, "last_revision": 412 } ]
+} ] }
+```
 
 **`POST /vaults`**
-Creates a new vault. Body: `{ "name": "my-vault", "max_file_size"?: bytes }`. Returns `201 { "vault": { id, name, created, max_file_size } }`.
+Creates a new vault. Body: `{ "name": "my-vault", "wrapped_key": "<…>", "max_file_size"?: bytes }`. The client generates the vault key and wraps it under its account key; the vault row and the owner's `vault_members` row are written in one transaction. `400 set a passphrase first` when the account has no key yet. Returns `201 { "vault": { id, name, created, max_file_size } }`.
+
+**`PATCH /vaults/:vault_id`**
+`{ "name": "…" }` renames the vault for every device (owner only).
+
+**`DELETE /vaults/:vault_id`**
+Deletes the vault and its data for every device (owner only). Other devices see it disappear from `GET /vaults`; their local folders stay.
+
+**`PUT /vaults/:vault_id/devices/self`**
+Body `{ "revision"?: n }`. Without a revision: this device now holds the vault (called by Download and Create). With one: the checkpoint report of §3.2 step 7; sets `last_synced`, `last_revision` and the device's `last_seen`. Idempotent.
+
+**`DELETE /vaults/:vault_id/devices/self`**
+This device no longer holds the vault (called by `Remove from this device`).
 
 **`GET /vaults/:vault_id/manifest`**
 Returns the full manifest JSON for a vault with `ETag: "<revision>"` and `Cache-Control: private, no-cache`. A request with `If-None-Match` matching the current revision returns `304` with no body; clients keep the last manifest and its ETag in `<vault>/.obsink/remote-manifest.json`.
@@ -187,10 +215,10 @@ Headers:
 - `X-Enc-Path` — encrypted real path (kept from the previous entry when absent)
 
 Logic, all inside one database transaction that locks the vault row:
-1. Read the current manifest entry for the path.
-2. Body larger than the vault's `max_file_size` → `413 file too large`. For accounts, current usage plus the body over `MAX_VAULT_BYTES` → `507 vault storage limit reached`.
+1. Check membership, then read the current manifest entry for the path.
+2. Body larger than the vault's `max_file_size` → `413 file too large`. Current usage plus the body over `MAX_VAULT_BYTES` → `507 vault storage limit reached`.
 3. If an entry exists and `X-Parent-Hash` ≠ its hash → `409 Conflict` with `{ path, current }`. Exception: if the entry is live and already has `X-Content-Hash`, the upload is a retry whose first attempt landed, and the server answers `200` without writing.
-4. Otherwise: move the previous live blob to `_versions/<ts>` (version history), write the new blob, upsert the manifest row, bump `revision`, `200 OK`.
+4. Otherwise: move the previous live blob to `_versions/<ts>` (version history), write the new blob, upsert the manifest row, bump `revision` and `last_write`, `200 OK`.
 
 **`DELETE /vaults/:vault_id/files/:path`**
 Soft-deletes a file. Requires `X-Parent-Hash`. On hash mismatch → `409 Conflict`.
@@ -205,6 +233,20 @@ Batch operations as `multipart/form-data`:
 
 `action` must be exactly `put` or `delete`; any other value (or none) rejects the whole batch with `400` before anything runs. Operations run in order, each with the same transaction as the single-file routes. The response is `200 { "results": [ { path, status, conflict } ] }`; `409` entries carry the conflicting `current` entry, so a batch can partly succeed. A non-multipart body is `415`; a body over `MAX_BATCH_BYTES` (default 128 MiB) is `413`.
 
+**`GET /vaults/:vault_id/files/:path/versions`**
+`{ "versions": [ { "ts": 1713100800, "size": 2048 } ] }`, newest first: the entries under `_versions/` for this path token (§8).
+
+**`GET /vaults/:vault_id/files/:path/versions/:ts`**
+That version's encrypted blob.
+
+**`GET /vaults/:vault_id/trash`**
+`{ "entries": [ { "path": "<path token>", "encPath": "…", "hash": "…", "size": 2048, "deleted_at": 1713100800 } ] }`: the manifest's tombstones (the volume's directory names are one-way, so the listing comes from `files WHERE deleted`, with the newest `_trash/` entry's timestamp).
+
+**`GET /vaults/:vault_id/trash/:path`**
+The newest trashed blob for that path token.
+
+There is no server-side restore. The server cannot compute the manifest `hash` of an old blob, so a restore is a client operation: fetch the blob, decrypt, write it locally, and let the next sync upload it through the conflict-gated `PUT` (with the current hash, or the tombstone's, as `X-Parent-Hash`). §8.2 and §9.3 describe the UI.
+
 ### 4.4 Attachment Size Limit
 
 Files above **50 MB** (`MAX_FILE_BYTES`) are rejected by the server. This prevents accidental syncing of large media files. Configurable per vault at creation (`max_file_size`, capped at the server maximum). The sync engine transfers files one request at a time and skips a too-large file as a per-file failure.
@@ -217,7 +259,7 @@ An in-process task runs at startup and then every `RETENTION_INTERVAL_SECS` (def
 
 **Trash purging** — Hard-deletes trash older than 30 days.
 
-**Housekeeping** — Removes expired sessions, day-old one-time codes, and blob directories whose vault row no longer exists.
+**Housekeeping** — Removes expired sessions, day-old one-time codes, and blob directories whose vault row no longer exists. Devices are never expired: the user sees and removes them.
 
 ---
 
@@ -251,34 +293,49 @@ Inline diff with merge — show a unified view with conflicting sections highlig
 
 ## 6. Encryption
 
-### 6.1 Scheme
+### 6.1 Key hierarchy (wire format v3)
 
-- **Key derivation:** Argon2id from user passphrase → 256-bit master key
-- **File encryption:** AES-256-GCM with a random 96-bit nonce per file
-- **Encrypted blob format:** `[12-byte nonce][ciphertext][16-byte GCM auth tag]`
-- **One key per vault.** Different vaults can have different passphrases.
+One passphrase per account; one random key per vault; the server holds only wrapped keys.
 
-### 6.2 What Is Encrypted
+| Key | Made from | Lives |
+|---|---|---|
+| **KEK** (key-encryption key) | Argon2id(passphrase, `salt`) — 64 MiB / 3 iterations / 1 lane, 32 bytes; `salt` is 16 random bytes generated when the passphrase is set | derived on demand, never stored |
+| **Account key** | 32 random bytes, generated once when the passphrase is first set | in the OS keychain (`account:<user id>`, with `key_id`); on the server as `AES-256-GCM(KEK, account key)` with AAD = user id, plus the salt and a `key_id`; in the browser in worker memory only |
+| **Verifier** | `HMAC-SHA256(HKDF(account key, "obsink:v3:verify"), user id)` | on the server, never returned; proves a rewrap request comes from a client that holds the account key |
+| **Vault key** | 32 random bytes, generated when the vault is created | in the OS keychain under the vault id, as before; on the server per member as `AES-256-GCM(HKDF(account key, "obsink:v3:vault-wrap"), vault key)` with AAD = vault id |
+| **Sub-keys** | HKDF-SHA256 of the vault key: `content_enc`, `content_mac`, `path_token`, `path_enc` (unchanged from v2) | derived on demand |
+
+Consequences:
+
+- Unlocking a device runs Argon2id once, not once per vault; every vault key is one AES-GCM unwrap away. Download is one action.
+- A wrong passphrase is a failed unwrap (the GCM tag), detected on the client before anything is downloaded. No probe file is needed.
+- Changing the passphrase rewraps the account key (`PUT /auth/keys/rewrap`); nothing else changes. The account key and the vault keys are never rotated in v3.
+- Vault keys do not derive from the account key, so a vault can later be shared by wrapping its key for another member. Only the wrap changes hands, never a passphrase.
+- The passphrase never leaves the device, but the wrapped account key does travel to any session holder, and a database dump contains it. Argon2id at the parameters above is the defence, and clients require at least 12 characters when the passphrase is set.
+- **File encryption**: AES-256-GCM with a random 96-bit nonce per file; blob = `[12-byte nonce][ciphertext][16-byte GCM auth tag]`. Unchanged.
+- `PROTOCOL_VERSION = 3`. v2 vaults (passphrase-derived keys, one passphrase per vault) are not migrated: the cutover wipes the server, and v2 clients cannot sign in (§4.1).
+
+### 6.2 What Is Encrypted, and what the server holds
 
 - File contents: **encrypted** (stored as opaque blobs on the server volume, wrapped once more with the server key)
-- File paths in manifest: **plaintext** (server needs paths for routing and manifest lookups)
-- Vault names: **plaintext** (server needs to list vaults)
-- File hashes in manifest: **plaintext** (derived from plaintext content; see §3.3 for information leak discussion)
+- File paths: **encrypted** (`encPath`) and **tokenized** (manifest keys are `HMAC(path_token_key, path)`)
+- File hashes: **keyed HMACs** of plaintext content (see §3.3)
+- Vault names, device names, emails: sealed with the server's envelope key (the server can read them; nothing else can)
+- Account key, vault keys: **wrapped** under keys the server never has. The server holds no KEK, no account key, no vault key, and cannot check a passphrase; it can only tell whether a rewrap request knows the account key.
 
 ### 6.3 Key Storage
 
-On first setup, user enters passphrase. The app derives the key via Argon2id and stores it in the platform keychain:
+| Platform | Account key | Device id | Vault keys |
+|---|---|---|---|
+| macOS (desktop app and CLI share these) | Keychain `account:<user id>`, `key_id` alongside | Keychain `device:<canonical server URL>` (`OBSINK_DEVICE_ID` overrides for harnesses) | Keychain, account = vault id |
+| iOS | Keychain (app group, `AfterFirstUnlock`), same account names | Keychain | Keychain, account = vault id |
+| Browser | worker memory for the tab's lifetime; a reload shows `Unlock` | IndexedDB | worker memory |
 
-| Platform | Storage |
-|---|---|
-| macOS | macOS Keychain |
-| iOS | iOS Keychain |
-
-Key is loaded from keychain on app launch. User only re-enters passphrase when setting up a new device or connecting to a new vault.
+Nothing wrapped is cached in client config: a vault's wrapped key is fetched from `GET /vaults` when the vault is downloaded or created, unwrapped once, and the unwrapped key is what the keychain keeps. A keychain account key whose `key_id` no longer matches `GET /auth/keys` (the losing side of the first-set race in §4.1) is discarded and the client asks for the passphrase again.
 
 ### 6.4 No Key Recovery
 
-There is no key recovery mechanism. Lost passphrase = lost data. This is a deliberate design choice for simplicity in v1.
+There is no key recovery mechanism. Lost passphrase = lost data. This is a deliberate design choice. A passphrase change (rewrap) needs the current passphrase on a device that is already unlocked.
 
 ---
 
@@ -302,9 +359,7 @@ Retention: **14 days, max 10 versions per file** (whichever limit is hit first).
 
 ### 8.2 Access
 
-v1: backend safety net only. Recovery requires operator access to the data volume (`obsink-server` decrypts nothing; the vault passphrase is still needed) or a simple CLI tool.
-
-Future: "Browse history" button per file in the app UI, showing a list of past versions with timestamps and the ability to restore.
+`History` on the vault page (§15): pick a file, see its versions (timestamp, size) from `GET …/versions`, open one as a decrypted read-only preview, and `Restore` it. Restore writes the version over the local file; the next sync uploads it as an ordinary change, conflict-gated against whatever the server holds by then. A version of a file that has since been deleted is restored the same way (the upload presents the tombstone's hash as its parent).
 
 ---
 
@@ -322,9 +377,7 @@ Trashed files are retained for **30 days**. Purged by the daily retention task (
 
 ### 9.3 Recovery
 
-v1: operator access to the data volume or a CLI tool.
-
-Future: "Recently deleted" view in the app UI.
+`Recently deleted` under `History` on the vault page (§15): the tombstones from `GET /vaults/:id/trash` with their real paths (decrypted `encPath`), sizes and deletion times, a decrypted preview, and `Restore`. Restore writes the file back into the local folder; the next sync uploads it with the tombstone's hash as its parent.
 
 ---
 
@@ -336,15 +389,15 @@ Each vault has:
 - A unique `vault_id`
 - Its own blob directories (`live/{vault_id}/`, `_versions/{vault_id}/`, `_trash/{vault_id}/`)
 - Its own manifest rows (`files` where `vault_id = ...`) and revision counter
-- Its own encryption passphrase and derived key
+- Its own random key (§6.1), wrapped per member
 
 ### 10.2 Vault Management
 
-The server keeps a `vaults` table scoped by tenant. Clients can list, create, and delete the vaults their principal owns.
+The server keeps a `vaults` table with an owner and a `vault_members` table (v1: the owner only). Clients list, create, rename and delete the vaults their account is a member of, and tell the server which device holds which vault.
 
 ### 10.3 Client UX
 
-On app launch, the client shows a vault picker if multiple vaults are configured. Each vault's passphrase is stored separately in the platform keychain, and on iOS each vault has its own cache directory, item database, and File Provider location (§11.2). The user can add/remove vaults from settings.
+The vault list on every client is the account's list, not the device's. Each row shows the vault's state on this device (§15), or `Not on this device` with a `Download` action for a vault the account owns that this device does not hold. Download asks for a folder on desktop and in the browser (always a picker, no default location) and uses the app's own container on iOS, registers the device with `PUT /vaults/:id/devices/self`, and runs the first sync. `Create vault` asks for a name and (on desktop and the browser) a folder; the passphrase is never asked again after the unlock. A vault can be renamed from any device. On desktop, `Move folder` re-points a vault at another folder (the `.obsink/` bookkeeping moves with it, so the next sync is a no-op). `Remove from this device` detaches the device and drops the vault key from the keychain; `Delete vault on server` removes it for every device. On iOS each vault has its own cache directory, item database, and File Provider location (§11.2).
 
 ---
 
@@ -403,23 +456,22 @@ Stable UUIDs assigned on first encounter. **Never** use file paths as identifier
 
 ## 12. Initial Setup Flow
 
-### 12.1 First Device (Creating a Vault)
+### 12.1 Sign in and unlock
 
-1. Sign in with an email code or Sign in with Apple (iOS). Each build talks to one server (baked in at build time; the CLI also takes `--server-url`), so there is no URL to enter. New accounts need an invite code unless the server has no users yet. The session token goes to the keychain, so this happens once per device.
-2. Choose: "Create new vault" or "Connect to existing vault"
-3. If creating: enter vault name, choose passphrase → app derives key, stores in keychain, creates vault on server, optionally imports existing local Obsidian vault folder
-4. If connecting: app lists vaults from server, user picks one, enters passphrase → key derived, stored in keychain, initial pull of all files
+1. **Sign in** with an email code or Sign in with Apple (iOS). Each build talks to one server (baked in at build time; the CLI also takes `--server-url`), so there is no URL to enter. New accounts need an invite code unless the server has no users yet. The client sends its device id, name and platform; the session token goes to the keychain, so this happens once per device.
+2. **Unlock.** The client calls `GET /auth/keys`.
+   - `null` (a new account): `Set passphrase`, twice, at least 12 characters. The client generates the salt and the account key, wraps the key, computes the verifier, and `PUT /auth/keys`. A `409` means another device set it first: the generated key is discarded and the screen becomes `Unlock` with the message `A passphrase was already set on another device. Enter it.`
+   - a key: `Unlock`. The client derives the KEK, unwraps the account key (a failed tag is `Passphrase does not match this account.`), and stores it in the keychain with the `key_id`.
+   A crash between sign-in and the `PUT` is harmless: the next launch finds `null` again.
+3. **The vault list** (`GET /vaults`). The first account on a fresh server sees `No vaults yet.` and `Create vault`.
 
-### 12.2 Adding a New Device
+### 12.2 First vault
 
-1. Sign in to the same account (on the same server)
-2. App lists available vaults
-3. User selects vault(s) and enters passphrase for each
-4. Initial sync pulls all files
+`Create vault`: name, then a folder (desktop, browser) — an existing Obsidian vault folder is fine, its files are uploaded on the first sync. The client generates the vault key, wraps it, `POST /vaults`, `PUT /vaults/:id/devices/self`, stores the vault key in the keychain, and syncs.
 
-### 12.3 Validation
+### 12.3 Another device
 
-On connect, the app downloads a single file and attempts decryption. If it fails, the passphrase is wrong. Fail fast with a clear error.
+Sign in (a new device row), unlock (the same passphrase; the unwrap is the check), and the list shows every vault as `Not on this device`. `Download` on each one the user wants here: folder (desktop, browser), `GET /vaults` supplies the wrapped key, unwrap, register the device, first sync pulls all files.
 
 ---
 
@@ -431,16 +483,16 @@ obsink/
 │   ├── Cargo.toml
 │   └── src/
 │       ├── lib.rs            public API surface; cfg-gates the IO modules off wasm32
-│       ├── crypto.rs         Argon2id key derivation, HKDF sub-keys, AES-256-GCM, path tokens
+│       ├── crypto.rs         Argon2id KEK, key wrapping, verifier, HKDF sub-keys, AES-256-GCM, path tokens
 │       ├── manifest.rs       manifest diffing, conflict detection, checkpoint
 │       ├── hasher.rs         keyed content hashing (HMAC-SHA256) + the (mtime, size) hash cache
 │       ├── ignore.rs         built-in and per-vault ignore rules
 │       ├── sync_rules.rs     pure sync decisions: upload batching, effective conflict choice, copy names
 │       ├── pacing.rs         daemon pacing: poll intervals, exponential backoff
 │       ├── server_url.rs     URL normalization and the legacy host alias table
-│       ├── api_client.rs     HTTP client for the server (ETag cache, multipart batch)
-│       ├── auth.rs           sign-in, sessions, invites
-│       ├── keychain.rs       macOS Keychain (or a directory of files) for keys and bearers
+│       ├── api_client.rs     HTTP client for the server (ETag cache, multipart batch, history, device report)
+│       ├── auth.rs           sign-in with device identity, account keys, devices, invites
+│       ├── keychain.rs       macOS Keychain (or a directory of files) for keys, the bearer and the device id
 │       ├── sync_engine.rs    orchestrates the full sync cycle
 │       ├── daemon.rs         the driver: watcher + poll + backoff around the engine
 │       └── types.rs          shared types (SyncResult, Conflict, FileEntry, etc.)
@@ -454,8 +506,8 @@ obsink/
 │   │   ├── config.rs         env vars, server key
 │   │   ├── crypto.rs         envelope encryption
 │   │   ├── blobs.rs          filesystem blob store
-│   │   ├── auth/             principal, email, apple, sessions, invites
-│   │   ├── routes/           vaults, files, batch, me
+│   │   ├── auth/             session principal, email, apple, sessions, devices, keys, invites
+│   │   ├── routes/           vaults (members, devices), files, batch, history (versions, trash), me
 │   │   └── retention.rs      pruning task
 │   └── tests/                DATABASE_URL-gated integration tests
 ├── ui/                       shared React screens + the Backend interface (npm workspace, TS source)
@@ -476,7 +528,7 @@ obsink/
 │   │   ├── main.tsx, App.tsx  entry, error boundary, visibility wiring
 │   │   ├── backend.ts        the Backend over a worker; folder picking on the page
 │   │   ├── shared/           IndexedDB layer, worker protocol
-│   │   └── worker/           fetch layer, account, vaults, keys, fs (File System Access), sync, driver, activity
+│   │   └── worker/           fetch layer, account, keys, vaults, fs (File System Access), sync, driver, activity
 │   ├── Dockerfile            wasm-pack + npm build, Caddy
 │   └── Caddyfile             site at /, client at /app, API paths proxied to the server
 ├── site/                     landing page (index.html, icon.svg, robots.txt) and install.sh
@@ -509,8 +561,42 @@ obsink/
 
 ## 14. Non-Functional Requirements
 
-- **Privacy:** Server never sees plaintext. All encryption/decryption happens on-device.
+- **Privacy:** Server never sees plaintext. All encryption/decryption happens on-device; the server holds keys only in wrapped form.
 - **Cost:** one small VPS (or any Docker host) runs the server, Postgres, and the blob volume for a household of users; no per-request pricing.
 - **Reliability:** One sync at a time per vault, driven by explicit calls into an engine without timers, means no data races. Conflict detection means no silent data loss.
 - **Portability:** Rust core compiles to every target platform; the server is one static binary in a distroless image. No platform lock-in beyond the iOS File Provider.
 - **Simplicity:** Minimal moving parts. One engine call does everything; the drivers (foreground and background refresh, the daemon) only decide when to make it.
+
+---
+
+## 15. Client Information Architecture
+
+The same three nouns on every client: vaults, devices, the account. `DESIGN.md` §5 holds the exact strings; this section says what goes where.
+
+### 15.1 Vault list
+
+Every vault the account is a member of, from `GET /vaults` merged with the device's own records. Per row: state dot, name, the state text. States on this device: `Up to date`, `n to upload · n to download`, `n conflicts`, `Syncing…`, `Offline`, `Session expired`, `Error: …`, `Needs folder access` (browser), `Unlock` (browser, after a reload); and for a vault this device does not hold: `Not on this device` with `Download`. A vault the server no longer lists (deleted elsewhere) is shown once as `Deleted on the server` with `Remove from this device`. The desktop popover shows the same list, `Download` rows included, and stays a place without forms: `Download` opens the settings window at the folder picker. `Create vault` sits below the list.
+
+### 15.2 Vault page
+
+- **Status**: state line, `Last synced <relative>`, per-vault usage, the local path with `Open folder`, `Sync now`, notices (stale, pending local, checkpoint failed), `Conflicts`.
+- **Devices**: every device that holds this vault, from `GET /vaults`: name, platform, `Last synced <relative>`, and how far behind the server it is (`n revisions behind`, or `Up to date`). This device is tagged `This device`. Read-only here; sign-out lives on the Devices tab.
+- **Activity**: this vault's log (uploads, downloads, deletions, conflicts, errors, sync summaries), newest first.
+- **History**: `File history` (pick a file, list versions, preview, `Restore`) and `Recently deleted` (tombstones with real paths, preview, `Restore`). §8.2, §9.3.
+- **Manage vault**: `Rename`, `Move folder` (desktop), `Remove from this device`, `Delete vault on server`.
+
+### 15.3 Devices tab
+
+One row per device of the account, from `GET /auth/me`: name (editable in place, `Rename`), platform, `Last seen <relative>`, `This device` tag, the vaults it holds as a muted line, and `Sign out`. Signing out this device is the ordinary sign-out; signing out another device is `DELETE /auth/devices/:id`. The revoked device shows `Session expired` on its next request and keeps its folders and keys.
+
+### 15.4 Settings tab
+
+Signed in as (email or user id), the server in mono, usage across vaults, `Change passphrase` (current, new twice), `Invite someone` and the invite list, `Sign out`, `Delete account`. When signed out: the sign-in form. When signed in and locked (browser after a reload, or a lost first-set race): the unlock form, above everything else.
+
+### 15.5 Protocol gate
+
+`GET /` on launch. `protocol` other than the client's: one page, `Update ObSink`, with the download link; nothing else runs.
+
+### 15.6 iOS
+
+The same three tabs (`Vaults`, `Devices`, `Settings`). The vault list is a scroll of cards with the same states and a `Download` button on a `Not on this device` card; the vault page is the pushed `Manage` screen with the sections above. `Unlock` and `Set passphrase` are steps of the sign-in sheet.
