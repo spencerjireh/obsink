@@ -183,6 +183,16 @@ export async function deleteRemoteVault(vaultId: string): Promise<void> {
   await forgetVault(vaultId)
 }
 
+// Spec §4.3 `PATCH /vaults/:id`; the stored copy follows so a signed-out
+// page shows the new name too.
+export async function renameVault(vaultId: string, name: string): Promise<void> {
+  const trimmed = name.trim()
+  if (!trimmed) throw other('Enter a vault name.')
+  await bearerCall((bearer) => api.renameVault(bearer, vaultId, trimmed))
+  const vault = await get<StoredVault>('vaults', vaultId)
+  if (vault) await put('vaults', vaultId, { ...vault, name: trimmed })
+}
+
 export async function forgetVaultsForServer(server: string): Promise<void> {
   for (const vault of await all<StoredVault>('vaults')) {
     if (vault.server_url === server) await forgetVault(vault.id)

@@ -90,9 +90,13 @@ export class WebBackend implements Backend {
   getAccount = () => this.call<never>('getAccount')
   setPassphrase = (passphrase: string) => this.call<never>('setPassphrase', passphrase)
   unlock = (passphrase: string) => this.call<never>('unlock', passphrase)
+  changePassphrase = (current: string, next: string) =>
+    this.call<void>('changePassphrase', current, next)
   createInvite = () => this.call<never>('createInvite')
   listInvites = () => this.call<never>('listInvites')
   revokeDevice = (deviceId: string) => this.call<never>('revokeDevice', deviceId)
+  renameDevice = (deviceId: string, name: string) =>
+    this.call<never>('renameDevice', deviceId, name)
   signOut = () => this.call<void>('signOut')
   deleteAccount = () => this.call<void>('deleteAccount')
   listVaults = () => this.call<never>('listVaults')
@@ -107,6 +111,7 @@ export class WebBackend implements Backend {
     if (request.local_path === this.pickedHandleId) this.pickedHandleId = null
     return vault
   }
+  renameVault = (vaultId: string, name: string) => this.call<void>('renameVault', vaultId, name)
   removeVault = (vaultId: string) => this.call<void>('removeVault', vaultId)
   deleteRemoteVault = (vaultId: string) => this.call<void>('deleteRemoteVault', vaultId)
   syncVault = (vaultId: string) => this.call<never>('syncVault', vaultId)

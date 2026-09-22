@@ -7,7 +7,7 @@ import type {
   ProtocolInfo,
   SetPassphraseOutcome,
 } from '@obsink/ui'
-import type { Me, WireDevice, WireInvite } from './api'
+import type { AccountKeyMaterial, Me, WireDevice, WireInvite } from './api'
 import { all, type StoredVault } from '../shared/db'
 import { stopDriver } from './driver'
 import { other } from './errors'
@@ -200,6 +200,25 @@ export async function unlock(passphrase: string): Promise<AccountState> {
   return getAccount()
 }
 
+// DESIGN.md §5 `Change passphrase`: the current one must open the stored
+// blob; the key itself is unchanged, rewrapped under the new KEK.
+export async function changePassphrase(current: string, next: string): Promise<void> {
+  const { bearer, id } = await signedInUser()
+  const key = accountKey()
+  if (!key) throw other('Unlock the account first.')
+  const blob = await api.getKeys(bearer)
+  if (!blob) throw other('Set a passphrase first.')
+  let check
+  try {
+    check = await unlockAccountKey(current, blob.salt, blob.wrapped, id)
+  } catch {
+    throw other('Passphrase does not match this account.')
+  }
+  check.free()
+  const material = JSON.parse(key.rewrap(next)) as AccountKeyMaterial
+  await api.rewrapKeys(bearer, material)
+}
+
 export function createInvite(): Promise<InviteInfo> {
   return bearerCall(async (bearer) => inviteInfo(await api.createInvite(bearer)))
 }
@@ -210,6 +229,13 @@ export function listInvites(): Promise<InviteInfo[]> {
 
 export async function revokeDevice(deviceId: string): Promise<AccountState> {
   await bearerCall((bearer) => api.revokeDevice(bearer, deviceId))
+  return getAccount()
+}
+
+export async function renameDevice(deviceId: string, name: string): Promise<AccountState> {
+  const trimmed = name.trim()
+  if (!trimmed) throw other('Enter a device name.')
+  await bearerCall((bearer) => api.renameDevice(bearer, deviceId, trimmed))
   return getAccount()
 }
 

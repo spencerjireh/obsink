@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, it } from 'vitest'
 import { BackendProvider } from '../backend'
 import type { AccountState } from '../types'
@@ -174,5 +174,174 @@ describe('the vault list (spec §15.1)', () => {
     expect(await screen.findByRole('heading', { name: 'Created Journal' })).toBeTruthy()
     const call = backend.calls.find((entry) => entry.method === 'createVault')
     expect(call?.args[0]).toEqual({ vault_name: 'Journal', local_path: '/Users/me/Journal' })
+  })
+})
+
+const otherDevice = {
+  id: 'dev-2',
+  name: 'Work laptop',
+  platform: 'macos' as const,
+  created: 1_700_000_000,
+  last_seen: 1_700_000_000,
+  current: false,
+  vault_ids: ['vault_1'],
+}
+const thisDevice = { ...otherDevice, id: 'dev-1', name: 'MacBook', current: true, vault_ids: [] }
+
+function accountWithDevices(devices = [thisDevice, otherDevice]): AccountState {
+  return { kind: 'account', user_id: 'usr_1', email: 'me@example.com', devices, usage: null }
+}
+
+describe('the tabs (spec §15)', () => {
+  it('routes Vaults, Devices and Settings', async () => {
+    const backend = mockBackend({
+      getAccount: () => Promise.resolve(accountWithDevices()),
+      listVaults: () => Promise.resolve([vault()]),
+    })
+    renderApp(backend)
+    const tabs = await screen.findAllByRole('tab')
+    expect(tabs.map((tab) => tab.textContent)).toEqual(['Vaults', 'Devices', 'Settings'])
+
+    fireEvent.click(tabs[1])
+    const rows = await screen.findAllByTestId('deviceRow')
+    expect(rows).toHaveLength(2)
+    expect(within(rows[0]).getByText('This device')).toBeTruthy()
+    expect(within(rows[0]).getByText('No vaults on this device.')).toBeTruthy()
+    expect(within(rows[1]).getByText('Notes')).toBeTruthy()
+
+    fireEvent.click(tabs[2])
+    expect((await screen.findByTestId('signedInAsText')).textContent).toContain('me@example.com')
+    expect(screen.getByTestId('changePassphraseButton')).toBeTruthy()
+    expect(screen.getByTestId('deleteAccountButton')).toBeTruthy()
+  })
+
+  it('renames a device in place', async () => {
+    let account = accountWithDevices()
+    const backend = mockBackend({
+      getAccount: () => Promise.resolve(account),
+      renameDevice: (deviceId: string, name: string) => {
+        account = accountWithDevices([thisDevice, { ...otherDevice, id: deviceId, name }])
+        return Promise.resolve(account)
+      },
+    })
+    renderApp(backend)
+    fireEvent.click((await screen.findAllByRole('tab'))[1])
+    const row = (await screen.findAllByTestId('deviceRow'))[1]
+    fireEvent.click(within(row).getByTestId('deviceRenameButton'))
+    fireEvent.change(within(row).getByTestId('deviceRenameField'), {
+      target: { value: 'Office Mac' },
+    })
+    fireEvent.click(within(row).getByTestId('deviceRenameButton'))
+    expect(await screen.findByText('Device renamed.')).toBeTruthy()
+    const call = backend.calls.find((entry) => entry.method === 'renameDevice')
+    expect(call?.args).toEqual(['dev-2', 'Office Mac'])
+    expect(
+      within((await screen.findAllByTestId('deviceRow'))[1]).getByText('Office Mac'),
+    ).toBeTruthy()
+  })
+
+  it('signs another device out after a confirmation', async () => {
+    const backend = mockBackend({
+      getAccount: () => Promise.resolve(accountWithDevices()),
+      revokeDevice: () => Promise.resolve(accountWithDevices([thisDevice])),
+    })
+    renderApp(backend)
+    fireEvent.click((await screen.findAllByRole('tab'))[1])
+    const row = (await screen.findAllByTestId('deviceRow'))[1]
+    fireEvent.click(within(row).getByTestId('deviceSignOutButton'))
+    expect(
+      await screen.findByText('Work laptop is signed out on its next request. Its folders stay.'),
+    ).toBeTruthy()
+    fireEvent.click(screen.getByTestId('confirmDestructiveButton'))
+    expect(await screen.findByText('Device signed out.')).toBeTruthy()
+    expect(backend.calls.find((entry) => entry.method === 'revokeDevice')?.args).toEqual(['dev-2'])
+  })
+
+  it('changes the passphrase from Settings', async () => {
+    const backend = mockBackend({ changePassphrase: () => Promise.resolve() })
+    renderApp(backend)
+    fireEvent.click((await screen.findAllByRole('tab'))[2])
+    const button = (await screen.findByTestId('changePassphraseButton')) as HTMLButtonElement
+    fireEvent.change(screen.getByTestId('currentPassphraseField'), { target: { value: 'old one' } })
+    fireEvent.change(screen.getByTestId('newPassphraseField'), { target: { value: 'short' } })
+    fireEvent.change(screen.getByTestId('newPassphraseConfirmField'), {
+      target: { value: 'short' },
+    })
+    expect(button.disabled).toBe(true)
+    fireEvent.change(screen.getByTestId('newPassphraseField'), {
+      target: { value: 'correct horse battery' },
+    })
+    fireEvent.change(screen.getByTestId('newPassphraseConfirmField'), {
+      target: { value: 'correct horse battery' },
+    })
+    fireEvent.click(button)
+    expect(await screen.findByText('Passphrase changed.')).toBeTruthy()
+    expect(backend.calls.find((entry) => entry.method === 'changePassphrase')?.args).toEqual([
+      'old one',
+      'correct horse battery',
+    ])
+  })
+})
+
+describe('the vault page (spec §15.2)', () => {
+  it('renames the vault in place and re-reads the list', async () => {
+    let name = 'Notes'
+    const backend = mockBackend({
+      listVaults: () => Promise.resolve([vault({ name })]),
+      renameVault: (_vaultId: string, next: string) => {
+        name = next
+        return Promise.resolve()
+      },
+    })
+    renderApp(backend)
+    await screen.findByRole('heading', { name: 'Notes' })
+    fireEvent.click(screen.getByTestId('renameVaultButton'))
+    fireEvent.change(screen.getByTestId('renameVaultField'), { target: { value: 'Journal' } })
+    fireEvent.click(screen.getByTestId('renameVaultButton'))
+    expect(await screen.findByText('Renamed to Journal.')).toBeTruthy()
+    expect(backend.calls.find((entry) => entry.method === 'renameVault')?.args).toEqual([
+      'vault_1',
+      'Journal',
+    ])
+    expect(await screen.findByRole('heading', { name: 'Journal' })).toBeTruthy()
+  })
+
+  it("shows this vault's activity on the page", async () => {
+    const backend = mockBackend({
+      listVaults: () => Promise.resolve([vault()]),
+      listActivity: (vaultId: string | null) =>
+        Promise.resolve(
+          vaultId === 'vault_1'
+            ? [{ at: 1_700_000_000, vault_id: 'vault_1', kind: 'uploaded' as const, path: 'a.md' }]
+            : [],
+        ),
+    })
+    renderApp(backend)
+    const row = await screen.findByTestId('activityRow')
+    expect(row.textContent).toContain('Uploaded a.md')
+    expect(screen.getByRole('heading', { name: 'Activity' })).toBeTruthy()
+  })
+
+  it('offers Move folder only where the backend can move one', async () => {
+    const backend = mockBackend({
+      listVaults: () => Promise.resolve([vault()]),
+      moveVaultFolder: () => Promise.resolve(),
+    })
+    renderApp(backend)
+    await screen.findByRole('heading', { name: 'Notes' })
+    fireEvent.click(screen.getByTestId('moveFolderButton'))
+    fireEvent.change(screen.getByTestId('moveFolderField'), {
+      target: { value: '/Users/me/Elsewhere' },
+    })
+    fireEvent.click(screen.getByTestId('moveFolderButton'))
+    expect(await screen.findByText('Moved Notes.')).toBeTruthy()
+    expect(backend.calls.find((entry) => entry.method === 'moveVaultFolder')?.args).toEqual([
+      'vault_1',
+      '/Users/me/Elsewhere',
+    ])
+    cleanup()
+    renderApp(mockBackend({ listVaults: () => Promise.resolve([vault()]) }))
+    await screen.findByRole('heading', { name: 'Notes' })
+    expect(screen.queryByTestId('moveFolderButton')).toBeNull()
   })
 })

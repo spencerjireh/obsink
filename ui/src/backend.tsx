@@ -80,16 +80,24 @@ export interface Backend {
   ): Promise<{ outcome: SetPassphraseOutcome; account: AccountState }>
   // Enter the passphrase on a device that does not hold the account key.
   unlock(passphrase: string): Promise<AccountState>
+  // Spec §6.1: the same account key under a new KEK; the current passphrase
+  // must open the stored blob first.
+  changePassphrase(current: string, next: string): Promise<void>
   createInvite(): Promise<InviteInfo>
   listInvites(): Promise<InviteInfo[]>
   // Sign another device out for good (its folders stay).
   revokeDevice(deviceId: string): Promise<AccountState>
+  renameDevice(deviceId: string, name: string): Promise<AccountState>
   signOut(): Promise<void>
   deleteAccount(): Promise<void>
   // Every vault of the account with its state on this device (spec §15.1).
   listVaults(): Promise<VaultStateInfo[]>
   createVault(request: CreateVaultRequest): Promise<LocalVault>
   downloadVault(request: DownloadVaultRequest): Promise<LocalVault>
+  renameVault(vaultId: string, name: string): Promise<void>
+  // Present where the vault folder is a path the user can move (desktop):
+  // move the folder, or re-point the vault when it was moved already.
+  moveVaultFolder?(vaultId: string, localPath: string): Promise<void>
   // Present where folders are picked rather than typed (the browser).
   pickFolder?(): Promise<{ id: string; name: string }>
   // Forget a picked folder that never became a vault (the flow closed).

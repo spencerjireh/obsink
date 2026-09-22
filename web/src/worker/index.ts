@@ -20,14 +20,17 @@ const handlers: Record<string, (...args: any[]) => Promise<unknown> | unknown> =
   getAccount: account.getAccount,
   setPassphrase: account.setPassphrase,
   unlock: account.unlock,
+  changePassphrase: account.changePassphrase,
   createInvite: account.createInvite,
   listInvites: account.listInvites,
   revokeDevice: account.revokeDevice,
+  renameDevice: account.renameDevice,
   signOut: account.signOut,
   deleteAccount: account.deleteAccount,
   listVaults: vaults.listVaults,
   createVault: vaults.createVault,
   downloadVault: vaults.downloadVault,
+  renameVault: vaults.renameVault,
   removeVault: vaults.removeVault,
   deleteRemoteVault: vaults.deleteRemoteVault,
   syncVault,
@@ -43,13 +46,20 @@ const CHANGES_STATE = new Set([
   'authEmailVerify',
   'setPassphrase',
   'unlock',
+  'revokeDevice',
+  'renameDevice',
   'signOut',
   'deleteAccount',
   'createVault',
   'downloadVault',
+  'renameVault',
   'removeVault',
   'deleteRemoteVault',
 ])
+
+// The methods whose first argument is the vault id (`state://changed` then
+// names it).
+const VAULT_METHODS = new Set(['renameVault', 'removeVault', 'deleteRemoteVault'])
 
 self.onmessage = async (message: MessageEvent<WorkerRequest>) => {
   const { id, method, args } = message.data
@@ -63,7 +73,7 @@ self.onmessage = async (message: MessageEvent<WorkerRequest>) => {
   }
   self.postMessage(response)
   if (CHANGES_STATE.has(method)) {
-    const vaultId = typeof args[0] === 'string' && method !== 'authEmailVerify' ? args[0] : null
+    const vaultId = VAULT_METHODS.has(method) && typeof args[0] === 'string' ? args[0] : null
     stateChanged(vaultId)
   }
 }

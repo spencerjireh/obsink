@@ -737,6 +737,45 @@ select {
   font-size: 12px;
 }
 
+/* A value edited in place (Rename, Move folder) */
+.inline-edit {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.inline-edit input {
+  flex: 1 1 12em;
+  min-width: 0;
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+  font: inherit;
+  color: inherit;
+}
+
+.pane-header__title .inline-edit input {
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.row-item--stacked .row-item__main {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-1);
+}
+
+.row-item__name {
+  font-weight: 500;
+}
+
+.row-item__line {
+  display: block;
+}
+
 .inline-field {
   display: flex;
   align-items: center;
