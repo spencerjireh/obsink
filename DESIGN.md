@@ -22,7 +22,7 @@ Each principle follows from a hard rule in `AGENTS.md`.
    disclosure; "changed on another device" is a warning notice, not a badge.
 4. **Privacy is shown, not marketed.** The UI states facts that follow from
    hard rules 1, 4, and 5 where they matter: "Key saved on this device",
-   "Passphrase does not match this vault", no recovery link. It does not
+   "Passphrase does not match this account", no recovery link. It does not
    advertise encryption.
 5. **Deterministic over decorative.** Counts show zero rather than disappear;
    file paths are always monospace; the same event has the same wording on
@@ -129,12 +129,13 @@ iOS uses the system font with Dynamic Type (`.body`, `.caption`,
 | Icon button | idle, hover | 28px square, no border, muted glyph that turns to `--color-text` on hover; always carries an `aria-label`. |
 | Status counts | uploads, downloads, conflicts as three counts | iOS only. Always rendered; zero is shown as `0`. Count in `--font-mono` at 20px, label in muted text. |
 | Notice | info, warning, danger | One line of text; a `FATAL` or `skipped` tag leads a failure line. Warning is used for the stale banner and pending local changes. Danger for `Checkpoint failed: <message>. Sync again.` (the files moved, the bookkeeping did not). |
-| Vault row (list) | active, inactive, disabled while busy | State dot and name in the display face, state text in mono below. Active row has a 2px accent left border and `aria-current="page"`. |
+| Vault row (list) | active, inactive, not on this device, disabled while busy | State dot and name in the display face, state text in mono below. Active row has a 2px accent left border and `aria-current="page"`. A vault this device does not hold shows a muted dot, `Not on this device`, and a ghost `Download` button in the row. |
 | Conflict card | selected, unselected | Path in mono; two rows `This device` / `Other device` with size and modified time; a segmented choice of `Keep local`, `Keep remote`, `Keep both` (or `Delete on server` / `Delete here` when one side is deleted). |
 | Preview | text, deleted, empty, loading | Two columns titled `This device` and `Other device`; body in mono, max height 280px, scrolls. |
-| Form field | default, focused, invalid | Label above the input in muted text; URLs, ids, and codes in mono; passphrase is a secure field; the error sits below the field in `--color-danger`. |
+| Form field | default, focused, invalid | Label above the input in muted text; URLs, ids, and codes in mono; passphrase is a secure field (twice when set, at least 12 characters); the error sits below the field in `--color-danger`. |
 | Empty state | — | One sentence in muted text that says what will appear and when. Never an illustration. |
-| Device row | current, other | Device name, a `This device` tag on the current session, sign-in date in muted text, and a `Sign out` button. The current row signs this device out; any other row revokes that session on the server. |
+| Device row | current, other, renaming | Platform glyph, device name (editable in place after `Rename`), a `This device` tag on the current device, `Last seen <relative>` and the vaults it holds in muted text, and a `Sign out` button. The current row signs this device out; any other row revokes that device on the server. On a vault page the row is read-only and says `Last synced <relative>` and `n revisions behind` or `Up to date` instead. |
+| History row | version, deleted | Timestamp (relative, with the short date on hover) and size in muted text, the path in mono for a deleted file, `Preview` and `Restore`. |
 | Invite row | active, used, expired | Code in mono (letter-spaced), a status tag (`Active` success, `Used` muted, `Expired` warning), expiry or use date in muted text; `Copy` on active rows only. |
 | Confirmation | pending, ready, busy | Inline (desktop) or a sheet (iOS), never a native dialog. Title, one sentence of consequence, then `Type <value> to confirm.` with the value in mono; the destructive button is disabled until the typed value matches (the account email, or `delete` for an account without one, or the vault name). `Remove from this device` needs no typed value. |
 | Danger button | idle, disabled | Ghost shape with `--color-danger` text and a translucent danger border; used for `Delete account` and `Delete vault on server`. |
@@ -153,47 +154,51 @@ Shared labels. Every platform uses exactly these strings:
 
 | role | label |
 |---|---|
-| sections | `Vaults`, `Status`, `Account`, `Conflicts`, `Failed this sync`, `Last result` (iOS status line only), `Devices`, `Invites`, `Manage vault`, `Recent` (popover), `Activity` |
-| tabs (desktop settings) | `Vaults`, `Account`, `Activity` |
+| sections | `Vaults`, `Status`, `Devices`, `Activity`, `History`, `File history`, `Recently deleted`, `Manage vault`, `Conflicts`, `Failed this sync`, `Last result` (iOS status line only), `Account`, `Passphrase`, `Invites`, `Recent` (popover) |
+| tabs (desktop settings, iOS tab bar) | `Vaults`, `Devices`, `Settings` |
 | primary actions | `Sync now`, `Apply resolutions` |
-| setup | `Add vault`, `Create vault`, `Connect vault`, `Load vaults` (iOS; desktop lists on entry), `Send sign-in code`, `Verify and sign in`, `Change email`, `Sign in` |
-| browser only | `Choose folder` / `Choose another folder` (the folder is picked, not typed), `Unlock` (the passphrase again after a reload: keys live only in memory), `Allow access` (the folder grant again: Chrome forgets it per session) |
-| add-vault steps | `Sign in`, `Choose vault`, `Folder`, `Passphrase`; navigation `Back`, `Next`, `Cancel`, `Done` |
+| sign-in and unlock | `Send sign-in code`, `Verify and sign in`, `Change email`, `Sign in`, `Set passphrase` (new account: the field twice, `At least 12 characters.` as the hint), `Unlock` (existing account, the browser after a reload, or after a lost first-set race), `Change passphrase` (Settings: current, new twice) |
+| vault setup | `Create vault` (name, then the folder on desktop and in the browser), `Download` (the folder on desktop and in the browser; iOS downloads in place), `Choose folder` / `Choose another folder` (browser: the folder is picked, not typed), `Allow access` (browser: the folder grant again, Chrome forgets it per session); navigation `Back`, `Next`, `Cancel`, `Done` |
+| protocol gate | `Update ObSink` with `This app is too old for the server. Download the current version.` and the download link |
 | windows | `Settings`, `Open settings`, `Open folder`, `Quit ObSink` |
-| vault state | `Up to date`, `n to upload`, `n to download`, `n to upload · n to download`, `n conflicts` (`1 conflict`), `Syncing…`, `Offline`, `Session expired`, `Error: <message>`, `On another server`, `Needs passphrase`, `Needs folder access` (browser) |
+| vault state | `Up to date`, `n to upload`, `n to download`, `n to upload · n to download`, `n conflicts` (`1 conflict`), `Syncing…`, `Offline`, `Session expired`, `Error: <message>`, `Not on this device` (with `Download`), `Deleted on the server` (with `Remove from this device`), `Locked` (browser: unlock first), `Needs folder access` (browser) |
 | last synced | `Never synced`, `Just now`, `1 minute ago`, `n minutes ago`, `n hours ago`, `Yesterday`, `n days ago`, then the short date; `Last synced <relative>` on a vault page |
-| popover global line | the worst state across vaults: `Offline`, `n conflicts`, `Syncing…`, `Error`, `Changes pending · synced <relative>`, `Up to date · synced <relative>`; `No vaults yet.` |
+| popover global line | the worst state across the vaults on this device: `Offline`, `n conflicts`, `Syncing…`, `Error`, `Changes pending · synced <relative>`, `Up to date · synced <relative>`; `No vaults yet.`; `n vaults not on this Mac` when every vault here is fine and some are elsewhere |
 | activity lines | `Uploaded <path>`, `Downloaded <path>`, `Deleted here <path>`, `Deleted on server <path>`, `Conflict <path>`, `Failed <path>: <error>`, `Error: <error>`, `Synced · ↑n ↓n` |
-| account | `Invite someone`, `Copy`, `Sign out` (per device), `Delete account` |
-| vault actions | `Remove from this device`, `Delete vault on server` (distinct from the conflict choice `Delete on server`) |
+| settings | `Signed in as <email>`, `Invite someone`, `Copy`, `Change passphrase`, `Sign out`, `Delete account` |
+| devices | `Rename`, `Save`, `Sign out` (per row), `Last seen <relative>`, platform nouns `Mac`, `iPhone` / `iPad`, `Browser`, `CLI`; on a vault page `Last synced <relative>`, `n revisions behind`, `Up to date` |
+| history | `Preview`, `Restore`, `Restored <path>. Sync to upload it.`, version line `<relative> · <size>`, deleted line `<path> · deleted <relative>` |
+| vault actions | `Rename`, `Move folder` (desktop), `Remove from this device`, `Delete vault on server` (distinct from the conflict choice `Delete on server`) |
 | device tag | `This device` (the same string as the conflict side, on purpose) |
 | invite status | `Active`, `Used`, `Expired` |
 | per-vault usage | `412 MiB of 1 GiB`; `412 MiB` when the server sets no cap |
 | session | `Session expired. Sign in again.` with the action `Sign in` |
 | server without email | `This server has no email sign-in.` |
-| after actions | `Invite code created.`, `Invite code copied.`, `Device signed out.`, `Account deleted.`, `Added <vault>.`, `Removed <vault> from this device.`, `Deleted <vault> on the server.`, `Unlocked <vault>.` (browser), `Signed out of <server>.` |
-| foreign vault | `Vault is on another server. Remove it from this device.` (error); the page explains it is configured for another server and offers only `Remove from this device` |
+| after actions | `Invite code created.`, `Invite code copied.`, `Device signed out.`, `Device renamed.`, `Account deleted.`, `Created <vault>.`, `Downloaded <vault>.`, `Renamed to <vault>.`, `Moved <vault>.`, `Removed <vault> from this device.`, `Deleted <vault> on the server.`, `Unlocked.`, `Passphrase changed.`, `Signed out of <server>.` |
+| unlock errors | `Passphrase does not match this account.`; `A passphrase was already set on another device. Enter it.` (the lost first-set race); `Set a passphrase first.` (a vault action before unlock) |
 | confirmation prompt | `Type <value> to confirm.` |
-| confirmation copy | delete account: `This deletes your account, every vault it owns on <server>, and every signed-in device.` then, desktop: `Vault folders on this device stay.`, iOS: `The copies on this device are removed too.`; delete vault: `This deletes <vault> and all of its files on <server>` then, desktop: `The folder on this device stays.`, browser: `The folder on this computer stays.`, iOS: `for every device.`; remove: `The vault stays on the server.` then, desktop: `The key is removed from the keychain, so connecting again needs the passphrase.`, browser: `This browser forgets the folder, so connecting again needs the passphrase.`, iOS: `The copy on this device, its Files location, and the key are removed, so connecting again needs the passphrase.` |
-| modes | `Create`, `Connect` |
+| confirmation copy | delete account: `This deletes your account, every vault it owns on <server>, and every signed-in device.` then, desktop: `Vault folders on this device stay.`, iOS: `The copies on this device are removed too.`; delete vault: `This deletes <vault> and all of its files on <server> for every device.` then, desktop: `The folder on this device stays.`, browser: `The folder on this computer stays.`; remove: `The vault stays on the server and can be downloaded again.` then, desktop: `The folder on this device stays.`, browser: `This browser forgets the folder.`, iOS: `The copy on this device and its Files location are removed.`; sign out another device: `<name> is signed out on its next request. Its folders stay.` |
 | conflict sides | `This device`, `Other device` |
 | conflict choices | `Keep local`, `Keep remote`, `Keep both`, `Delete on server`, `Delete here` |
 | busy | `Working…` |
 | status line | `Synced · ↑n ↓n`; `n conflicts need attention`; `Error: …` |
 | stale banner | `n files changed on another device. Sync before editing.` |
 | pending local | `n local changes not uploaded yet` |
-| key state | `Key saved on this device` |
+| key state | `Key saved on this device` (vault page); `Locked` (browser, before unlock) |
 
 Empty states:
 
-- Vaults: `No vaults yet.` (desktop); `No vault yet. Tap Add vault.` (iOS)
+- Vaults: `No vaults yet.` (desktop); `No vault yet. Tap Create vault.` (iOS)
+- Devices: only ever this device, so no empty state; a device's vault line
+  says `No vaults on this device.`
+- File history: `Pick a file to see its versions.`; a file with none: `No
+  earlier versions kept.`
+- Recently deleted: `Nothing deleted in the last 30 days.`
 - Last result / Recent / Activity: `Run a sync to see uploads and downloads.`
 - Vault page with nothing pending: `Nothing to sync.`
 - Conflicts: `Conflicts appear here when a sync needs a decision.`
 - Result column: `No entries.`
 - Preview: `Deleted in this version.` / `Empty file.`
-- Devices: `No other devices signed in.` (iOS, where the current device is
-  the picker's context); desktop always lists the current device.
 - Invites: `No invites yet.`
 
 The invite code field appears only when the server reports
@@ -217,24 +222,31 @@ next to the account heading in mono.
   top, no transparency) shown centred under the tray icon on a left click
   and hidden when it loses focus. Header: the app icon as a 20px rounded
   tile (`BrandMark`), `ObSink`, a gear icon button. Then the global line,
-  one vault row per configured vault (or an `Add vault` row), `Recent`
-  (the newest eight activity events), and a footer with `Sync now`
-  (primary) and `Settings` (ghost). It never shows a form; anything that
-  needs input opens the settings window.
+  one vault row per vault of the account (vaults on this Mac first, then
+  `Not on this device` rows whose `Download` opens the settings window at
+  the folder picker; or a `Create vault` row), `Recent` (the newest eight
+  activity events), and a footer with `Sync now` (primary) and `Settings`
+  (ghost). It never shows a form; anything that needs input opens the
+  settings window.
 - Settings window: 900x620, minimum 760x520, hidden by default, closing
-  hides it. A tab bar (`Vaults`, `Account`, `Activity`) over a pane. The
-  Vaults tab is a 240px list (state dot, name, state text; `Add vault`
-  below) and a page: name, state line with `Last synced <relative>` and the
-  per-vault usage, the path with `Open folder`, `Sync now`, `Status`
-  notices, `Conflicts`, `Manage vault`. `Add vault` replaces the page with
-  the stepper flow and ends on a card with the folder path, `Open folder`
-  and `Done`. The Account tab holds sign-in or the account, `Devices`,
-  `Invites`, `Delete account`; the Activity tab lists events with a vault
-  filter. Two-column groups stack below 860px; the list stacks above the
-  page below 760px.
+  hides it. A tab bar (`Vaults`, `Devices`, `Settings`) over a pane. The
+  Vaults tab is a 240px list (state dot, name, state text, `Download` on a
+  `Not on this device` row; `Create vault` below) and a page: name (with
+  `Rename` in place), state line with `Last synced <relative>` and the
+  per-vault usage, the path with `Open folder` and `Move folder`,
+  `Sync now`, `Status` notices, `Conflicts`, `Devices` (read-only rows),
+  `Activity` (this vault's log), `History` (`File history` and `Recently
+  deleted`), `Manage vault`. `Create vault` and `Download` replace the page
+  with a stepper (name and folder; folder) and end on a card with the
+  folder path, `Open folder` and `Done`. The Devices tab lists the
+  account's devices. The Settings tab holds sign-in, unlock or the account,
+  `Passphrase` (`Change passphrase`), `Invites`, `Delete account`. Before
+  unlock the Vaults tab shows the unlock form and nothing else. Two-column
+  groups stack below 860px; the list stacks above the page below 760px.
 - Errors reach the UI typed (`CommandError { kind, message, status }`); a
   401 shows `Session expired` as the vault state and the session notice
-  with `Sign in`, which opens the Account tab.
+  with `Sign in`, which opens the Settings tab. A `protocol` mismatch on
+  `GET /` replaces both windows' content with the `Update ObSink` page.
 - Menu bar: the template silhouette; left click toggles the popover; menu
   items `Sync now`, `Open settings`, `Quit ObSink`.
 - Icons: `desktop/src-tauri/icons/` holds the generated macOS set
@@ -250,31 +262,32 @@ next to the account heading in mono.
   `.red` for danger, `.green` for success. Asset catalog colorsets:
   `AccentColor` (`--color-accent`, light and dark variants) for tinted text
   and controls; `Amber` and `Ink` (brand constants) for the primary button.
-- Structure: a `TabView`. **Home** is a scroll of cards on the grouped
-  background, one per vault: name and `Manage` (the vault screen), a state
-  dot with the shared state text (section 5) and `Last synced`, the
-  per-vault usage, the last result line on the active vault, the stale
-  banner, `Resolve n conflicts` (pushes the Conflicts screen), a
-  `Passphrase` field until the key is stored, and a full-width
-  `.borderedProminent` `Sync now` (amber with ink text). One sync runs at a
-  time. After the first vault a one-time `Open in Obsidian` card explains
-  the Files path (`Got it` dismisses it for good). `+` in the toolbar adds a
-  vault. **Settings** holds the account: signed in as, usage, `Devices`,
-  `Invites`, `Sign out`, `Delete account`, or `Sign in` when signed out
-  (the session notice when it expired), plus the version.
+- Structure: a `TabView` with `Vaults`, `Devices`, `Settings`. **Vaults**
+  is a scroll of cards on the grouped background, one per vault of the
+  account: name and `Manage` (the vault screen), a state dot with the shared
+  state text (section 5) and `Last synced`, the per-vault usage, the last
+  result line, the stale banner, `Resolve n conflicts` (pushes the Conflicts
+  screen), and a full-width `.borderedProminent` `Sync now` (amber with ink
+  text); a `Not on this device` card carries `Download` instead. One sync
+  runs at a time. After the first vault a one-time `Open in Obsidian` card
+  explains the Files path (`Got it` dismisses it for good). `+` in the
+  toolbar creates a vault. **Devices** lists the account's devices (rename
+  in place, `Sign out`). **Settings** holds the account: signed in as,
+  usage, `Change passphrase`, `Invites`, `Sign out`, `Delete account`, or
+  `Sign in` when signed out (the session notice when it expired), plus the
+  version and the Background App Refresh status.
 - The server is baked in (`OBSINK_SERVER_URL` at build time, read from
   `Info.plist` `ObSinkServerURL`; `OBSINK_UITEST_SERVER_URL` overrides it
-  for tests) and only printed under the account section. A vault entry on
-  another server shows `On another server` and offers only `Remove from
-  this device`.
-- Add vault is a sheet with steps: `Sign in` (only when signed out; Sign
-  in with Apple or an email code, the invite field only when needed),
-  `Choose vault` (`Create` / `Connect`, the account's vaults listed on
-  entry, `Next`), `Passphrase` (`Create vault` / `Connect vault`).
-- `Devices`, `Invites`, `Manage vault` and `Conflicts` are pushed screens;
-  typed confirmations are a sheet with a medium detent
-  (`TypedConfirmationSheet`); `Remove from this device` is a confirmation
-  dialog. Errors reach Swift typed (`MobileError`) and
+  for tests) and only printed under the account section.
+- Sign-in is a sheet with steps: `Sign in` (Sign in with Apple or an email
+  code, the invite field only when needed), then `Set passphrase` or
+  `Unlock`. `Create vault` is a sheet with a name field; `Download` runs in
+  place on the card. The vault screen has the sections of spec §15.2
+  (`Devices`, `Activity`, `History` as pushed lists).
+- `Invites`, `Manage vault`, `Conflicts`, `File history` and `Recently
+  deleted` are pushed screens; typed confirmations are a sheet with a
+  medium detent (`TypedConfirmationSheet`); `Remove from this device` is a
+  confirmation dialog. Errors reach Swift typed (`MobileError`) and
   `MobileErrorPresentation.swift` maps each variant to its copy.
 - The vault cache on iOS lives inside the app group, so `Remove from this
   device` and `Delete account` remove it (the copy says so); on desktop the
@@ -286,7 +299,10 @@ next to the account heading in mono.
 ### CLI
 
 Uses the shared vocabulary in messages and prompts: `obsink sync` is the
-one action; the interactive conflict prompt offers `keep local`, `keep
+one action; `obsink login` ends with the unlock (or set-passphrase) prompt;
+`obsink vaults` prints each vault with its state on this machine
+(`not on this device`, `up to date`, …); `obsink download` is the CLI's
+`Download`; the interactive conflict prompt offers `keep local`, `keep
 remote`, `keep both` in that order.
 
 ## 7. Accessibility
@@ -302,38 +318,50 @@ remote`, `keep both` in that order.
 - **XCUITest identifiers and matched labels are API.** The simulator
   harness (`ios/UITests/SyncE2ETests.swift`,
   `scripts/verify-ios-sim-e2e.sh`) finds elements by these identifiers:
-  `syncButton`, `passphraseField`, `statusText`, `addVaultButton`,
-  `addVaultAccountText`, `addVaultNextButton`, `listVaultsButton`,
-  `vaultPicker`, `addVaultStatusText`, `addVaultPassphraseField`,
-  `addVaultSubmitButton`, `staleBanner`, `conflictRowTitle`,
-  `winnerPicker`, `applyResolutionsButton`, `vaultUsageText`,
-  `manageVaultButton`, `removeVaultButton`, `deleteVaultButton`,
-  `devicesLink`, `deviceRow`, `deviceSignOutButton`, `invitesLink`,
-  `inviteRow`, `deleteAccountButton`, `signInButton`, `sessionExpiredText`,
-  `confirmationField`, `confirmDestructiveButton`, `confirmCancelButton`,
-  `addVaultDoneButton`, `vaultCard`, `vaultStateText`, `lastSyncedText`,
-  `resolveConflictsLink`, `guidanceCard`, `guidanceDismissButton`,
-  `accountNoticeText`, `appVersionText`, `backgroundRefreshText`; and by these labels: the `Connect` segment, the
-  `Keep local` / `Keep remote` / `Keep both` segments, the
+  `syncButton`, `statusText`, `signInButton`, `unlockField`,
+  `unlockConfirmField`, `unlockButton`, `setPassphraseButton`,
+  `createVaultButton`, `createVaultNameField`, `createVaultSubmitButton`,
+  `downloadVaultButton` (+ `data-vault-id`), `addVaultStatusText`,
+  `addVaultDoneButton`, `staleBanner`, `conflictRowTitle`, `winnerPicker`,
+  `applyResolutionsButton`, `vaultUsageText`, `manageVaultButton`,
+  `renameVaultField`, `renameVaultButton`, `removeVaultButton`,
+  `deleteVaultButton`, `vaultDeviceRow`, `deviceRow`, `deviceRenameField`,
+  `deviceRenameButton`, `deviceSignOutButton`, `historyLink`,
+  `historyFilePicker`, `historyRow`, `trashRow`, `previewButton`,
+  `restoreButton`, `invitesLink`, `inviteRow`, `changePassphraseButton`,
+  `deleteAccountButton`, `sessionExpiredText`, `confirmationField`,
+  `confirmDestructiveButton`, `confirmCancelButton`, `vaultCard`,
+  `vaultStateText`, `lastSyncedText`, `resolveConflictsLink`,
+  `guidanceCard`, `guidanceDismissButton`, `accountNoticeText`,
+  `appVersionText`, `backgroundRefreshText`, `updateRequiredText`; and by
+  these labels: the `Keep local` / `Keep remote` / `Keep both` segments, the
   `Remove from this device` confirmation button, the tab bar buttons
-  `Home` / `Settings`, `Next`, `Got it`, the status prefixes `Synced ·`,
-  `Added vault`, `1 conflict`, the empty state `No vault yet. Tap Add
-  vault.`, and the banner text `changed on another device`. The web and
-  desktop harnesses (`scripts/verify-web-e2e.mjs`,
+  `Vaults` / `Devices` / `Settings`, `Next`, `Got it`, the status prefixes
+  `Synced ·`, `Created vault`, `Downloaded`, `1 conflict`, the empty state
+  `No vault yet. Tap Create vault.`, and the banner text `changed on another
+  device`. The web and desktop harnesses (`scripts/verify-web-e2e.mjs`,
   `scripts/verify-desktop-smoke.mjs`) use the same names as `data-testid` on
   the shared React components: `emailField`, `inviteField`, `codeField`,
-  `sendCodeButton`, `signInButton`, `settingsTab` (+ `data-tab`), `vaultCard`
-  (+ `data-vault-id`), `addVaultButton`, `addVaultModeButton` (+ `data-mode`),
-  `addVaultNameField`, `vaultPicker`, `addVaultNextButton`, `addVaultPathField`,
-  `addVaultPassphraseField`, `addVaultSubmitButton`, `addVaultDoneButton`,
-  `syncButton`, `vaultStateText`, `lastSyncedText`, `statusText` (every notice,
-  + `data-kind`), `staleBanner`, `conflictRowTitle` (+ `data-path`),
-  `winnerPicker` (+ `data-choice`: `KeepLocal` / `KeepRemote` / `KeepBoth`),
-  `applyResolutionsButton`, `removeVaultButton`, `deleteVaultButton`,
-  `confirmationField`, `confirmDestructiveButton`, `confirmCancelButton`,
-  `deleteAccountButton`, `deviceRow`, `deviceSignOutButton`, `inviteRow`,
-  `activityRow` (+ `data-kind`), and in the desktop popover
+  `sendCodeButton`, `signInButton`, `unlockField`, `unlockConfirmField`,
+  `unlockButton`, `setPassphraseButton`, `settingsTab` (+ `data-tab`),
+  `vaultCard` (+ `data-vault-id`), `createVaultButton`,
+  `createVaultNameField`, `addVaultPathField`, `addVaultNextButton`,
+  `createVaultSubmitButton`, `downloadVaultButton` (+ `data-vault-id`),
+  `addVaultDoneButton`, `syncButton`, `vaultStateText`, `lastSyncedText`,
+  `statusText` (every notice, + `data-kind`), `staleBanner`,
+  `conflictRowTitle` (+ `data-path`), `winnerPicker` (+ `data-choice`:
+  `KeepLocal` / `KeepRemote` / `KeepBoth`), `applyResolutionsButton`,
+  `renameVaultField`, `renameVaultButton`, `moveFolderButton`,
+  `removeVaultButton`, `deleteVaultButton`, `confirmationField`,
+  `confirmDestructiveButton`, `confirmCancelButton`, `changePassphraseButton`,
+  `deleteAccountButton`, `vaultDeviceRow` (+ `data-device-id`), `deviceRow`
+  (+ `data-device-id`), `deviceRenameField`, `deviceRenameButton`,
+  `deviceSignOutButton`, `inviteRow`, `activityRow` (+ `data-kind`),
+  `historyFilePicker`, `historyRow` (+ `data-ts`), `trashRow` (+ `data-path`),
+  `previewButton`, `restoreButton`, `updateRequiredText`, and in the desktop
+  popover
   `popoverOpenSettingsButton`, `popoverGlobalText`, `popoverVaultRow`
-  (+ `data-vault-id`), `popoverSyncButton`, `popoverSettingsButton`,
-  `recentRow` (+ `data-kind`). Renaming any of them means updating the
-  tests and the harness in the same change.
+  (+ `data-vault-id`), `popoverDownloadButton` (+ `data-vault-id`),
+  `popoverSyncButton`, `popoverSettingsButton`, `recentRow` (+ `data-kind`).
+  Renaming any of them means updating the tests and the harness in the same
+  change.

@@ -9,7 +9,9 @@ ObSink is a free, self-hosted, end-to-end encrypted sync engine for
 Tauri desktop app (macOS), and an iOS client; the backend is a Rust server
 (`server/`, axum + Postgres + an encrypted blob volume) that operators run with
 `docker compose up` behind their own TLS proxy. Accounts are invite-only
-(email one-time code everywhere, Sign in with Apple on iOS). **`spec.md` is the
+(email one-time code everywhere, Sign in with Apple on iOS); one account
+passphrase unlocks every vault, and every vault an account owns is listed on
+every device (spec §6, §15). **`spec.md` is the
 spec source of truth** — read it before your first task. Architecture/wire-format
 details live in `docs/architecture.md`; per-platform status in `docs/platforms.md`;
 deployment in `docs/self-hosting.md`.
@@ -25,7 +27,7 @@ deployment in `docs/self-hosting.md`.
   multipart), `tokio`, `tower-http` (tracing), `sqlx` 0.8 (Postgres, runtime
   queries, embedded migrations), `lettre` 0.11 (SMTP one-time codes),
   `jsonwebtoken` 9 (Apple identity tokens), `reqwest` (JWKS fetch,
-  healthcheck), `subtle` (constant-time operator key compare), `rand`/`uuid`
+  healthcheck), `subtle` (constant-time verifier compare), `rand`/`uuid`
   (tokens, ids), `walkdir` (retention), `clap` (subcommands); envelope crypto
   uses the same `aes-gcm`/`hkdf`/`hmac`/`sha2` versions as core. Dev:
   `tempfile`, `rsa` (forges Apple tokens in tests). Env vars are listed in
@@ -81,14 +83,17 @@ obsink/
 
 ## Hard rules (non-negotiables)
 
-1. **The server never sees plaintext.** Wire format v2: the Argon2id master key
-   is *only* HKDF input. Four purpose-separated sub-keys are derived — content
+1. **The server never sees plaintext.** Wire format v3: the passphrase only
+   ever derives a KEK (Argon2id) that unwraps the random account key; the
+   account key wraps the random per-vault keys; a vault key is *only* HKDF
+   input. Four purpose-separated sub-keys are derived from it — content
    encryption, content MAC, path token, path encryption. Manifest entries are
    keyed by `HMAC(path_token_key, path)`; the manifest `hash` is
    `HMAC(content_mac_key, plaintext)`; an `encPath` (AES-GCM of the real path)
-   lets a fresh device recover filenames. **Never** put plaintext content hashes
-   or plaintext paths on the wire (that was v1's information leak — do not
-   reintroduce it).
+   lets a fresh device recover filenames. The server stores keys only wrapped
+   (spec §6.1) and never a KEK, an account key or a vault key. **Never** put
+   plaintext content hashes or plaintext paths on the wire (that was v1's
+   information leak — do not reintroduce it).
 2. **Sync is driven, not ambient.** The engine (`prepare_sync` /
    `complete_sync`) stays a pure, caller-triggered cycle with no timers and no
    watcher inside it: one call runs the full pull→diff→download→resolve→upload
@@ -102,11 +107,13 @@ obsink/
    `X-Parent-Hash`; on mismatch the server returns `409` and the client surfaces
    the conflict to the UI (keep local / keep remote / keep both). The check runs
    in one Postgres transaction that locks the vault row. See spec §5.
-4. **One key per vault.** AES-256-GCM with a random 96-bit nonce per file; blob
-   = `[12-byte nonce][ciphertext][16-byte tag]`. Argon2id parameters are
-   64 MiB / 3 / 1 (exceeds OWASP 2024) — do not weaken.
-5. **No key recovery.** Lost passphrase = lost data. This is deliberate for v1;
-   do not add recovery without an explicit decision.
+4. **One key per vault.** A random 32-byte vault key, wrapped per member under
+   the account key, never derived from a passphrase. AES-256-GCM with a random
+   96-bit nonce per file; blob = `[12-byte nonce][ciphertext][16-byte tag]`.
+   Argon2id parameters are 64 MiB / 3 / 1 (exceeds OWASP 2024) — do not weaken.
+5. **No key recovery.** Lost passphrase = lost data. A passphrase change is a
+   rewrap of the account key on an unlocked device, never a reset. This is
+   deliberate; do not add recovery without an explicit decision.
 6. **50 MB upload limit.** The server rejects larger files (`413`); a
    per-account byte budget answers `507`, which the sync engine treats as fatal.
 7. **Tests and lints stay green.** `cargo test --workspace` (server integration
@@ -163,17 +170,18 @@ scripts/build-ios.sh
 # Run the CLI against a server (logs to stderr)
 RUST_LOG=obsink_core=debug cargo run -p obsink -- sync
 
-# Contract + two-device checks against a running server (uses .env.deploy)
+# Contract + two-device checks against a running server (uses .env.deploy: a
+# harness account's session token, passphrase and device ids; no operator key)
 scripts/verify-server-deploy.sh && scripts/verify-cli-deployed-sync.sh
 ```
 
 ## Local credentials (gitignored)
 
-The server URL and operator bearer used by the CLI and the `scripts/verify-*`
+The server URL and the harness account used by the CLI and the `scripts/verify-*`
 harnesses live in a **gitignored** `.env.deploy` at the repo root (copy
 `.env.deploy.example`; `.gitignore` covers `.env` and `.env.*`). Docker compose
 does not read it, so the local stack always runs with its own defaults
-(`dev-operator-key`, Mailpit). Source it:
+(`AUTH_DEV_RETURN_CODE=1`, Mailpit). Source it:
 
 ```bash
 set -a; . ./.env.deploy; set +a
@@ -182,13 +190,22 @@ RUST_LOG=obsink_core=debug cargo run -p obsink -- sync
 
 - `OBSINK_SERVER_URL` — the server to test against (`http://localhost:8080`
   for the local compose stack; the Coolify domain for production).
-- `OBSINK_API_KEY` — the operator bearer; the same value is the server's
-  `OBSINK_API_KEY` env var. Never hand it to a tester — they sign up with an
-  invite (`obsink invite`).
+- `OBSINK_BEARER` — a session token of the harness account, minted once with
+  `obsink login` (180-day expiry). There is no operator bearer: every principal
+  is an account. Testers sign up with an invite (`obsink invite`, or
+  `obsink-server invite` on the server).
+- `OBSINK_PASSPHRASE`, `OBSINK_DEVICE_ID` — the harness account's passphrase and
+  a fixed device id, so `login`, `init` and `download` run non-interactively;
+  the two-device scripts set a different device id per side.
+- Until OBS-143 lands, the scripts still read the pre-v3 `OBSINK_API_KEY`
+  operator bearer; `.env.deploy.example` says which variables the checkout
+  expects.
 - `DEVELOPMENT_TEAM`, `ASC_KEY_ID`, `ASC_ISSUER_ID`, `ASC_KEY_PATH` — Apple
   signing and App Store Connect for `scripts/build-ios.sh` / `release-ios.sh`.
-- Clients store bearers in the OS keychain (service `obsink`, account
-  `bearer:<server url>`), never in `config.toml` / `app.json` / UserDefaults.
+- Clients store the bearer (`bearer:<server url>`), the device id
+  (`device:<server url>`), the account key (`account:<user id>`) and vault keys
+  (account = vault id) in the OS keychain (service `obsink`), never in
+  `config.toml` / `app.json` / UserDefaults.
 - Production secrets (`OBSINK_SERVER_KEY`, `POSTGRES_PASSWORD`, `SMTP_*`) live
   only in Coolify's environment. Back up `OBSINK_SERVER_KEY`: without it the
   server's metadata is unreadable.
@@ -264,9 +281,10 @@ Status, tasks, decisions, and session logs live in the Plane project **OBS**
 ("ObSink"), reachable via the plane MCP tools. Conventions:
 
 - `spec.md` phases are Plane *modules*; module status tracks phase
-  progression (P1/P2/P3/P7 completed; P4/P6/P8 in-progress; P5 cancelled). P8 =
-  the self-hosted server pivot (OBS-82..89); P7 (Cloudflare accounts) is
-  superseded by it.
+  progression (P1/P2/P3/P7/P10 completed; P4/P6/P8/P9 in-progress; P5
+  cancelled; P11 planned). P8 = the self-hosted server pivot (OBS-82..89); P7
+  (Cloudflare accounts) is superseded by it. P11 = the account key, devices and
+  the vault list (wire format v3, OBS-131..144; decision 2026-09-22 on OBS-74).
 - Work items are session-sized; move to **In Progress** when starting, comment
   outcomes (e.g. test output or a deploy URL), then mark **Done**. Reference the
   item in commits: `feat(ios): file-provider enumerateChanges (OBS-12)`.
