@@ -22,6 +22,14 @@ use serde::{Deserialize, Serialize};
 
 const CONFIG_FILE: &str = ".obsink/config.toml";
 
+/// The server used when no flag, environment variable or saved config names
+/// one: the public server, or whatever `OBSINK_SERVER_URL` was at build time
+/// (self-hosters bake their own, as the desktop app does).
+const FALLBACK_SERVER_URL: &str = match option_env!("OBSINK_SERVER_URL") {
+    Some(url) => url,
+    None => "https://obsink-api.spencerjireh.com",
+};
+
 #[derive(Debug, Parser)]
 #[command(name = "obsink")]
 #[command(version)]
@@ -32,8 +40,9 @@ struct Cli {
 }
 
 /// Which server to talk to and how to authenticate. `--server-url` falls back
-/// to the URL in the saved config; `--api-key` is the operator bearer (admin
-/// and harness use) and is remembered in the keychain, so it is needed once.
+/// to the URL in the saved config, then to the built-in default; `--api-key`
+/// is the operator bearer (admin and harness use) and is remembered in the
+/// keychain, so it is needed once.
 #[derive(Debug, clap::Args)]
 struct ServerArgs {
     #[arg(long, env = "OBSINK_SERVER_URL")]
@@ -48,16 +57,21 @@ impl ServerArgs {
     }
 }
 
-/// Explicit flag/env first, then the saved config, otherwise an error: there
-/// is no built-in default server.
+/// Explicit flag/env first, then the saved config, then the built-in default
+/// (`FALLBACK_SERVER_URL`), so `obsink login` works right after install.sh.
 fn resolve_server_url(explicit: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
+    let saved = load_config().ok().map(|config| config.server_url);
+    Ok(pick_server_url(explicit, saved))
+}
+
+fn pick_server_url(explicit: Option<&str>, saved: Option<String>) -> String {
     if let Some(url) = explicit.map(str::trim).filter(|url| !url.is_empty()) {
-        return Ok(normalize_server_url(url));
+        return normalize_server_url(url);
     }
-    if let Ok(config) = load_config() {
-        return Ok(config.server_url);
+    if let Some(url) = saved {
+        return url;
     }
-    Err("no server: pass --server-url or set OBSINK_SERVER_URL".into())
+    normalize_server_url(FALLBACK_SERVER_URL)
 }
 
 #[derive(Debug, Subcommand)]
@@ -329,8 +343,10 @@ async fn run_login(
         Err(error) => return Err(error.into()),
     };
     save_secret(&bearer_account(&url), &session.token)?;
+    // The URL is the normalized one (an alias of an old host reads as the
+    // current host here), so the user sees which server holds the session.
     println!(
-        "signed in as {} on {url}",
+        "Signed in as {} on {url}.",
         session.user.email.unwrap_or(session.user.id)
     );
     Ok(())
@@ -805,7 +821,27 @@ fn load_key_from_keychain(vault_id: &str) -> Result<KeyBytes, Box<dyn std::error
 mod tests {
     use std::path::Path;
 
-    use super::resolve_vault_dir;
+    use super::{pick_server_url, resolve_vault_dir, FALLBACK_SERVER_URL};
+
+    #[test]
+    fn the_server_url_is_the_flag_then_the_config_then_the_default() {
+        assert_eq!(
+            pick_server_url(
+                Some(" HTTPS://Own.example/ "),
+                Some("https://saved.example".into())
+            ),
+            "https://own.example"
+        );
+        assert_eq!(
+            pick_server_url(Some("  "), Some("https://saved.example".into())),
+            "https://saved.example"
+        );
+        assert_eq!(
+            pick_server_url(None, None),
+            FALLBACK_SERVER_URL.trim_end_matches('/')
+        );
+        assert!(FALLBACK_SERVER_URL.starts_with("http"));
+    }
 
     #[test]
     fn resolve_vault_dir_returns_an_absolute_path() {
