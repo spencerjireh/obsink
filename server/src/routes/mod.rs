@@ -96,7 +96,14 @@ pub fn router(state: AppState) -> Router {
             post(me::create_invite).get(me::list_invites),
         )
         .route("/vaults", get(vaults::list).post(vaults::create))
-        .route("/vaults/{vault_id}", delete(vaults::delete_vault))
+        .route(
+            "/vaults/{vault_id}",
+            patch(vaults::rename).delete(vaults::delete_vault),
+        )
+        .route(
+            "/vaults/{vault_id}/devices/self",
+            put(vaults::attach_self).delete(vaults::detach_self),
+        )
         .route("/vaults/{vault_id}/manifest", get(files::get_manifest))
         .merge(file_routes)
         .merge(batch_routes)

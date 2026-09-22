@@ -335,6 +335,8 @@ pub fn create_vault(
     let request = CreateVaultRequest {
         name,
         max_file_size: 50 * 1024 * 1024,
+        // v2: the wrapped vault key arrives with OBS-142.
+        wrapped_key: None,
     };
     let response =
         block_on(ApiClient::new(server_only(server_url, api_key)).create_vault(&request))

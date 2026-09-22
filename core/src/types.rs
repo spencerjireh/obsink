@@ -101,6 +101,8 @@ impl std::fmt::Debug for VaultConfig {
     }
 }
 
+/// One vault of the account as `GET /vaults` lists it (spec §4.3). The v3
+/// fields default so a v2 response still parses.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VaultSummary {
     pub id: String,
@@ -108,6 +110,40 @@ pub struct VaultSummary {
     pub created: u64,
     #[serde(default = "default_max_file_size")]
     pub max_file_size: u64,
+    /// The manifest revision (the ETag), for "n revisions behind".
+    #[serde(default)]
+    pub revision: u64,
+    /// When the manifest last changed.
+    #[serde(default)]
+    pub last_write: u64,
+    /// Live bytes on the server.
+    #[serde(default)]
+    pub bytes: u64,
+    /// The vault key wrapped for this account (base64), or `None` for a vault
+    /// created before the account had a passphrase (transitional).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wrapped_key: Option<String>,
+    /// The devices that hold this vault.
+    #[serde(default)]
+    pub devices: Vec<VaultDevice>,
+}
+
+/// A device that holds a vault, as `GET /vaults` reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VaultDevice {
+    pub id: String,
+    pub name: String,
+    pub platform: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_synced: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_revision: Option<u64>,
+}
+
+/// `GET /vaults`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListVaultsResponse {
+    pub vaults: Vec<VaultSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,6 +151,10 @@ pub struct CreateVaultRequest {
     pub name: String,
     #[serde(default = "default_max_file_size")]
     pub max_file_size: u64,
+    /// The new vault's key wrapped under the account key (base64). Optional
+    /// only while v2 clients exist (OBS-143 makes it required).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wrapped_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
