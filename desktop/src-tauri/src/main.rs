@@ -417,10 +417,13 @@ impl From<obsink_core::Invite> for InviteInfo {
 
 #[derive(Debug, Clone, Serialize)]
 struct DeviceInfo {
-    session_id: String,
-    device_name: String,
+    id: String,
+    name: String,
+    platform: String,
     created: u64,
+    last_seen: u64,
     current: bool,
+    vault_ids: Vec<String>,
 }
 
 #[tauri::command]
@@ -497,10 +500,13 @@ async fn get_account() -> Result<AccountState, CommandError> {
                     .devices
                     .into_iter()
                     .map(|device| DeviceInfo {
-                        session_id: device.id,
-                        device_name: device.name,
+                        id: device.id,
+                        name: device.name,
+                        platform: device.platform,
                         created: device.created,
+                        last_seen: device.last_seen,
                         current: device.current,
+                        vault_ids: device.vault_ids,
                     })
                     .collect(),
                 usage: me.usage.map(|usage| UsageInfo {
@@ -2196,7 +2202,7 @@ mod live_tests {
                         .iter()
                         .find(|device| device.current == current)
                         .unwrap()
-                        .session_id
+                        .id
                         .clone()
                 };
                 (pick(true), pick(false))

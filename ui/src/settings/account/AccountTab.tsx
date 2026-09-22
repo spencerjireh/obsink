@@ -5,12 +5,13 @@ import { ConfirmForm } from '../../components/ConfirmForm'
 import { DeviceList } from '../../components/DeviceList'
 import { InviteList } from '../../components/InviteList'
 import { SignInForm } from './SignInForm'
+import { UnlockForm } from './UnlockForm'
 
 export function AccountTab({ account, busy }: { account: Account; busy: boolean }) {
   const [confirmingDelete, setConfirmingDelete] = useState(false)
   const current = account.account
 
-  if (current?.kind !== 'account') {
+  if (!current || current.kind === 'signed_out') {
     return (
       <section className="section" aria-labelledby="account-heading">
         <div className="section__heading">
@@ -20,6 +21,10 @@ export function AccountTab({ account, busy }: { account: Account; busy: boolean 
         <SignInForm account={account} busy={busy} />
       </section>
     )
+  }
+
+  if (current.kind === 'locked') {
+    return <UnlockForm account={account} busy={busy} />
   }
 
   return (
@@ -69,7 +74,7 @@ export function AccountTab({ account, busy }: { account: Account; busy: boolean 
         devices={current.devices}
         busy={busy}
         onSignOut={() => void account.signOut()}
-        onRevoke={(sessionId) => void account.revokeDevice(sessionId)}
+        onRevoke={(deviceId) => void account.revokeDevice(deviceId)}
       />
       <InviteList invites={account.invites} busy={busy} onCopy={account.copyInvite} />
     </section>

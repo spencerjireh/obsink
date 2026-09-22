@@ -3,7 +3,8 @@ import { useBackend } from '../backend'
 import { ConfirmForm } from './ConfirmForm'
 
 type Props = {
-  vault: { id: string; name: string; server_url: string }
+  vault: { id: string; name: string }
+  serverUrl: string
   busy: boolean
   // A vault this device cannot talk to (another server, no key) can only be
   // removed here.
@@ -14,14 +15,21 @@ type Props = {
 
 // Mounted with `key={vault.id}` so an open confirmation never outlives the
 // vault it was asked about.
-export function VaultActions({ vault, busy, removeOnly = false, onRemove, onDeleteRemote }: Props) {
-  const { kind, keyStoreNoun } = useBackend().platform
+export function VaultActions({
+  vault,
+  serverUrl,
+  busy,
+  removeOnly = false,
+  onRemove,
+  onDeleteRemote,
+}: Props) {
+  const { kind } = useBackend().platform
   const [confirming, setConfirming] = useState<'remove' | 'delete' | null>(null)
-  // The browser never keeps a key; the desktop app has one in the keychain.
+  // DESIGN.md §5 confirmation copy.
   const removeConsequence =
     kind === 'web'
-      ? 'The vault stays on the server. This browser forgets the folder, so connecting again needs the passphrase.'
-      : `The vault stays on the server. The key is removed from ${keyStoreNoun}, so connecting again needs the passphrase.`
+      ? 'The vault stays on the server and can be downloaded again. This browser forgets the folder.'
+      : 'The vault stays on the server and can be downloaded again. The folder on this device stays.'
   const deleteConsequence =
     kind === 'web' ? 'The folder on this computer stays.' : 'The folder on this device stays.'
 
@@ -65,7 +73,7 @@ export function VaultActions({ vault, busy, removeOnly = false, onRemove, onDele
       {confirming === 'delete' ? (
         <ConfirmForm
           title="Delete vault on server"
-          description={`This deletes ${vault.name} and all of its files on ${vault.server_url}. ${deleteConsequence}`}
+          description={`This deletes ${vault.name} and all of its files on ${serverUrl} for every device. ${deleteConsequence}`}
           expected={vault.name}
           confirmLabel="Delete vault on server"
           busy={busy}

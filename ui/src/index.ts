@@ -3,10 +3,11 @@
 // `BackendProvider`.
 export { BackendProvider, useBackend } from './backend'
 export type {
-  AddVaultRequest,
   Backend,
   BackendEvent,
   BackendEvents,
+  CreateVaultRequest,
+  DownloadVaultRequest,
   Platform,
   Resolution,
 } from './backend'

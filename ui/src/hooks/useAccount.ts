@@ -26,6 +26,9 @@ export function useAccount(notify: Notify) {
   // capabilities said none was needed (they can go stale).
   const [inviteForced, setInviteForced] = useState(false)
   const [inviteFocusAt, setInviteFocusAt] = useState(0)
+  // Spec §12.1: another device set the passphrase first; the form says so
+  // and turns into Unlock.
+  const [raceNotice, setRaceNotice] = useState('')
   const notifyRef = useRef(notify)
   notifyRef.current = notify
 
@@ -126,7 +129,7 @@ export function useAccount(notify: Notify) {
         setInviteForced(false)
         void refreshInvites()
         notifyRef.current(
-          next.kind === 'account' ? `Signed in as ${next.email ?? next.user_id}.` : 'Signed in.',
+          next.kind === 'signed_out' ? 'Signed in.' : `Signed in as ${next.email ?? next.user_id}.`,
         )
       } catch (error) {
         const failure = toCommandError(error)
@@ -160,15 +163,60 @@ export function useAccount(notify: Notify) {
     }
   }
 
-  const revokeDevice = (sessionId: string) =>
+  const revokeDevice = (deviceId: string) =>
     withBusy(async () => {
       try {
-        setAccount(await backend.revokeSession(sessionId))
+        setAccount(await backend.revokeDevice(deviceId))
         notifyRef.current('Device signed out.')
       } catch (error) {
         fail(error)
       }
     })
+
+  // Returns whether the account is now unlocked.
+  const setPassphrase = async (passphrase: string): Promise<boolean> => {
+    setBusy(true)
+    try {
+      const result = await backend.setPassphrase(passphrase)
+      setAccount(result.account)
+      setRaceNotice('')
+      notifyRef.current(
+        result.outcome === 'created'
+          ? 'Passphrase set. There is no recovery if it is lost.'
+          : 'A passphrase was already set on another device; it matched.',
+      )
+      void refreshInvites()
+      return true
+    } catch (error) {
+      const failure = toCommandError(error)
+      if (failure.kind === 'server' && failure.status === 409) {
+        // The winner's key is now the account's; the form becomes Unlock.
+        setRaceNotice('A passphrase was already set on another device. Enter it.')
+        await refresh()
+      } else {
+        fail(failure)
+      }
+      return false
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const unlock = async (passphrase: string): Promise<boolean> => {
+    setBusy(true)
+    try {
+      setAccount(await backend.unlock(passphrase))
+      setRaceNotice('')
+      notifyRef.current('Unlocked.')
+      void refreshInvites()
+      return true
+    } catch (error) {
+      fail(error)
+      return false
+    } finally {
+      setBusy(false)
+    }
+  }
 
   const signOut = () =>
     withBusy(async () => {
@@ -216,7 +264,12 @@ export function useAccount(notify: Notify) {
     busy,
     fail,
     refresh,
+    // Signed in and unlocked; `locked` is signed in without the key.
     signedIn: account?.kind === 'account',
+    locked: account?.kind === 'locked',
+    raceNotice,
+    setPassphrase,
+    unlock,
     inviteRequired: (capabilities?.invite_required ?? false) || inviteForced,
     inviteFocusAt,
     form: { authEmail, authCode, inviteCode, codeSent },

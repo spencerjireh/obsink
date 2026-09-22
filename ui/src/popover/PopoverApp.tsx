@@ -3,7 +3,7 @@ import { useBackend } from '../backend'
 import { useActivity } from '../hooks/useActivity'
 import { useVaultStates } from '../hooks/useVaultStates'
 import { toCommandError } from '../lib/errors'
-import { canSync, globalLine } from '../lib/vault-state'
+import { canSync, globalLine, onThisDevice } from '../lib/vault-state'
 import { BrandMark } from '../components/BrandMark'
 import { RecentList } from './RecentList'
 import { VaultRow } from './VaultRow'
@@ -91,23 +91,30 @@ export function PopoverApp() {
         </button>
       </header>
       <p className="popover__global" data-testid="popoverGlobalText">
-        {busy ? 'Syncing…' : globalLine(states)}
+        {busy ? 'Syncing…' : globalLine(states, backend.platform.deviceNoun)}
       </p>
 
       <ul className="popover__vaults" aria-label="Vaults">
-        {states.map((info) => (
-          <VaultRow
-            key={info.id}
-            info={info}
-            syncing={syncingId === info.id}
-            onOpen={() => openSettings({ tab: 'vaults', vault_id: info.id })}
-            onOpenFolder={
-              backend.platform.canOpenFolder
-                ? () => void backend.openVaultFolder(info.id).catch(fail)
-                : undefined
-            }
-          />
-        ))}
+        {[...states.filter(onThisDevice), ...states.filter((info) => !onThisDevice(info))].map(
+          (info) => (
+            <VaultRow
+              key={info.id}
+              info={info}
+              syncing={syncingId === info.id}
+              onOpen={() => openSettings({ tab: 'vaults', vault_id: info.id })}
+              onOpenFolder={
+                backend.platform.canOpenFolder && onThisDevice(info)
+                  ? () => void backend.openVaultFolder(info.id).catch(fail)
+                  : undefined
+              }
+              onDownload={
+                info.state.kind === 'not_on_device'
+                  ? () => openSettings({ tab: 'vaults', vault_id: info.id, download: true })
+                  : undefined
+              }
+            />
+          ),
+        )}
         {states.length === 0 ? (
           <li className="vault-row">
             <button
@@ -115,7 +122,7 @@ export function PopoverApp() {
               onClick={() => openSettings({ tab: 'vaults', add_vault: true })}
               type="button"
             >
-              <span className="vault-row__name">Add vault</span>
+              <span className="vault-row__name">Create vault</span>
             </button>
           </li>
         ) : null}

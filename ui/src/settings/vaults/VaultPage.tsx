@@ -1,15 +1,15 @@
-import { useState } from 'react'
 import type { VaultStateInfo } from '../../types'
 import type { Account } from '../../hooks/useAccount'
 import { useBackend } from '../../backend'
 import { useSyncRunner } from '../../hooks/useSyncRunner'
 import { SESSION_EXPIRED } from '../../lib/errors'
 import { formatRelative, phaseLabel, plural, vaultUsageLine } from '../../lib/format'
-import { canSync, remoteChanges, stateText, stateTone } from '../../lib/vault-state'
+import { canSync, onThisDevice, remoteChanges, stateText, stateTone } from '../../lib/vault-state'
 import { Conflicts } from '../../components/Conflicts'
 import { FailureNotice, Notice } from '../../components/Notices'
 import { StateDot } from '../../components/StateDot'
 import { VaultActions } from '../../components/VaultActions'
+import { VaultDevices } from '../../components/VaultDevices'
 
 type Props = {
   info: VaultStateInfo
@@ -18,6 +18,8 @@ type Props = {
   notify: (message: string) => void
   onError: (error: unknown) => void
   onSignIn: () => void
+  // Put this vault on this device (spec §15.1).
+  onDownload: () => void
   // The vault is gone from this device (removed or deleted).
   onGone: () => void
 }
@@ -25,12 +27,20 @@ type Props = {
 // One vault: its state, the sync button, conflicts, and the manage section.
 // Mounted with `key={info.id}` so the runner and any open confirmation
 // belong to this vault only.
-export function VaultPage({ info, account, message, notify, onError, onSignIn, onGone }: Props) {
+export function VaultPage({
+  info,
+  account,
+  message,
+  notify,
+  onError,
+  onSignIn,
+  onDownload,
+  onGone,
+}: Props) {
   const backend = useBackend()
   const runner = useSyncRunner(info.id, onError, notify)
-  const [passphrase, setPassphrase] = useState('')
-  const [unlocking, setUnlocking] = useState(false)
   const busy = runner.busy || account.busy
+  const here = onThisDevice(info)
   const syncable = canSync(info)
   const usage = account.vaultUsage(info.id)
   const stale = runner.conflicts.length > 0 ? 0 : remoteChanges(info)
@@ -67,19 +77,39 @@ export function VaultPage({ info, account, message, notify, onError, onSignIn, o
     backend.openVaultFolder(info.id).catch(onError)
   }
 
-  // The passphrase again where the key is not kept between launches.
-  async function unlock() {
-    if (!backend.unlockVault || passphrase.length === 0) return
-    setUnlocking(true)
-    try {
-      await backend.unlockVault(info.id, passphrase)
-      setPassphrase('')
-      notify(`Unlocked ${info.name}.`)
-    } catch (error) {
-      onError(error)
-    } finally {
-      setUnlocking(false)
-    }
+  // A vault the account owns that is not on this device: one action.
+  if (info.state.kind === 'not_on_device') {
+    return (
+      <div className="vault-page">
+        <header className="pane-header">
+          <div className="pane-header__title">
+            <h1>{info.name}</h1>
+            <p className="state-line">
+              <StateDot tone={stateTone(info)} />
+              <span data-testid="vaultStateText">{stateText(info)}</span>
+              {usage ? (
+                <>
+                  <span aria-hidden="true"> · </span>
+                  <span className="mono">{vaultUsageLine(usage)}</span>
+                </>
+              ) : null}
+            </p>
+          </div>
+          <button
+            className="button button--primary"
+            data-testid="downloadVaultButton"
+            data-vault-id={info.id}
+            disabled={busy || sessionExpired}
+            onClick={onDownload}
+            type="button"
+          >
+            Download
+          </button>
+        </header>
+        {plainMessage ? <Notice>{plainMessage}</Notice> : null}
+        <VaultDevices devices={info.devices} revision={info.revision} />
+      </div>
+    )
   }
 
   return (
@@ -104,8 +134,8 @@ export function VaultPage({ info, account, message, notify, onError, onSignIn, o
             ) : null}
           </p>
           <p className="pane-header__meta">
-            <code>{info.local_path}</code>{' '}
-            {backend.platform.canOpenFolder ? (
+            <code>{info.local_path ?? ''}</code>{' '}
+            {backend.platform.canOpenFolder && here ? (
               <button
                 className="button button--ghost button--small"
                 onClick={openFolder}
@@ -131,45 +161,14 @@ export function VaultPage({ info, account, message, notify, onError, onSignIn, o
         <div className="section__heading">
           <h2 id="status-heading">Status</h2>
         </div>
-        {info.state.kind === 'foreign' ? (
+        {info.state.kind === 'deleted_on_server' ? (
           <Notice kind="warning">
-            This vault is configured for <code>{info.server_url}</code>, not this build&apos;s
-            server. Remove it from this device, then connect it again.
+            This vault was deleted on the server. The folder on this device stays; remove the vault
+            here when you are done with it.
           </Notice>
         ) : null}
-        {info.state.kind === 'no_key' && backend.unlockVault ? (
-          <form
-            className="form-grid"
-            onSubmit={(event) => {
-              event.preventDefault()
-              void unlock()
-            }}
-          >
-            <label>
-              <span>Passphrase</span>
-              <input
-                type="password"
-                autoComplete="off"
-                autoFocus
-                value={passphrase}
-                onChange={(event) => setPassphrase(event.target.value)}
-              />
-            </label>
-            <div className="choice-row form-grid__actions">
-              <button
-                className="button button--primary"
-                disabled={busy || unlocking || passphrase.length === 0}
-                type="submit"
-              >
-                {unlocking ? 'Working…' : 'Unlock'}
-              </button>
-            </div>
-          </form>
-        ) : info.state.kind === 'no_key' ? (
-          <Notice kind="warning">
-            No key for this vault on this device. Remove it, then connect it again with the
-            passphrase.
-          </Notice>
+        {info.state.kind === 'locked' ? (
+          <Notice kind="warning">Unlock the account to sync this vault.</Notice>
         ) : null}
         {info.state.kind === 'needs_access' ? (
           <Notice
@@ -243,8 +242,11 @@ export function VaultPage({ info, account, message, notify, onError, onSignIn, o
         onResolve={() => void runner.resolve()}
       />
 
+      <VaultDevices devices={info.devices} revision={info.revision} />
+
       <VaultActions
         vault={info}
+        serverUrl={account.serverUrl}
         busy={busy}
         removeOnly={!syncable}
         onRemove={() =>

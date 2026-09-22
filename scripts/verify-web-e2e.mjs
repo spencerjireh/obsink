@@ -5,11 +5,11 @@
 //   docker compose up -d                       (AUTH_DEV_RETURN_CODE=1 returns the sign-in code)
 //   wasm-pack build core-wasm --target web && npm run dev -w web
 //   npx playwright install chromium            (once)
-//   OBSINK_API_KEY=... node scripts/verify-web-e2e.mjs
+//   OBSINK_INVITE_CODE=... node scripts/verify-web-e2e.mjs
 //
 // Env: OBSINK_WEB_URL (default http://localhost:5173/app/), OBSINK_SERVER_URL
-// (default http://localhost:18080), OBSINK_API_KEY (operator bearer, mints the
-// invite a new account needs). An OPFS directory stands in for the picked
+// (default http://localhost:18080), OBSINK_INVITE_CODE (an invite from a signed-in
+// account, when the stack already has accounts). An OPFS directory stands in for the picked
 // folder: `showDirectoryPicker` is shimmed, everything else is the real client.
 //
 // Flow: A signs in and creates a vault with a.md; B connects with the same
@@ -23,7 +23,6 @@ import { chromium } from 'playwright'
 
 const WEB = process.env.OBSINK_WEB_URL ?? 'http://localhost:5173/app/'
 const SERVER = process.env.OBSINK_SERVER_URL ?? 'http://localhost:18080'
-const API_KEY = process.env.OBSINK_API_KEY
 const EMAIL = `web-e2e-${Date.now()}@example.test`
 const PASSPHRASE = 'e2e-passphrase'
 const VAULT = `e2e-${Date.now()}`
@@ -40,15 +39,15 @@ async function api(path, options = {}) {
   return response.json()
 }
 
+// A fresh CI database needs no invite (the first account is free). Against a
+// stack that already has accounts, pass one minted by a signed-in account
+// (`obsink invite`) as OBSINK_INVITE_CODE.
 async function mintInvite() {
   const { invite_required } = await api('/', { headers: { Accept: 'application/json' } })
   if (!invite_required) return null
-  if (!API_KEY) fail('the server needs an invite for a new account; set OBSINK_API_KEY')
-  const { invite } = await api('/auth/invites', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${API_KEY}` },
-  })
-  return invite.code
+  const code = process.env.OBSINK_INVITE_CODE
+  if (!code) fail('the server needs an invite for a new account; set OBSINK_INVITE_CODE (obsink invite)')
+  return code
 }
 
 // The dev server returns the code from /auth/email/start; the UI fills it in.
@@ -113,23 +112,34 @@ async function readFiles(page) {
   })
 }
 
+// Spec §12.1: sign in, then set the account passphrase (a new account) or
+// enter it (a device that came later).
 async function signIn(page, invite) {
-  await page.getByRole('main').getByRole('button', { name: 'Add vault' }).click()
   await page.getByRole('textbox', { name: 'Email' }).fill(EMAIL)
   await page.getByRole('button', { name: 'Send sign-in code' }).click()
   await page.getByRole('button', { name: 'Verify and sign in' }).waitFor()
   if (invite) await page.getByRole('textbox', { name: 'Invite code' }).fill(invite)
   await page.getByRole('button', { name: 'Verify and sign in' }).click()
-  await page.getByRole('heading', { name: 'Choose vault' }).waitFor()
+  await page.getByRole('heading', { name: 'Set passphrase' }).waitFor()
+  await page.getByRole('textbox', { name: 'Passphrase' }).fill(PASSPHRASE)
+  await page.getByRole('textbox', { name: 'Again' }).fill(PASSPHRASE)
+  await page.getByRole('button', { name: 'Set passphrase' }).click()
+  await page.getByText('Passphrase set.').waitFor({ timeout: 60_000 })
 }
 
-async function folderAndPassphrase(page, submitLabel) {
+async function unlock(page) {
+  await page.getByRole('heading', { name: 'Unlock' }).waitFor()
+  await page.getByRole('textbox', { name: 'Passphrase' }).fill(PASSPHRASE)
+  await page.getByRole('button', { name: 'Unlock' }).click()
+  await page.getByText('Unlocked.').waitFor({ timeout: 60_000 })
+}
+
+// The folder step of Create vault / Download, then the done card.
+async function folderStep(page, submitTestId, doneHeading) {
   await page.getByRole('button', { name: 'Choose folder' }).click()
   await page.getByText('e2e-vault').waitFor()
-  await page.getByRole('button', { name: 'Next' }).click()
-  await page.getByRole('textbox', { name: 'Passphrase' }).fill(PASSPHRASE)
-  await page.getByRole('button', { name: submitLabel }).click()
-  await page.getByRole('heading', { name: `Added ${VAULT}` }).waitFor({ timeout: 60_000 })
+  await page.getByTestId(submitTestId).click()
+  await page.getByRole('heading', { name: doneHeading }).waitFor({ timeout: 60_000 })
   await page.getByRole('button', { name: 'Done' }).click()
 }
 
@@ -190,25 +200,24 @@ try {
   devices.push(closeA)
   await writeFile(a, 'a.md', '# from A\n')
   await signIn(a, invite)
-  await a.getByRole('button', { name: 'Create' }).click()
+  await a.getByRole('main').getByRole('button', { name: 'Create vault' }).click()
   await a.getByRole('textbox', { name: 'Vault name' }).fill(VAULT)
   await a.getByRole('button', { name: 'Next' }).click()
-  await folderAndPassphrase(a, 'Create vault')
+  await folderStep(a, 'createVaultSubmitButton', `Created ${VAULT}`)
   await syncNow(a)
   console.log('A: vault created and a.md uploaded')
 
   // Device B: the same account (a second sign-in for one address within a
   // minute hits the server's email cooldown, so B carries A's session),
-  // connect, get the note.
+  // unlock with the passphrase, download the vault, get the note.
   const { page: b, close: closeB } = await device()
   devices.push(closeB)
   await b.evaluate(idbPut, ['kv', `bearer:${new URL(WEB).origin}`, await a.evaluate(idbGet, ['kv', `bearer:${new URL(WEB).origin}`])])
   await b.reload()
-  await b.getByRole('main').getByRole('button', { name: 'Add vault' }).click()
-  await b.getByRole('heading', { name: 'Choose vault' }).waitFor()
-  await b.getByRole('combobox', { name: 'Vault' }).selectOption({ label: VAULT })
-  await b.getByRole('button', { name: 'Next' }).click()
-  await folderAndPassphrase(b, 'Connect vault')
+  await unlock(b)
+  await b.getByTestId('vaultStateText').filter({ hasText: 'Not on this device' }).first().waitFor()
+  await b.getByTestId('downloadVaultButton').first().click()
+  await folderStep(b, 'downloadVaultSubmitButton', `Downloaded ${VAULT}`)
   await syncNow(b)
   const onB = await readFiles(b)
   if (onB['a.md'] !== '# from A\n') fail(`B did not receive a.md: ${JSON.stringify(onB)}`)

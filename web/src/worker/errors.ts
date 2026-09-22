@@ -20,7 +20,7 @@ export function fromStatus(status: number, message: string): CommandError {
 
 // The one message for a passphrase that does not decrypt (DESIGN.md §5).
 export function wrongPassphrase(): CommandError {
-  return other('Passphrase does not match this vault.')
+  return other('Passphrase does not match this account.')
 }
 
 export function isCommandError(error: unknown): error is CommandError {

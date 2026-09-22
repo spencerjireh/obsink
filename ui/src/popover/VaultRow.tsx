@@ -8,9 +8,11 @@ type Props = {
   onOpen: () => void
   // Absent where the platform cannot reveal a folder (the browser).
   onOpenFolder?: () => void
+  // Present on a vault this device does not hold: opens the Download flow.
+  onDownload?: () => void
 }
 
-export function VaultRow({ info, syncing, onOpen, onOpenFolder }: Props) {
+export function VaultRow({ info, syncing, onOpen, onOpenFolder, onDownload }: Props) {
   return (
     <li className="vault-row" data-testid="popoverVaultRow" data-vault-id={info.id}>
       <button className="vault-row__main" onClick={onOpen} type="button">
@@ -18,6 +20,17 @@ export function VaultRow({ info, syncing, onOpen, onOpenFolder }: Props) {
         <span className="vault-row__name">{info.name}</span>
         <span className="vault-row__state">{syncing ? 'Syncing…' : stateText(info)}</span>
       </button>
+      {onDownload ? (
+        <button
+          className="button button--ghost button--small"
+          data-testid="popoverDownloadButton"
+          data-vault-id={info.id}
+          onClick={onDownload}
+          type="button"
+        >
+          Download
+        </button>
+      ) : null}
       {onOpenFolder ? (
         <button
           className="icon-button"
