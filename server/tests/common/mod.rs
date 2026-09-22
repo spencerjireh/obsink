@@ -290,9 +290,10 @@ impl TestEnv {
         // `api_key` is core's v2 name for the bearer; renamed in OBS-136.
         obsink_core::ApiClient::new(obsink_core::VaultConfig {
             server_url: self.base_url.clone(),
-            api_key: bearer.to_string(),
+            bearer: bearer.to_string(),
             vault_id: vault_id.to_string(),
             local_path: String::new(),
+            device_id: None,
             ignore: Vec::new(),
         })
     }

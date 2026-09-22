@@ -28,18 +28,19 @@ pub mod types;
 pub mod watcher;
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use api_client::{ApiClient, ApiError, ManifestFetch};
+pub use api_client::{ApiClient, ApiError, ManifestFetch, TrashEntry, VersionInfo};
 #[cfg(not(target_arch = "wasm32"))]
 pub use auth::{
-    AuthClient, AuthError, AuthMethods, Capabilities, EmailStartResult, Invite, Me, MeSession,
-    MeUser, Session, SessionInfo, Usage, UserInfo, VaultUsage,
+    AccountKeyBlob, AuthClient, AuthError, AuthMethods, Capabilities, Device, DevicePlatform,
+    EmailStartResult, Invite, Me, MeDevice, MeUser, Session, SessionInfo, SetKeysOutcome,
+    SignInDevice, Usage, UserInfo, VaultUsage,
 };
 pub use crypto::{
     account_verifier, content_hmac, create_account_key, decode_base64, decrypt, decrypt_path,
-    derive_key, derive_keys, encode_base64, encrypt, encrypt_path, new_key, new_salt, path_token,
-    rewrap_account_key, unlock_account_key, unwrap_key, unwrap_vault_key, vault_wrap_key, wrap_key,
-    wrap_vault_key, AccountKeyMaterial, CryptoError, CryptoKeys, KeyBytes, PROTOCOL_VERSION,
-    SALT_LEN, WRAPPED_KEY_LEN,
+    derive_key, derive_keys, encode_base64, encrypt, encrypt_path, new_key, new_salt, new_vault_id,
+    path_token, rewrap_account_key, unlock_account_key, unwrap_key, unwrap_vault_key,
+    vault_wrap_key, wrap_key, wrap_vault_key, AccountKeyMaterial, CryptoError, CryptoKeys,
+    KeyBytes, PROTOCOL_VERSION, SALT_LEN, WRAPPED_KEY_LEN,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use daemon::{

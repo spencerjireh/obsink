@@ -721,7 +721,8 @@ mod integration {
 
         let config = VaultConfig {
             server_url: server.base_url(),
-            api_key: "token".into(),
+            bearer: "token".into(),
+            device_id: None,
             vault_id: "vault_123".into(),
             local_path: root.display().to_string(),
             ignore: Vec::new(),

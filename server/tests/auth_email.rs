@@ -121,11 +121,11 @@ async fn issues_a_session_for_a_valid_code_and_rejects_a_wrong_one() {
     assert_eq!(me["usage"]["total_bytes"], 0);
     assert_eq!(me["usage"]["max_vaults"], 10);
 
-    // The core AuthClient (still the v2 shape) parses the response: `kind`
-    // and `sessions` default until OBS-136 moves it to devices.
+    // The core AuthClient understands the same response.
     let core_me = env.auth_client().me(&token).await.unwrap();
-    assert_eq!(core_me.kind, "");
-    assert!(core_me.sessions.is_empty());
+    assert_eq!(core_me.devices[0].name, "iPhone");
+    assert_eq!(core_me.devices[0].platform, "ios");
+    assert!(core_me.devices[0].current);
     assert_eq!(
         core_me.user.unwrap().email.as_deref(),
         Some("person@example.com")

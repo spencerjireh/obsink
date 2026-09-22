@@ -70,13 +70,20 @@ pub struct SyncResult {
     pub checkpoint_error: Option<String>,
 }
 
-/// `Debug` redacts `api_key` (the bearer).
+/// `Debug` redacts `bearer` (the session token).
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VaultConfig {
     pub server_url: String,
-    pub api_key: String,
+    /// The session token. `api_key` is the v2 name still found in stored
+    /// configs and the mobile facade.
+    #[serde(alias = "api_key")]
+    pub bearer: String,
     pub vault_id: String,
     pub local_path: String,
+    /// This machine's device id (spec §4.1); when set, a checkpoint reports
+    /// its revision to `PUT /vaults/:id/devices/self`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
     /// Extra ignore patterns on top of [`crate::ignore::DEFAULT_IGNORE`].
     #[serde(default)]
     pub ignore: Vec<String>,
@@ -93,7 +100,7 @@ impl std::fmt::Debug for VaultConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VaultConfig")
             .field("server_url", &self.server_url)
-            .field("api_key", &"..")
+            .field("bearer", &"..")
             .field("vault_id", &self.vault_id)
             .field("local_path", &self.local_path)
             .field("ignore", &self.ignore)
@@ -148,6 +155,10 @@ pub struct ListVaultsResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateVaultRequest {
+    /// A client-minted id (`new_vault_id`) so the wrapped key's AAD is the
+    /// real id; the server mints one when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub name: String,
     #[serde(default = "default_max_file_size")]
     pub max_file_size: u64,
@@ -249,14 +260,15 @@ mod tests {
     fn vault_config_debug_redacts_the_bearer() {
         let config = VaultConfig {
             server_url: "https://s.test".into(),
-            api_key: "secret-bearer-xyz".into(),
+            bearer: "secret-bearer-xyz".into(),
+            device_id: None,
             vault_id: "vault_1".into(),
             local_path: "/tmp/v".into(),
             ignore: Vec::new(),
         };
         let printed = format!("{config:?}");
         assert!(printed.contains("vault_1"));
-        assert!(printed.contains("api_key: \"..\""));
+        assert!(printed.contains("bearer: \"..\""));
         assert!(!printed.contains("secret-bearer-xyz"));
     }
 }

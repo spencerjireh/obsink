@@ -16,23 +16,31 @@ Windows, Linux, and Android clients are out of scope.
 The CLI is the simplest way to use ObSink and the easiest to script.
 
 ```bash
-# Sign in once per machine (emailed 6-digit code), then work with vaults
+# Sign in once per machine (emailed 6-digit code), then set or enter the
+# account passphrase; every vault of the account is then one command away
 obsink login [--server-url <url>] [--email <you@example.com>] [--invite-code <code>]
-obsink whoami                                     # account, signed-in devices, storage usage
+obsink whoami                                     # account, devices, storage usage
+obsink devices [--rename <id> <name>] [--revoke <id>]
+obsink passphrase                                 # change it (the same key, rewrapped)
 obsink invite [--list]                            # mint a code for someone else
-obsink vaults
-obsink init    --vault-name <name> --directory <path> [--passphrase <p>]
-obsink connect --vault-id <id>     --directory <path> [--passphrase <p>]
+obsink vaults                                     # every vault, with its state on this machine
+obsink init     --vault-name <name> --directory <path>
+obsink download --vault-id <id>     --directory <path>   # alias: connect
+obsink rename --name <name>
 obsink logout
 
 obsink sync                       # full sync cycle; prompts to resolve conflicts
 obsink watch                      # keep syncing: watch the folder, poll the server; Ctrl-C stops
 obsink status [--directory <path>]
+obsink history <path>             # archived versions of a file
+obsink trash                      # deleted in the last 30 days
+obsink restore <path> [--version <name>]   # back into the folder; `sync` uploads it
 ```
 
-- `--server-url` also reads `OBSINK_SERVER_URL`; after the first command it defaults to the URL in the saved config, and before any config exists to the public server `https://obsink-api.spencerjireh.com` (a self-hosted build bakes its own by setting `OBSINK_SERVER_URL` at compile time, as the desktop app does). `--api-key` (`OBSINK_API_KEY`) supplies the operator bearer for scripts and harnesses; normal use is `login`.
+- `--server-url` also reads `OBSINK_SERVER_URL`; after the first command it defaults to the URL in the saved config, and before any config exists to the public server `https://obsink-api.spencerjireh.com` (a self-hosted build bakes its own by setting `OBSINK_SERVER_URL` at compile time, as the desktop app does). There is no operator bearer: scripts sign in as an account too.
+- `OBSINK_PASSPHRASE` supplies the passphrase for `login` and `passphrase` (scripts); `OBSINK_DEVICE_ID` fixes the device id (the two-device harnesses give each side its own).
 - Config lives at `~/.obsink/config.toml` (server URL, vault ID, local path — **no secrets**). Set `OBSINK_HOME` to relocate it (used for per-device isolation in tests). Configs written before the server pivot (`worker_url`) still load.
-- The macOS Keychain (service `obsink`) holds the encryption key (account = vault ID) and the server bearer (account = `bearer:<server url>`). `OBSINK_KEYRING_DIR=<dir>` swaps it for a directory of files (CI, harnesses).
+- The macOS Keychain (service `obsink`) holds the vault key (account = vault ID), the server bearer (`bearer:<server url>`), the signed-in user id (`user:<server url>`), the account key (`account:<user id>`) and the device id (`device:<server url>`, shared with the desktop app so one Mac is one device). `OBSINK_KEYRING_DIR=<dir>` swaps it for a directory of files (CI, harnesses).
 - Each vault directory keeps `.obsink/manifest.json` (last completed sync), `.obsink/remote-manifest.json` (last server manifest + ETag, so an unchanged manifest costs a `304`) and `.obsink/hash-cache.json` (the `(mtime, size) → hash` memo).
 - `obsink watch` runs the daemon (`docs/architecture.md`, "The daemon") for the configured vault: a filesystem watcher plus a debounce (750 ms quiet per path, 2 s batch window, a stat gate for files still being written), an ETag poll of the server every 5 s after activity and every 60 s when idle, exponential backoff on fatal errors (5 s to 5 min), and one line per event on stdout (`sync started`, `sync finished: n uploaded, n downloaded, n failed`, `n conflict(s) waiting; run \`obsink sync\` to resolve:` with the paths). Conflicts are never resolved by the daemon: the conflicted paths stay pending while everything else keeps syncing.
 - Paths that never sync: `.obsink/`, `*.obsink-tmp`, `.obsidian/workspace.json`, `.obsidian/workspace-mobile.json`, `.trash/`, `.DS_Store`, `.git/`. Add a vault's own patterns with `ignore = ["drafts/", "*.tmp"]` in `config.toml` (`dir/`, `*.ext`, an exact `a/b.md`, or a bare name at any depth). A path already on the server when it becomes ignored is left there untouched; it just stops taking part in the diff.

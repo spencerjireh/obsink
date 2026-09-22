@@ -186,7 +186,7 @@ Returns every vault the account is a member of, with what each device needs to s
 ```
 
 **`POST /vaults`**
-Creates a new vault. Body: `{ "name": "my-vault", "wrapped_key": "<…>", "max_file_size"?: bytes }`. The client generates the vault key and wraps it under its account key; the vault row and the owner's `vault_members` row are written in one transaction. `400 set a passphrase first` when the account has no key yet. Returns `201 { "vault": { id, name, created, max_file_size } }`.
+Creates a new vault. Body: `{ "id"?: "vault_<uuid>", "name": "my-vault", "wrapped_key": "<…>", "max_file_size"?: bytes }`. The client generates the vault key and wraps it under its account key with the vault id as AAD, so it mints the id too (`vault_` followed by a UUID; `409` if taken, the server mints one when absent); the vault row and the owner's `vault_members` row are written in one transaction. `400 set a passphrase first` when the account has no key yet. Returns `201 { "vault": { id, name, created, max_file_size } }`.
 
 **`PATCH /vaults/:vault_id`**
 `{ "name": "…" }` renames the vault for every device (owner only).
@@ -327,7 +327,7 @@ Consequences:
 
 | Platform | Account key | Device id | Vault keys |
 |---|---|---|---|
-| macOS (desktop app and CLI share these) | Keychain `account:<user id>`, `key_id` alongside | Keychain `device:<canonical server URL>` (`OBSINK_DEVICE_ID` overrides for harnesses) | Keychain, account = vault id |
+| macOS (desktop app and CLI share these) | Keychain `account:<user id>`, `key_id` alongside; `user:<canonical server URL>` names the signed-in user id so the entry can be found without a request | Keychain `device:<canonical server URL>` (`OBSINK_DEVICE_ID` overrides for harnesses) | Keychain, account = vault id |
 | iOS | Keychain (app group, `AfterFirstUnlock`), same account names | Keychain | Keychain, account = vault id |
 | Browser | worker memory for the tab's lifetime; a reload shows `Unlock` | IndexedDB | worker memory |
 
