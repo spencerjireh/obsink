@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import type { VaultStateInfo } from '../types'
 import { useBackend, type BackendEvent } from '../backend'
 
-// Every configured vault with its state. Re-read on mount, whenever the
+// Every vault of the account with its state on this device. Re-read on mount, whenever the
 // backend says something changed, and on any extra event names given (the
 // popover passes `popover://opened`).
 export function useVaultStates(
@@ -27,7 +27,7 @@ export function useVaultStates(
     try {
       do {
         again.current = false
-        setStates(await backend.getVaultStates())
+        setStates(await backend.listVaults())
         setLoaded(true)
       } while (again.current)
     } catch (error) {

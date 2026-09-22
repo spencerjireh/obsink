@@ -13,21 +13,23 @@ import * as vaults from './vaults'
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const handlers: Record<string, (...args: any[]) => Promise<unknown> | unknown> = {
   getServerUrl: () => serverUrl,
+  getProtocol: account.getProtocol,
   getAuthCapabilities: account.getAuthCapabilities,
   authEmailStart: account.authEmailStart,
   authEmailVerify: account.authEmailVerify,
   getAccount: account.getAccount,
+  setPassphrase: account.setPassphrase,
+  unlock: account.unlock,
   createInvite: account.createInvite,
   listInvites: account.listInvites,
-  revokeSession: account.revokeSession,
+  revokeDevice: account.revokeDevice,
   signOut: account.signOut,
   deleteAccount: account.deleteAccount,
-  listRemoteVaults: vaults.listRemoteVaults,
-  addVault: vaults.addVault,
+  listVaults: vaults.listVaults,
+  createVault: vaults.createVault,
+  downloadVault: vaults.downloadVault,
   removeVault: vaults.removeVault,
   deleteRemoteVault: vaults.deleteRemoteVault,
-  getVaultStates: vaults.getVaultStates,
-  unlockVault: vaults.unlockVault,
   syncVault,
   resolveConflict,
   getConflictPreview,
@@ -39,12 +41,14 @@ const handlers: Record<string, (...args: any[]) => Promise<unknown> | unknown> =
 // way desktop emits `state://changed` after every mutating command.
 const CHANGES_STATE = new Set([
   'authEmailVerify',
+  'setPassphrase',
+  'unlock',
   'signOut',
   'deleteAccount',
-  'addVault',
+  'createVault',
+  'downloadVault',
   'removeVault',
   'deleteRemoteVault',
-  'unlockVault',
 ])
 
 self.onmessage = async (message: MessageEvent<WorkerRequest>) => {

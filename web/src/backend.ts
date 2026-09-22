@@ -15,7 +15,7 @@ export class WebBackend implements Backend {
     folderPlaceholder: '',
     folderPrompt: {
       create: 'Which folder on this computer holds the vault',
-      connect: 'Which folder on this computer to put the vault in',
+      download: 'Which folder on this computer to put the vault in',
     },
   }
 
@@ -82,26 +82,33 @@ export class WebBackend implements Backend {
   }
 
   getServerUrl = () => this.call<string>('getServerUrl')
+  getProtocol = () => this.call<never>('getProtocol')
   getAuthCapabilities = () => this.call<never>('getAuthCapabilities')
   authEmailStart = (email: string) => this.call<string | null>('authEmailStart', email)
   authEmailVerify = (email: string, code: string, inviteCode: string | null) =>
     this.call<never>('authEmailVerify', email, code, inviteCode)
   getAccount = () => this.call<never>('getAccount')
+  setPassphrase = (passphrase: string) => this.call<never>('setPassphrase', passphrase)
+  unlock = (passphrase: string) => this.call<never>('unlock', passphrase)
   createInvite = () => this.call<never>('createInvite')
   listInvites = () => this.call<never>('listInvites')
-  revokeSession = (sessionId: string) => this.call<never>('revokeSession', sessionId)
+  revokeDevice = (deviceId: string) => this.call<never>('revokeDevice', deviceId)
   signOut = () => this.call<void>('signOut')
   deleteAccount = () => this.call<void>('deleteAccount')
-  listRemoteVaults = () => this.call<never>('listRemoteVaults')
-  addVault = async (request: Parameters<Backend['addVault']>[0]) => {
-    const vault = await this.call<never>('addVault', request)
+  listVaults = () => this.call<never>('listVaults')
+  createVault = async (request: Parameters<Backend['createVault']>[0]) => {
+    const vault = await this.call<never>('createVault', request)
     // The picked folder is a vault's now; nothing to discard.
+    if (request.local_path === this.pickedHandleId) this.pickedHandleId = null
+    return vault
+  }
+  downloadVault = async (request: Parameters<Backend['downloadVault']>[0]) => {
+    const vault = await this.call<never>('downloadVault', request)
     if (request.local_path === this.pickedHandleId) this.pickedHandleId = null
     return vault
   }
   removeVault = (vaultId: string) => this.call<void>('removeVault', vaultId)
   deleteRemoteVault = (vaultId: string) => this.call<void>('deleteRemoteVault', vaultId)
-  getVaultStates = () => this.call<never>('getVaultStates')
   syncVault = (vaultId: string) => this.call<never>('syncVault', vaultId)
   resolveConflict = (vaultId: string, resolutions: Parameters<Backend['resolveConflict']>[1]) =>
     this.call<never>('resolveConflict', vaultId, resolutions)
@@ -109,8 +116,6 @@ export class WebBackend implements Backend {
     this.call<never>('getConflictPreview', vaultId, path)
   listActivity = (vaultId: string | null, limit: number) =>
     this.call<never>('listActivity', vaultId, limit)
-  unlockVault = (vaultId: string, passphrase: string) =>
-    this.call<void>('unlockVault', vaultId, passphrase)
   setVisibility = (hidden: boolean) => this.call<void>('setVisibility', hidden)
 
   // A directory picker is a user gesture on the page; the handle goes to
@@ -140,7 +145,7 @@ export class WebBackend implements Backend {
     const vault = await get<StoredVault>('vaults', vaultId)
     const handle = vault && (await get<FileSystemDirectoryHandle>('handles', vault.handle_id))
     if (!handle)
-      throw { kind: 'other', message: 'Folder not found. Remove the vault and add it again.' }
+      throw { kind: 'other', message: 'Folder not found. Remove the vault and download it again.' }
     const state = await handle.requestPermission({ mode: 'readwrite' })
     if (state !== 'granted') throw { kind: 'other', message: 'Folder access was not granted.' }
     this.emit('state://changed', { vault_id: vaultId })

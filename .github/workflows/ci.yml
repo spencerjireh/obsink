@@ -211,6 +211,8 @@ jobs:
         run: npm run format:check
       - name: Type-check the shared UI package
         run: npm run typecheck -w ui
+      - name: Shared UI unit tests
+        run: npm run test -w ui
       - name: Build desktop frontend
         run: npm run build -w desktop
       - name: Clippy the Tauri shell and the CLI (macOS keychain path)

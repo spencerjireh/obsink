@@ -120,8 +120,8 @@ obsink/
    tests skip without `DATABASE_URL`; run them against Postgres before touching
    `server/`), `cargo clippy --workspace --all-targets -- -D warnings`,
    `cargo deny check`, and at the repo root `npm run lint && npm run format:check
-   && npm run typecheck -w ui && npm run build -w desktop && npm run typecheck -w web
-   && npm run test -w web && npm run build -w web` (the web steps need
+   && npm run typecheck -w ui && npm run test -w ui && npm run build -w desktop
+   && npm run typecheck -w web && npm run test -w web && npm run build -w web` (the web steps need
    `wasm-pack build core-wasm --target web` first). CI enforces all of them on
    every PR, plus the container route checks (`scripts/test-web-container.sh`),
    the install script test (`scripts/test-install-sh.sh`) and the desktop unit

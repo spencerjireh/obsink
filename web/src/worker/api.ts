@@ -23,20 +23,30 @@ export type WireFileEntry = {
 
 export type Capabilities = {
   service: string
-  auth: { email: boolean; apple: boolean; api_key: boolean }
+  protocol?: number
+  auth: { email: boolean; apple: boolean }
   invite_required?: boolean
 }
 
 export type Session = {
   token: string
-  session: { id: string; expires: number }
+  session: { id: string; expires: number; device_id?: string }
   user: { id: string; email: string | null }
 }
 
+export type WireDevice = {
+  id: string
+  name: string
+  platform: string
+  created: number
+  last_seen?: number
+  current: boolean
+  vault_ids?: string[]
+}
+
 export type Me = {
-  kind: string
   user: { id: string; email: string | null; created: number } | null
-  sessions?: { id: string; deviceName: string; created: number; current: boolean }[]
+  devices?: WireDevice[]
   usage?: {
     vaults?: { id: string; bytes: number }[]
     total_bytes: number
@@ -44,6 +54,12 @@ export type Me = {
     max_vaults: number | null
   } | null
 }
+
+// The wrapped account key as the server holds it (spec §6.1).
+export type AccountKeyBlob = { key_id: string; wrapped: string; salt: string }
+export type AccountKeyMaterial = { wrapped: string; salt: string; verifier: string }
+export type SetKeysOutcome =
+  { outcome: 'created'; key_id: string } | { outcome: 'exists'; blob: AccountKeyBlob }
 
 export type WireInvite = {
   code: string
@@ -53,7 +69,25 @@ export type WireInvite = {
   used_at?: number | null
 }
 
-export type VaultSummary = { id: string; name: string; created: number; max_file_size?: number }
+export type VaultSummaryDevice = {
+  id: string
+  name: string
+  platform: string
+  last_synced?: number | null
+  last_revision?: number | null
+}
+
+export type VaultSummary = {
+  id: string
+  name: string
+  created: number
+  max_file_size?: number
+  revision?: number
+  last_write?: number
+  bytes?: number
+  wrapped_key?: string | null
+  devices?: VaultSummaryDevice[]
+}
 
 export type ManifestFetch =
   | { status: 'not_modified' }
@@ -151,6 +185,8 @@ export class Api {
     return this.json('POST', '/auth/email/start', { json: { email } })
   }
 
+  // v2 device identity (a name only) until OBS-141 gives the browser a
+  // stable device id.
   emailVerify(
     email: string,
     code: string,
@@ -166,12 +202,48 @@ export class Api {
     return this.json('GET', '/auth/me', { bearer })
   }
 
+  async getKeys(bearer: string): Promise<AccountKeyBlob | null> {
+    const { account_key } = await this.json<{ account_key: AccountKeyBlob | null }>(
+      'GET',
+      '/auth/keys',
+      { bearer },
+    )
+    return account_key
+  }
+
+  // Create-only: a 409 carries the blob another device set first.
+  async setKeys(bearer: string, material: AccountKeyMaterial): Promise<SetKeysOutcome> {
+    const response = await this.send('PUT', '/auth/keys', {
+      bearer,
+      json: material,
+      accept: [409],
+    })
+    if (response.status === 409) {
+      const { account_key } = (await response.json()) as { account_key: AccountKeyBlob | null }
+      if (!account_key) throw fromStatus(409, 'the passphrase was set elsewhere; sign in again')
+      return { outcome: 'exists', blob: account_key }
+    }
+    const { key_id } = (await response.json()) as { key_id: string }
+    return { outcome: 'created', key_id }
+  }
+
+  async rewrapKeys(bearer: string, material: AccountKeyMaterial): Promise<void> {
+    await this.send('PUT', '/auth/keys/rewrap', { bearer, json: material })
+  }
+
   async logout(bearer: string): Promise<void> {
     await this.send('DELETE', '/auth/session', { bearer })
   }
 
-  async revokeSession(bearer: string, sessionId: string): Promise<void> {
-    await this.send('DELETE', `/auth/sessions/${encodeURIComponent(sessionId)}`, { bearer })
+  async revokeDevice(bearer: string, deviceId: string): Promise<void> {
+    await this.send('DELETE', `/auth/devices/${encodeURIComponent(deviceId)}`, { bearer })
+  }
+
+  async renameDevice(bearer: string, deviceId: string, name: string): Promise<void> {
+    await this.send('PATCH', `/auth/devices/${encodeURIComponent(deviceId)}`, {
+      bearer,
+      json: { name },
+    })
   }
 
   async deleteAccount(bearer: string): Promise<void> {
@@ -195,16 +267,36 @@ export class Api {
     return vaults
   }
 
-  async createVault(bearer: string, name: string, maxFileSize: number): Promise<VaultSummary> {
+  // The client mints the id so the vault key is wrapped under it (spec §4.3).
+  async createVault(
+    bearer: string,
+    request: { id: string; name: string; wrapped_key: string; max_file_size: number },
+  ): Promise<VaultSummary> {
     const { vault } = await this.json<{ vault: VaultSummary }>('POST', '/vaults', {
       bearer,
-      json: { name, max_file_size: maxFileSize },
+      json: request,
     })
     return vault
   }
 
+  async renameVault(bearer: string, vaultId: string, name: string): Promise<void> {
+    await this.send('PATCH', `/vaults/${vaultId}`, { bearer, json: { name } })
+  }
+
   async deleteVault(bearer: string, vaultId: string): Promise<void> {
     await this.send('DELETE', `/vaults/${vaultId}`, { bearer })
+  }
+
+  // This device holds the vault (no revision) or just synced it to `revision`.
+  async attachDevice(bearer: string, vaultId: string, revision: number | null): Promise<void> {
+    await this.send('PUT', `/vaults/${vaultId}/devices/self`, {
+      bearer,
+      json: revision === null ? {} : { revision },
+    })
+  }
+
+  async detachDevice(bearer: string, vaultId: string): Promise<void> {
+    await this.send('DELETE', `/vaults/${vaultId}/devices/self`, { bearer })
   }
 
   async getManifest(

@@ -2,14 +2,14 @@ import { createContext, useContext, type ReactNode } from 'react'
 import type {
   AccountState,
   ActivityEvent,
-  AddVaultMode,
   AuthCapabilities,
   ConflictPreview,
   InviteInfo,
   LocalVault,
   ProgressEnvelope,
-  RemoteVault,
+  ProtocolInfo,
   ResolutionChoice,
+  SetPassphraseOutcome,
   SettingsTarget,
   SyncResponse,
   VaultStateInfo,
@@ -20,13 +20,15 @@ import type {
 // browser client answers from a worker (wasm + fetch + the File System
 // Access API). Field names in the payloads mirror the Rust structs.
 
-export type AddVaultRequest = {
-  mode: AddVaultMode
+export type CreateVaultRequest = {
+  vault_name: string
   // A folder path on desktop; the id of a picked directory handle on the web.
   local_path: string
-  vault_name: string
+}
+
+export type DownloadVaultRequest = {
   vault_id: string
-  passphrase: string
+  local_path: string
 }
 
 export type Resolution = { path: string; choice: ResolutionChoice }
@@ -55,41 +57,50 @@ export type Platform = {
   canOpenFolder: boolean
   // Shown in the path field when the folder is typed rather than picked.
   folderPlaceholder: string
-  // The hint on the folder step, per mode ("Where the vault lives on this
+  // The hint on the folder step, per flow ("Where the vault lives on this
   // Mac" | "Which folder on this computer holds the vault").
-  folderPrompt: { create: string; connect: string }
+  folderPrompt: { create: string; download: string }
 }
 
 export interface Backend {
   readonly platform: Platform
   getServerUrl(): Promise<string>
+  // The protocol gate (spec §15.5): checked once on launch.
+  getProtocol(): Promise<ProtocolInfo>
   getAuthCapabilities(): Promise<AuthCapabilities>
   // Resolves to the code itself on a dev server that returns it inline.
   authEmailStart(email: string): Promise<string | null>
+  // Signs in; the result is `locked` until the passphrase step is done.
   authEmailVerify(email: string, code: string, inviteCode: string | null): Promise<AccountState>
   getAccount(): Promise<AccountState>
+  // Spec §12.1: set the account passphrase (a new account), or, when another
+  // device set it first, unlock with the same passphrase.
+  setPassphrase(
+    passphrase: string,
+  ): Promise<{ outcome: SetPassphraseOutcome; account: AccountState }>
+  // Enter the passphrase on a device that does not hold the account key.
+  unlock(passphrase: string): Promise<AccountState>
   createInvite(): Promise<InviteInfo>
   listInvites(): Promise<InviteInfo[]>
-  revokeSession(sessionId: string): Promise<AccountState>
+  // Sign another device out for good (its folders stay).
+  revokeDevice(deviceId: string): Promise<AccountState>
   signOut(): Promise<void>
   deleteAccount(): Promise<void>
-  listRemoteVaults(): Promise<RemoteVault[]>
-  addVault(request: AddVaultRequest): Promise<LocalVault>
+  // Every vault of the account with its state on this device (spec §15.1).
+  listVaults(): Promise<VaultStateInfo[]>
+  createVault(request: CreateVaultRequest): Promise<LocalVault>
+  downloadVault(request: DownloadVaultRequest): Promise<LocalVault>
   // Present where folders are picked rather than typed (the browser).
   pickFolder?(): Promise<{ id: string; name: string }>
-  // Forget a picked folder that never became a vault (the add flow closed).
+  // Forget a picked folder that never became a vault (the flow closed).
   discardPickedFolder?(): Promise<void>
   // Present where background work should pause while the app is hidden or
   // offline (the browser's polling).
   setVisibility?(hidden: boolean): Promise<void>
   // Present where a folder grant can lapse (the browser): ask for it again.
   requestFolderAccess?(vaultId: string): Promise<void>
-  // Present where the key is not kept between launches (the browser): the
-  // passphrase again for a `no_key` vault.
-  unlockVault?(vaultId: string, passphrase: string): Promise<void>
   removeVault(vaultId: string): Promise<void>
   deleteRemoteVault(vaultId: string): Promise<void>
-  getVaultStates(): Promise<VaultStateInfo[]>
   syncVault(vaultId: string): Promise<SyncResponse>
   resolveConflict(vaultId: string, resolutions: Resolution[]): Promise<SyncResponse>
   getConflictPreview(vaultId: string, path: string): Promise<ConflictPreview>

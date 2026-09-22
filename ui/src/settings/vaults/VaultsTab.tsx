@@ -1,43 +1,46 @@
 import type { VaultStateInfo } from '../../types'
 import type { Account } from '../../hooks/useAccount'
-import { stateText, stateTone } from '../../lib/vault-state'
+import { onThisDevice, stateText, stateTone } from '../../lib/vault-state'
 import { EmptyState } from '../../components/EmptyState'
 import { Notice } from '../../components/Notices'
 import { StateDot } from '../../components/StateDot'
-import { AddVaultFlow } from './AddVaultFlow'
+import { VaultFlow } from './VaultFlow'
 import { VaultPage } from './VaultPage'
+
+// What the pane on the right shows besides a vault page.
+export type VaultFlowTarget =
+  { kind: 'create' } | { kind: 'download'; vault_id: string; vault_name: string }
 
 type Props = {
   states: VaultStateInfo[]
   loaded: boolean
   selectedId: string | null
-  adding: boolean
+  flow: VaultFlowTarget | null
   account: Account
   message: string
   notify: (message: string) => void
   onError: (error: unknown) => void
   onSelect: (vaultId: string) => void
-  // A vault was configured; the add flow stays open on its done card.
+  // A vault landed on this device; the flow stays open on its done card.
   onAdded: (vaultId: string) => void
-  onAdd: () => void
-  onCloseAdd: () => void
+  onFlow: (flow: VaultFlowTarget | null) => void
   onSignIn: () => void
 }
 
-// Vault list on the left, the selected vault (or the add flow) on the right.
+// Every vault of the account on the left (spec §15.1), the selected vault
+// or a flow on the right.
 export function VaultsTab({
   states,
   loaded,
   selectedId,
-  adding,
+  flow,
   account,
   message,
   notify,
   onError,
   onSelect,
   onAdded,
-  onAdd,
-  onCloseAdd,
+  onFlow,
   onSignIn,
 }: Props) {
   const selected = states.find((s) => s.id === selectedId) ?? null
@@ -48,46 +51,70 @@ export function VaultsTab({
         <nav className="vault-list__items">
           {loaded && states.length === 0 ? <EmptyState>No vaults yet.</EmptyState> : null}
           {states.map((info) => {
-            const current = !adding && info.id === selectedId
+            const current = !flow && info.id === selectedId
+            const here = onThisDevice(info)
             return (
-              <button
+              <div
                 key={info.id}
-                className={`vault-item${current ? ' vault-item--active' : ''}`}
-                aria-current={current ? 'page' : undefined}
-                data-testid="vaultCard"
-                data-vault-id={info.id}
-                onClick={() => onSelect(info.id)}
-                type="button"
+                className={`vault-item${current ? ' vault-item--active' : ''}${
+                  here ? '' : ' vault-item--elsewhere'
+                }`}
               >
-                <span className="vault-item__name">
-                  <StateDot tone={stateTone(info)} /> {info.name}
-                </span>
-                <span className="vault-item__path">{stateText(info)}</span>
-              </button>
+                <button
+                  className="vault-item__button"
+                  aria-current={current ? 'page' : undefined}
+                  data-testid="vaultCard"
+                  data-vault-id={info.id}
+                  onClick={() => onSelect(info.id)}
+                  type="button"
+                >
+                  <span className="vault-item__name">
+                    <StateDot tone={stateTone(info)} /> {info.name}
+                  </span>
+                  <span className="vault-item__path" data-testid="vaultStateText">
+                    {stateText(info)}
+                  </span>
+                </button>
+                {info.state.kind === 'not_on_device' ? (
+                  <button
+                    className="button button--ghost button--small"
+                    data-testid="downloadVaultButton"
+                    data-vault-id={info.id}
+                    disabled={account.busy}
+                    onClick={() =>
+                      onFlow({ kind: 'download', vault_id: info.id, vault_name: info.name })
+                    }
+                    type="button"
+                  >
+                    Download
+                  </button>
+                ) : null}
+              </div>
             )
           })}
         </nav>
         <div className="vault-list__footer">
           <button
             className="button button--ghost"
-            data-testid="addVaultButton"
-            disabled={adding}
-            onClick={onAdd}
+            data-testid="createVaultButton"
+            disabled={flow?.kind === 'create'}
+            onClick={() => onFlow({ kind: 'create' })}
             type="button"
           >
-            Add vault
+            Create vault
           </button>
         </div>
       </aside>
       <main className="main">
-        {adding ? (
-          <AddVaultFlow
-            account={account}
+        {flow ? (
+          <VaultFlow
+            key={flow.kind === 'download' ? flow.vault_id : 'create'}
+            flow={flow}
             message={message}
             notify={notify}
             onError={onError}
             onAdded={(vault) => onAdded(vault.id)}
-            onClose={onCloseAdd}
+            onClose={() => onFlow(null)}
           />
         ) : selected ? (
           <VaultPage
@@ -98,6 +125,9 @@ export function VaultsTab({
             notify={notify}
             onError={onError}
             onSignIn={onSignIn}
+            onDownload={() =>
+              onFlow({ kind: 'download', vault_id: selected.id, vault_name: selected.name })
+            }
             onGone={() => onSelect('')}
           />
         ) : (
@@ -107,17 +137,17 @@ export function VaultsTab({
                 <h1>{loaded && states.length === 0 ? 'No vaults yet' : 'No vault selected'}</h1>
                 <p className="pane-header__meta">
                   {loaded && states.length === 0
-                    ? 'Add a vault to start syncing.'
+                    ? 'Create a vault to start syncing.'
                     : 'Pick a vault on the left.'}
                 </p>
               </div>
               <button
                 className="button button--primary"
-                data-testid="addVaultButton"
-                onClick={onAdd}
+                data-testid="createVaultButton"
+                onClick={() => onFlow({ kind: 'create' })}
                 type="button"
               >
-                Add vault
+                Create vault
               </button>
             </header>
             {message ? <Notice>{message}</Notice> : null}
