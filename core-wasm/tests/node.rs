@@ -6,8 +6,8 @@
 use obsink_core_wasm::{
     backoff_wait_ms, checkpoint_manifest_json, chunk_uploads_json, conflict_copy_path_js,
     conflict_to_upload_json, default_ignore, diff_manifests_json as diff_manifests,
-    effective_choice_json, normalize_server_url_js, poll_interval_ms, protocol_version, Ignore,
-    VaultKeys,
+    effective_choice_json, new_vault_key, normalize_server_url_js, poll_interval_ms,
+    protocol_version, AccountKey, Ignore, VaultKeys,
 };
 use wasm_bindgen_test::wasm_bindgen_test;
 
@@ -26,6 +26,34 @@ fn derives_keys_and_round_trips_a_blob() {
 }
 
 #[wasm_bindgen_test]
+fn account_keys_unlock_and_wrap_vault_keys() {
+    let created = AccountKey::create("correct horse battery", "usr_1").unwrap();
+    let material: serde_json::Value = serde_json::from_str(&created.material().unwrap()).unwrap();
+    let salt = material["salt"].as_str().unwrap();
+    let wrapped = material["wrapped"].as_str().unwrap();
+
+    let unlocked = AccountKey::unlock("correct horse battery", salt, wrapped, "usr_1").unwrap();
+    assert_eq!(unlocked.bytes(), created.bytes());
+    // A wrong passphrase, a wrong user, and bad base64 all surface as errors.
+    assert!(AccountKey::unlock("wrong", salt, wrapped, "usr_1").is_err());
+    assert!(AccountKey::unlock("correct horse battery", salt, wrapped, "usr_2").is_err());
+    assert!(AccountKey::unlock("correct horse battery", "!!", wrapped, "usr_1").is_err());
+    assert!(AccountKey::unlock("correct horse battery", salt, "!!", "usr_1").is_err());
+
+    let vault_key = new_vault_key();
+    let blob = created.wrap_vault_key(&vault_key, "vault_a").unwrap();
+    assert_eq!(
+        unlocked.unwrap_vault_key(&blob, "vault_a").unwrap(),
+        vault_key
+    );
+    assert!(unlocked.unwrap_vault_key(&blob, "vault_b").is_err());
+    let keys = VaultKeys::from_vault_key(&vault_key).unwrap();
+    let note = keys.encrypt(b"note").unwrap();
+    assert_eq!(keys.decrypt(&note).unwrap(), b"note");
+    assert!(unlocked.material().is_err());
+}
+
+#[wasm_bindgen_test]
 fn diffs_and_ignores() {
     let local = r#"{"a.md":{"hash":"h","modified":1,"size":1,"deleted":false,"encPath":""}}"#;
     let diff = diff_manifests("{}", local, "{}").unwrap();
@@ -40,7 +68,7 @@ fn diffs_and_ignores() {
 // rules themselves are tested natively in core.
 #[wasm_bindgen_test]
 fn the_rest_of_the_surface_crosses_the_boundary() {
-    assert!(protocol_version() >= 2);
+    assert_eq!(protocol_version(), 3);
 
     let keys = VaultKeys::from_master(&[7u8; 32]).unwrap();
     assert_eq!(keys.content_hmac(b"x").len(), 64);

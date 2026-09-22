@@ -35,8 +35,11 @@ pub use auth::{
     MeUser, Session, SessionInfo, Usage, UserInfo, VaultUsage,
 };
 pub use crypto::{
-    content_hmac, decrypt, decrypt_path, derive_key, derive_keys, encrypt, encrypt_path,
-    path_token, CryptoError, CryptoKeys, KeyBytes, PROTOCOL_VERSION,
+    account_verifier, content_hmac, create_account_key, decode_base64, decrypt, decrypt_path,
+    derive_key, derive_keys, encode_base64, encrypt, encrypt_path, new_key, new_salt, path_token,
+    rewrap_account_key, unlock_account_key, unwrap_key, unwrap_vault_key, vault_wrap_key, wrap_key,
+    wrap_vault_key, AccountKeyMaterial, CryptoError, CryptoKeys, KeyBytes, PROTOCOL_VERSION,
+    SALT_LEN, WRAPPED_KEY_LEN,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use daemon::{
