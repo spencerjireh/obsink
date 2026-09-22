@@ -287,6 +287,14 @@ impl LocalVaultSummary {
 /// otherwise at build time (self-hosters) or at launch (tests, harnesses).
 const FALLBACK_SERVER_URL: &str = "https://obsink-api.spencerjireh.com";
 
+/// The website with the downloads; the tray's "Check for updates" opens it.
+/// There is no in-app updater: a menu-bar app with no Dock icon would
+/// otherwise never tell its user a newer version exists.
+const SITE_URL: &str = match option_env!("OBSINK_SITE_URL") {
+    Some(url) => url,
+    None => "https://obsink.spencerjireh.com",
+};
+
 /// The one server this app talks to. The UI never shows or edits it.
 fn default_server_url() -> String {
     let raw = std::env::var("OBSINK_SERVER_URL")
@@ -1610,9 +1618,16 @@ fn toggle_popover(app: &AppHandle, anchor: tauri::Rect) {
 fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     let sync_now = MenuItem::with_id(app, "sync_now", "Sync now", true, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "Open settings", true, None::<&str>)?;
+    let updates = MenuItem::with_id(
+        app,
+        "check_updates",
+        "Check for updates",
+        true,
+        None::<&str>,
+    )?;
     let separator = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "quit", "Quit ObSink", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&sync_now, &settings, &separator, &quit])?;
+    let menu = Menu::with_items(app, &[&sync_now, &settings, &updates, &separator, &quit])?;
 
     let builder = TrayIconBuilder::with_id("obsink-tray")
         .tooltip("ObSink")
@@ -1627,6 +1642,11 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
             }
             "settings" => {
                 let _ = show_settings(app, SettingsTarget::vaults());
+            }
+            "check_updates" => {
+                // The download page shows the latest release; the app's own
+                // version is in the settings window's Account tab.
+                let _ = tauri_plugin_opener::open_url(format!("{SITE_URL}/#mac"), None::<&str>);
             }
             "quit" => app.exit(0),
             _ => {}
@@ -1655,6 +1675,9 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
 
 fn main() {
     tauri::Builder::default()
+        // Opens the download page in the default browser (Rust side only; no
+        // capability exposes it to the webview).
+        .plugin(tauri_plugin_opener::init())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             add_vault,
