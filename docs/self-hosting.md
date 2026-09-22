@@ -133,6 +133,10 @@ knows an email address.
 - **Upgrade** by redeploying in Coolify: it pulls `main` and rebuilds `server/Dockerfile` from
   source; migrations run at startup
   (`OBSINK_MIGRATE_ON_START=1`). `obsink-server migrate` applies them by hand.
+- **Wire format v3** (accounts with one passphrase, devices, wrapped keys) replaced the initial
+  schema rather than migrating it. A database created before v3 fails the migration checksum at
+  startup: locally `docker compose down -v` before `up`; a production deployment is wiped at the
+  cutover (its clients cannot sign in to a v3 server anyway).
 - **Retention** runs at startup and daily; `obsink-server retention` runs one pass and prints what
   it removed.
 

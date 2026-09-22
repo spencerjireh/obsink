@@ -32,15 +32,15 @@ struct LockedVault {
 async fn lock_vault(
     conn: &mut PgConnection,
     vault_id: &str,
-    tenant: &str,
+    user_id: &str,
 ) -> Result<LockedVault, ApiError> {
     if !valid_vault_id(vault_id) {
         return Err(ApiError::not_found("vault not found"));
     }
     let row =
-        sqlx::query("SELECT max_file_size FROM vaults WHERE id = $1 AND tenant = $2 FOR UPDATE")
+        sqlx::query("SELECT max_file_size FROM vaults WHERE id = $1 AND owner = $2 FOR UPDATE")
             .bind(vault_id)
-            .bind(tenant)
+            .bind(user_id)
             .fetch_optional(conn)
             .await?
             .ok_or_else(|| ApiError::not_found("vault not found"))?;
@@ -52,15 +52,15 @@ async fn lock_vault(
 async fn require_vault(
     conn: &mut PgConnection,
     vault_id: &str,
-    tenant: &str,
+    user_id: &str,
 ) -> Result<(), ApiError> {
     if !valid_vault_id(vault_id) {
         return Err(ApiError::not_found("vault not found"));
     }
     let exists: Option<(i32,)> =
-        sqlx::query_as("SELECT 1 FROM vaults WHERE id = $1 AND tenant = $2")
+        sqlx::query_as("SELECT 1 FROM vaults WHERE id = $1 AND owner = $2")
             .bind(vault_id)
-            .bind(tenant)
+            .bind(user_id)
             .fetch_optional(conn)
             .await?;
     exists
@@ -150,7 +150,7 @@ pub async fn apply_put(
     let size = body.len() as u64;
 
     let mut tx = state.pool.begin().await?;
-    let vault = lock_vault(&mut tx, params.vault_id, principal.tenant()).await?;
+    let vault = lock_vault(&mut tx, params.vault_id, &principal.user_id).await?;
     let current = current_entry(&mut tx, params.vault_id, params.path).await?;
     if size > vault.max_file_size {
         return Err(ApiError::status(
@@ -158,20 +158,18 @@ pub async fn apply_put(
             "file too large",
         ));
     }
-    if principal.is_user() {
-        let (used,): (i64,) = sqlx::query_as(
-            "SELECT COALESCE(SUM(size), 0)::BIGINT FROM files WHERE vault_id = $1 AND NOT deleted AND path <> $2",
-        )
-        .bind(params.vault_id)
-        .bind(params.path)
-        .fetch_one(&mut *tx)
-        .await?;
-        if db::to_u64(used) + size > state.config.max_vault_bytes {
-            return Err(ApiError::status(
-                StatusCode::INSUFFICIENT_STORAGE,
-                QUOTA_MESSAGE,
-            ));
-        }
+    let (used,): (i64,) = sqlx::query_as(
+        "SELECT COALESCE(SUM(size), 0)::BIGINT FROM files WHERE vault_id = $1 AND NOT deleted AND path <> $2",
+    )
+    .bind(params.vault_id)
+    .bind(params.path)
+    .fetch_one(&mut *tx)
+    .await?;
+    if db::to_u64(used) + size > state.config.max_vault_bytes {
+        return Err(ApiError::status(
+            StatusCode::INSUFFICIENT_STORAGE,
+            QUOTA_MESSAGE,
+        ));
     }
     if let Some(current) = &current {
         if current.hash != params.parent_hash.unwrap_or("") {
@@ -248,7 +246,7 @@ pub async fn apply_delete(
     }
     let now = db::now();
     let mut tx = state.pool.begin().await?;
-    lock_vault(&mut tx, vault_id, principal.tenant()).await?;
+    lock_vault(&mut tx, vault_id, &principal.user_id).await?;
     let current = current_entry(&mut tx, vault_id, path).await?;
     if let Some(current) = &current {
         if current.hash != parent_hash.unwrap_or("") {
@@ -328,9 +326,9 @@ pub async fn get_manifest(
         .execute(&mut *tx)
         .await?;
     let revision: Option<(i64,)> =
-        sqlx::query_as("SELECT revision FROM vaults WHERE id = $1 AND tenant = $2")
+        sqlx::query_as("SELECT revision FROM vaults WHERE id = $1 AND owner = $2")
             .bind(&vault_id)
-            .bind(principal.tenant())
+            .bind(&principal.user_id)
             .fetch_optional(&mut *tx)
             .await?;
     let (revision,) = revision.ok_or_else(|| ApiError::not_found("vault not found"))?;
@@ -376,7 +374,7 @@ pub async fn get_file(
 ) -> Result<Response, ApiError> {
     {
         let mut conn = state.pool.acquire().await?;
-        require_vault(&mut conn, &vault_id, principal.tenant()).await?;
+        require_vault(&mut conn, &vault_id, &principal.user_id).await?;
     }
     if !valid_path(&path) {
         return Err(ApiError::not_found("not_found"));

@@ -1,6 +1,6 @@
 mod common;
 
-use common::{TestEnv, API_KEY};
+use common::TestEnv;
 use reqwest::{
     multipart::{Form, Part},
     Method,
@@ -26,7 +26,7 @@ fn form(ops: serde_json::Value, contents: &[(usize, &[u8])]) -> Form {
 }
 
 async fn send(env: &TestEnv, vault: &str, form: Form) -> reqwest::Response {
-    env.operator(Method::POST, &format!("/vaults/{vault}/batch"))
+    env.owner(Method::POST, &format!("/vaults/{vault}/batch"))
         .multipart(form)
         .send()
         .await
@@ -35,12 +35,12 @@ async fn send(env: &TestEnv, vault: &str, form: Form) -> reqwest::Response {
 
 #[tokio::test]
 async fn batch_handles_mixed_results() {
-    let Some(env) = TestEnv::try_new().await else {
+    let Some(env) = TestEnv::try_with_owner().await else {
         return;
     };
-    let id = env.create_vault(API_KEY, "notes").await;
+    let id = env.create_vault(env.owner_token(), "notes").await;
     let seed = env
-        .operator(Method::PUT, &format!("/vaults/{id}/files/note.md"))
+        .owner(Method::PUT, &format!("/vaults/{id}/files/note.md"))
         .header("X-Content-Hash", "hash-1")
         .body("v1")
         .send()
@@ -66,7 +66,7 @@ async fn batch_handles_mixed_results() {
     assert!(body["results"][1]["conflict"].is_null());
 
     let manifest: serde_json::Value = env
-        .operator(Method::GET, &format!("/vaults/{id}/manifest"))
+        .owner(Method::GET, &format!("/vaults/{id}/manifest"))
         .send()
         .await
         .unwrap()
@@ -77,7 +77,7 @@ async fn batch_handles_mixed_results() {
     assert_eq!(manifest["fresh.md"]["hash"], "hash-3");
     assert_eq!(manifest["fresh.md"]["encPath"], "enc-fresh");
     let file = env
-        .operator(Method::GET, &format!("/vaults/{id}/files/fresh.md"))
+        .owner(Method::GET, &format!("/vaults/{id}/files/fresh.md"))
         .send()
         .await
         .unwrap();
@@ -87,10 +87,10 @@ async fn batch_handles_mixed_results() {
 
 #[tokio::test]
 async fn batch_handles_delete_operations() {
-    let Some(env) = TestEnv::try_new().await else {
+    let Some(env) = TestEnv::try_with_owner().await else {
         return;
     };
-    let id = env.create_vault(API_KEY, "notes").await;
+    let id = env.create_vault(env.owner_token(), "notes").await;
     let ops = serde_json::json!([
         { "action": "put", "path": "a", "contentHash": "ha" },
         { "action": "delete", "path": "a", "parentHash": "ha" },
@@ -108,7 +108,7 @@ async fn batch_handles_delete_operations() {
         .collect();
     assert_eq!(statuses, vec![200, 200, 200, 400]);
     let manifest: serde_json::Value = env
-        .operator(Method::GET, &format!("/vaults/{id}/manifest"))
+        .owner(Method::GET, &format!("/vaults/{id}/manifest"))
         .send()
         .await
         .unwrap()
@@ -139,12 +139,12 @@ async fn batch_handles_delete_operations() {
 
 #[tokio::test]
 async fn batch_rejects_unknown_actions_without_touching_files() {
-    let Some(env) = TestEnv::try_new().await else {
+    let Some(env) = TestEnv::try_with_owner().await else {
         return;
     };
-    let id = env.create_vault(API_KEY, "notes").await;
+    let id = env.create_vault(env.owner_token(), "notes").await;
     let seed = env
-        .operator(Method::PUT, &format!("/vaults/{id}/files/note.md"))
+        .owner(Method::PUT, &format!("/vaults/{id}/files/note.md"))
         .header("X-Content-Hash", "hash-1")
         .header("X-Enc-Path", "enc-note")
         .body("v1")
@@ -164,7 +164,7 @@ async fn batch_rejects_unknown_actions_without_touching_files() {
         assert_eq!(response.status(), 400);
     }
     let manifest: serde_json::Value = env
-        .operator(Method::GET, &format!("/vaults/{id}/manifest"))
+        .owner(Method::GET, &format!("/vaults/{id}/manifest"))
         .send()
         .await
         .unwrap()
@@ -178,12 +178,12 @@ async fn batch_rejects_unknown_actions_without_touching_files() {
 
 #[tokio::test]
 async fn batch_rejects_non_multipart_with_415() {
-    let Some(env) = TestEnv::try_new().await else {
+    let Some(env) = TestEnv::try_with_owner().await else {
         return;
     };
-    let id = env.create_vault(API_KEY, "notes").await;
+    let id = env.create_vault(env.owner_token(), "notes").await;
     let response = env
-        .operator(Method::POST, &format!("/vaults/{id}/batch"))
+        .owner(Method::POST, &format!("/vaults/{id}/batch"))
         .json(&serde_json::json!({ "operations": [] }))
         .send()
         .await
@@ -198,10 +198,10 @@ async fn batch_rejects_non_multipart_with_415() {
 
 #[tokio::test]
 async fn batch_rejects_missing_content_part_with_400() {
-    let Some(env) = TestEnv::try_new().await else {
+    let Some(env) = TestEnv::try_with_owner().await else {
         return;
     };
-    let id = env.create_vault(API_KEY, "notes").await;
+    let id = env.create_vault(env.owner_token(), "notes").await;
     let ops = serde_json::json!([{ "action": "put", "path": "a", "contentHash": "h" }]);
     let missing = send(&env, &id, form(ops.clone(), &[])).await;
     assert_eq!(missing.status(), 400);
@@ -241,10 +241,10 @@ async fn batch_rejects_missing_content_part_with_400() {
 
 #[tokio::test]
 async fn batch_body_limit_returns_413() {
-    let Some(env) = TestEnv::try_with(|config| config.max_batch_bytes = 512).await else {
+    let Some(env) = TestEnv::try_with_owner_and(|config| config.max_batch_bytes = 512).await else {
         return;
     };
-    let id = env.create_vault(API_KEY, "notes").await;
+    let id = env.create_vault(env.owner_token(), "notes").await;
     let ops = serde_json::json!([{ "action": "put", "path": "a", "contentHash": "h" }]);
     let big = vec![b'x'; 4096];
     let response = send(&env, &id, form(ops, &[(0, &big)])).await;

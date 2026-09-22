@@ -7,7 +7,7 @@ pub mod vaults;
 
 use axum::{
     extract::{DefaultBodyLimit, State},
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post, put},
     Json, Router,
 };
 use serde::Serialize;
@@ -18,6 +18,9 @@ use crate::{auth, error::ApiError, AppState};
 #[derive(Serialize)]
 pub struct Capabilities {
     pub service: &'static str,
+    /// The wire format this server speaks; a client built for another one
+    /// shows `Update ObSink` and stops.
+    pub protocol: u32,
     pub auth: AuthMethods,
     /// True once the server has any account: new sign-ups then need an invite.
     pub invite_required: bool,
@@ -27,7 +30,6 @@ pub struct Capabilities {
 pub struct AuthMethods {
     pub email: bool,
     pub apple: bool,
-    pub api_key: bool,
 }
 
 async fn capabilities(State(state): State<AppState>) -> Result<Json<Capabilities>, ApiError> {
@@ -36,10 +38,10 @@ async fn capabilities(State(state): State<AppState>) -> Result<Json<Capabilities
         .await?;
     Ok(Json(Capabilities {
         service: "obsink",
+        protocol: obsink_core::PROTOCOL_VERSION,
         auth: AuthMethods {
             email: state.config.email_enabled(),
             apple: state.config.apple_enabled(),
-            api_key: state.config.api_key.is_some(),
         },
         invite_required: users > 0,
     }))
@@ -80,8 +82,14 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/email/verify", post(auth::email::verify))
         .route("/auth/apple", post(auth::apple::sign_in))
         .route("/auth/me", get(me::me))
+        .route("/auth/keys", get(auth::keys::get).put(auth::keys::set))
+        .route("/auth/keys/rewrap", put(auth::keys::rewrap))
         .route("/auth/session", delete(me::sign_out))
         .route("/auth/sessions/{session_id}", delete(me::revoke_session))
+        .route(
+            "/auth/devices/{device_id}",
+            patch(me::rename_device).delete(me::revoke_device),
+        )
         .route("/auth/account", delete(me::delete_account))
         .route(
             "/auth/invites",

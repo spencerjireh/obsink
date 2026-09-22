@@ -3,7 +3,7 @@
 # its own defaults (dev-operator-key, Mailpit); it does not read .env.deploy.
 #
 #   docker compose up -d --wait      # OBSINK_PORT=18080 if 8080 is taken
-#   OBSINK_SERVER_URL=http://localhost:8080 OBSINK_API_KEY=dev-operator-key scripts/verify-server-deploy.sh
+#   OBSINK_SERVER_URL=http://localhost:8080 scripts/verify-server-deploy.sh
 #
 # AUTH_DEV_RETURN_CODE=1 makes /auth/email/start return the code inline so
 # harnesses can sign in without reading mail. Never set it in production.
@@ -18,7 +18,6 @@ services:
       - "${OBSINK_PORT:-8080}:8080"
     environment:
       DATABASE_URL: postgres://obsink:obsink@postgres:5432/obsink
-      OBSINK_API_KEY: ${OBSINK_API_KEY:-dev-operator-key}
       OBSINK_SERVER_KEY: ${OBSINK_SERVER_KEY:-}
       AUTH_DEV_RETURN_CODE: "1"
       SMTP_HOST: mailpit

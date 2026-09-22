@@ -2,7 +2,7 @@ mod common;
 
 use std::fs;
 
-use common::{TestEnv, API_KEY};
+use common::TestEnv;
 use obsink_server::{
     blobs::Tier,
     retention::{self, ORPHAN_GRACE_SECS, TRASH_RETENTION_SECS, VERSION_RETENTION_SECS},
@@ -23,10 +23,10 @@ fn seed(env: &TestEnv, tier: Tier, vault: &str, path: &str, timestamps: &[u64]) 
 
 #[tokio::test]
 async fn prunes_versions_beyond_the_newest_ten_per_file() {
-    let Some(env) = TestEnv::try_new().await else {
+    let Some(env) = TestEnv::try_with_owner().await else {
         return;
     };
-    let vault = env.create_vault(API_KEY, "v").await;
+    let vault = env.create_vault(env.owner_token(), "v").await;
     let timestamps: Vec<u64> = (1..=12).map(|i| 1_000_000 + i).collect();
     seed(&env, Tier::Versions, &vault, "note", &timestamps);
     let report = retention::run_once(&env.state, 1_000_100).await.unwrap();
@@ -45,10 +45,10 @@ async fn prunes_versions_beyond_the_newest_ten_per_file() {
 
 #[tokio::test]
 async fn prunes_versions_older_than_the_retention_window() {
-    let Some(env) = TestEnv::try_new().await else {
+    let Some(env) = TestEnv::try_with_owner().await else {
         return;
     };
-    let vault = env.create_vault(API_KEY, "v").await;
+    let vault = env.create_vault(env.owner_token(), "v").await;
     let now = VERSION_RETENTION_SECS + 5;
     seed(
         &env,
@@ -71,10 +71,10 @@ async fn prunes_versions_older_than_the_retention_window() {
 
 #[tokio::test]
 async fn prunes_trash_entries_older_than_the_retention_window() {
-    let Some(env) = TestEnv::try_new().await else {
+    let Some(env) = TestEnv::try_with_owner().await else {
         return;
     };
-    let vault = env.create_vault(API_KEY, "v").await;
+    let vault = env.create_vault(env.owner_token(), "v").await;
     let now = TRASH_RETENTION_SECS + 5;
     seed(
         &env,
@@ -107,10 +107,10 @@ async fn prunes_trash_entries_older_than_the_retention_window() {
 
 #[tokio::test]
 async fn prunes_expired_sessions_and_codes() {
-    let Some(env) = TestEnv::try_new().await else {
+    let Some(env) = TestEnv::try_with_owner().await else {
         return;
     };
-    let token = env.email_token("r@example.com", "d", None).await;
+    let token = env.invited("r@example.com", "d").await.token;
     sqlx::query("UPDATE sessions SET expires = 1")
         .execute(&env.state.pool)
         .await
@@ -122,10 +122,12 @@ async fn prunes_expired_sessions_and_codes() {
     let report = retention::run_once(&env.state, obsink_server::db::now())
         .await
         .unwrap();
-    assert_eq!(report.sessions_removed, 1);
-    assert_eq!(report.codes_removed, 1);
+    assert_eq!(report.sessions_removed, 2);
+    assert_eq!(report.codes_removed, 2);
     assert_eq!(env.table_count("sessions").await, 0);
     assert_eq!(env.table_count("email_codes").await, 0);
+    // Devices outlive their sessions: the user sees and removes them.
+    assert_eq!(env.table_count("devices").await, 2);
     let _ = token;
     env.finish().await;
 }
@@ -139,10 +141,10 @@ fn age_vault_dir(env: &TestEnv, tier: Tier, vault: &str) {
 
 #[tokio::test]
 async fn removes_orphaned_vault_directories() {
-    let Some(env) = TestEnv::try_new().await else {
+    let Some(env) = TestEnv::try_with_owner().await else {
         return;
     };
-    let real = env.create_vault(API_KEY, "real").await;
+    let real = env.create_vault(env.owner_token(), "real").await;
     env.state.blobs.put_live(&real, "tok", b"x").unwrap();
     seed(&env, Tier::Trash, VAULT, "tok", &[1]);
     env.state.blobs.put_live(VAULT, "tok", b"x").unwrap();

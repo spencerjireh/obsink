@@ -1,6 +1,6 @@
 mod common;
 
-use common::{TestEnv, API_KEY};
+use common::TestEnv;
 use obsink_server::blobs::Tier;
 use reqwest::Method;
 
@@ -12,7 +12,7 @@ async fn put(
     headers: &[(&str, &str)],
 ) -> reqwest::Response {
     let mut request = env
-        .operator(Method::PUT, &format!("/vaults/{vault}/files/{path}"))
+        .owner(Method::PUT, &format!("/vaults/{vault}/files/{path}"))
         .body(body.to_string());
     for (name, value) in headers {
         request = request.header(*name, *value);
@@ -22,7 +22,7 @@ async fn put(
 
 async fn manifest(env: &TestEnv, vault: &str) -> serde_json::Value {
     let response = env
-        .operator(Method::GET, &format!("/vaults/{vault}/manifest"))
+        .owner(Method::GET, &format!("/vaults/{vault}/manifest"))
         .send()
         .await
         .unwrap();
@@ -32,10 +32,10 @@ async fn manifest(env: &TestEnv, vault: &str) -> serde_json::Value {
 
 #[tokio::test]
 async fn returns_manifests_and_file_blobs_for_an_existing_vault() {
-    let Some(env) = TestEnv::try_new().await else {
+    let Some(env) = TestEnv::try_with_owner().await else {
         return;
     };
-    let id = env.create_vault(API_KEY, "notes").await;
+    let id = env.create_vault(env.owner_token(), "notes").await;
     assert_eq!(manifest(&env, &id).await, serde_json::json!({}));
 
     let response = put(
@@ -55,7 +55,7 @@ async fn returns_manifests_and_file_blobs_for_an_existing_vault() {
     assert_eq!(m["note.md"]["encPath"], "enc");
 
     let file = env
-        .operator(Method::GET, &format!("/vaults/{id}/files/note.md"))
+        .owner(Method::GET, &format!("/vaults/{id}/files/note.md"))
         .send()
         .await
         .unwrap();
@@ -70,13 +70,13 @@ async fn returns_manifests_and_file_blobs_for_an_existing_vault() {
     assert!(sealed.starts_with(b"OBSK"));
 
     let missing = env
-        .operator(Method::GET, &format!("/vaults/{id}/files/nope.md"))
+        .owner(Method::GET, &format!("/vaults/{id}/files/nope.md"))
         .send()
         .await
         .unwrap();
     assert_eq!(missing.status(), 404);
     let other_vault = env
-        .operator(
+        .owner(
             Method::GET,
             "/vaults/vault_00000000-0000-4000-8000-000000000000/manifest",
         )
@@ -93,10 +93,10 @@ async fn returns_manifests_and_file_blobs_for_an_existing_vault() {
 
 #[tokio::test]
 async fn returns_conflict_on_stale_parent_hash() {
-    let Some(env) = TestEnv::try_new().await else {
+    let Some(env) = TestEnv::try_with_owner().await else {
         return;
     };
-    let id = env.create_vault(API_KEY, "notes").await;
+    let id = env.create_vault(env.owner_token(), "notes").await;
     assert_eq!(
         put(&env, &id, "note.md", "v1", &[("X-Content-Hash", "hash-1")])
             .await
@@ -144,7 +144,7 @@ async fn returns_conflict_on_stale_parent_hash() {
     );
 
     // The core client maps the 409 body into ApiError::Conflict.
-    let client = env.api_client(API_KEY, &id);
+    let client = env.api_client(env.owner_token(), &id);
     let keys = obsink_core::derive_keys(&[1u8; 32]);
     let err = client
         .put_file(
@@ -164,10 +164,10 @@ async fn returns_conflict_on_stale_parent_hash() {
 
 #[tokio::test]
 async fn soft_deletes_files_into_trash_and_marks_manifest_entries_as_deleted() {
-    let Some(env) = TestEnv::try_new().await else {
+    let Some(env) = TestEnv::try_with_owner().await else {
         return;
     };
-    let id = env.create_vault(API_KEY, "notes").await;
+    let id = env.create_vault(env.owner_token(), "notes").await;
     assert_eq!(
         put(
             &env,
@@ -182,7 +182,7 @@ async fn soft_deletes_files_into_trash_and_marks_manifest_entries_as_deleted() {
     );
 
     let stale = env
-        .operator(Method::DELETE, &format!("/vaults/{id}/files/note.md"))
+        .owner(Method::DELETE, &format!("/vaults/{id}/files/note.md"))
         .header("X-Parent-Hash", "nope")
         .send()
         .await
@@ -190,7 +190,7 @@ async fn soft_deletes_files_into_trash_and_marks_manifest_entries_as_deleted() {
     assert_eq!(stale.status(), 409);
 
     let ok = env
-        .operator(Method::DELETE, &format!("/vaults/{id}/files/note.md"))
+        .owner(Method::DELETE, &format!("/vaults/{id}/files/note.md"))
         .header("X-Parent-Hash", "hash-1")
         .send()
         .await
@@ -210,7 +210,7 @@ async fn soft_deletes_files_into_trash_and_marks_manifest_entries_as_deleted() {
     assert_eq!(m["note.md"]["hash"], "hash-1");
     assert_eq!(m["note.md"]["size"], 5);
     let gone = env
-        .operator(Method::GET, &format!("/vaults/{id}/files/note.md"))
+        .owner(Method::GET, &format!("/vaults/{id}/files/note.md"))
         .send()
         .await
         .unwrap();
@@ -218,7 +218,7 @@ async fn soft_deletes_files_into_trash_and_marks_manifest_entries_as_deleted() {
 
     // Deleting a path that never existed leaves an empty tombstone (Worker parity).
     let ghost = env
-        .operator(Method::DELETE, &format!("/vaults/{id}/files/ghost.md"))
+        .owner(Method::DELETE, &format!("/vaults/{id}/files/ghost.md"))
         .send()
         .await
         .unwrap();
@@ -241,10 +241,10 @@ async fn soft_deletes_files_into_trash_and_marks_manifest_entries_as_deleted() {
 
 #[tokio::test]
 async fn stores_the_encrypted_path_on_upload_and_preserves_it_through_a_delete() {
-    let Some(env) = TestEnv::try_new().await else {
+    let Some(env) = TestEnv::try_with_owner().await else {
         return;
     };
-    let id = env.create_vault(API_KEY, "notes").await;
+    let id = env.create_vault(env.owner_token(), "notes").await;
     assert_eq!(
         put(
             &env,
@@ -272,7 +272,7 @@ async fn stores_the_encrypted_path_on_upload_and_preserves_it_through_a_delete()
     );
     assert_eq!(manifest(&env, &id).await["tok"]["encPath"], "enc-1");
     let del = env
-        .operator(Method::DELETE, &format!("/vaults/{id}/files/tok"))
+        .owner(Method::DELETE, &format!("/vaults/{id}/files/tok"))
         .header("X-Parent-Hash", "h2")
         .send()
         .await
@@ -286,11 +286,11 @@ async fn stores_the_encrypted_path_on_upload_and_preserves_it_through_a_delete()
 
 #[tokio::test]
 async fn rejects_uploads_larger_than_the_configured_max_file_size() {
-    let Some(env) = TestEnv::try_new().await else {
+    let Some(env) = TestEnv::try_with_owner().await else {
         return;
     };
     let response = env
-        .operator(Method::POST, "/vaults")
+        .owner(Method::POST, "/vaults")
         .json(&serde_json::json!({ "name": "tiny", "max_file_size": 4 }))
         .send()
         .await
@@ -323,10 +323,10 @@ async fn rejects_uploads_larger_than_the_configured_max_file_size() {
 
 #[tokio::test]
 async fn concurrent_puts_to_one_path_yield_exactly_one_winner() {
-    let Some(env) = TestEnv::try_new().await else {
+    let Some(env) = TestEnv::try_with_owner().await else {
         return;
     };
-    let id = env.create_vault(API_KEY, "race").await;
+    let id = env.create_vault(env.owner_token(), "race").await;
     assert_eq!(
         put(&env, &id, "tok", "base", &[("X-Content-Hash", "h0")])
             .await
@@ -337,10 +337,11 @@ async fn concurrent_puts_to_one_path_yield_exactly_one_winner() {
     for i in 0..8 {
         let env_url = env.url(&format!("/vaults/{id}/files/tok"));
         let client = env.http.clone();
+        let token = env.owner_token().to_string();
         handles.push(tokio::spawn(async move {
             client
                 .put(env_url)
-                .bearer_auth(API_KEY)
+                .bearer_auth(token)
                 .header("X-Parent-Hash", "h0")
                 .header("X-Content-Hash", format!("h{}", i + 1))
                 .body(format!("v{i}"))

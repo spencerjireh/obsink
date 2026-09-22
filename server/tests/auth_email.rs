@@ -34,12 +34,13 @@ async fn advertises_configured_sign_in_methods_without_auth() {
         body,
         serde_json::json!({
             "service": "obsink",
-            "auth": { "email": false, "apple": true, "api_key": true },
+            "protocol": obsink_core::PROTOCOL_VERSION,
+            "auth": { "email": false, "apple": true },
             "invite_required": false
         })
     );
     let caps = env.auth_client().capabilities().await.unwrap();
-    assert!(!caps.auth.email && caps.auth.apple && caps.auth.api_key);
+    assert!(!caps.auth.email && caps.auth.apple && !caps.auth.api_key);
     env.finish().await;
 }
 
@@ -74,7 +75,7 @@ async fn issues_a_session_for_a_valid_code_and_rejects_a_wrong_one() {
 
     let ok = env
         .req(Method::POST, "/auth/email/verify")
-        .json(&serde_json::json!({ "email": "person@example.com", "code": format!(" {code} "), "device_name": "iPhone" }))
+        .json(&serde_json::json!({ "email": "person@example.com", "code": format!(" {code} "), "device": { "id": "phone-1", "name": "iPhone", "platform": "ios" } }))
         .send()
         .await
         .unwrap();
@@ -87,6 +88,7 @@ async fn issues_a_session_for_a_valid_code_and_rejects_a_wrong_one() {
         .as_str()
         .unwrap()
         .starts_with("ses_"));
+    assert_eq!(session["session"]["device_id"], "phone-1");
 
     // Single use.
     let reuse = env
@@ -108,18 +110,26 @@ async fn issues_a_session_for_a_valid_code_and_rejects_a_wrong_one() {
         .unwrap();
     assert_eq!(me.status(), 200);
     let me: serde_json::Value = me.json().await.unwrap();
-    assert_eq!(me["kind"], "user");
+    assert!(me.get("kind").is_none(), "one principal, no kind");
     assert_eq!(me["user"]["email"], "person@example.com");
-    assert_eq!(me["sessions"].as_array().unwrap().len(), 1);
-    assert_eq!(me["sessions"][0]["deviceName"], "iPhone");
-    assert_eq!(me["sessions"][0]["current"], true);
+    assert_eq!(me["devices"].as_array().unwrap().len(), 1);
+    assert_eq!(me["devices"][0]["id"], "phone-1");
+    assert_eq!(me["devices"][0]["name"], "iPhone");
+    assert_eq!(me["devices"][0]["platform"], "ios");
+    assert_eq!(me["devices"][0]["current"], true);
+    assert!(me["devices"][0]["vault_ids"].as_array().unwrap().is_empty());
     assert_eq!(me["usage"]["total_bytes"], 0);
     assert_eq!(me["usage"]["max_vaults"], 10);
 
-    // The core AuthClient understands the same responses.
+    // The core AuthClient (still the v2 shape) parses the response: `kind`
+    // and `sessions` default until OBS-136 moves it to devices.
     let core_me = env.auth_client().me(&token).await.unwrap();
-    assert_eq!(core_me.kind, "user");
-    assert_eq!(core_me.sessions[0].device_name, "iPhone");
+    assert_eq!(core_me.kind, "");
+    assert!(core_me.sessions.is_empty());
+    assert_eq!(
+        core_me.user.unwrap().email.as_deref(),
+        Some("person@example.com")
+    );
     env.finish().await;
 }
 
@@ -234,7 +244,7 @@ async fn returns_the_same_account_on_repeat_sign_in() {
         .json()
         .await
         .unwrap();
-    assert_eq!(me["sessions"].as_array().unwrap().len(), 2);
+    assert_eq!(me["devices"].as_array().unwrap().len(), 2);
     let me_first: serde_json::Value = env
         .with_token(&first, Method::GET, "/auth/me")
         .send()

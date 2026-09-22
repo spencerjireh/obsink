@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{PgConnection, Row};
 
 use crate::{
-    auth::{account, account::Identity, sessions, sessions::SessionResponse},
+    auth::{account, account::Identity, devices, devices::DeviceBody, sessions::SessionResponse},
     config::{SmtpConfig, SmtpTls},
     db,
     error::{ApiError, AppJson},
@@ -110,6 +110,9 @@ pub struct StartResponse {
 pub struct VerifyBody {
     pub email: Option<String>,
     pub code: Option<String>,
+    /// The signing-in device (spec §4.1). A v2 client sends `device_name`
+    /// instead and gets a synthesized device until OBS-143.
+    pub device: Option<DeviceBody>,
     pub device_name: Option<String>,
     pub invite_code: Option<String>,
 }
@@ -313,7 +316,10 @@ pub async fn verify(
         return Err(error);
     }
 
-    let device = sessions::clean_device_name(body.device_name.as_deref());
+    let device = match body.device {
+        Some(device) => device.validate()?,
+        None => devices::legacy_device(body.device_name.as_deref()),
+    };
     let session = account::sign_in(
         &state,
         &mut tx,
