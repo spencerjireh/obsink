@@ -2,6 +2,7 @@
 
 pub mod batch;
 pub mod files;
+pub mod history;
 pub mod me;
 pub mod vaults;
 
@@ -74,6 +75,17 @@ pub fn router(state: AppState) -> Router {
     let batch_routes = Router::new()
         .route("/vaults/{vault_id}/batch", post(batch::batch))
         .layer(DefaultBodyLimit::max(max_batch));
+    let history_routes = Router::new()
+        .route(
+            "/vaults/{vault_id}/history/{*path}",
+            get(history::list_versions),
+        )
+        .route(
+            "/vaults/{vault_id}/versions/{name}/{*path}",
+            get(history::get_version),
+        )
+        .route("/vaults/{vault_id}/trash", get(history::list_trash))
+        .route("/vaults/{vault_id}/trash/{*path}", get(history::get_trash));
 
     Router::new()
         .route("/", get(capabilities))
@@ -107,6 +119,7 @@ pub fn router(state: AppState) -> Router {
         .route("/vaults/{vault_id}/manifest", get(files::get_manifest))
         .merge(file_routes)
         .merge(batch_routes)
+        .merge(history_routes)
         .fallback(not_found)
         .method_not_allowed_fallback(not_found)
         .layer(TraceLayer::new_for_http())

@@ -240,8 +240,50 @@ impl BlobStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
             Err(error) => return Err(error),
         };
-        names.sort_by_key(|name| std::cmp::Reverse(extract_timestamp(name)));
+        // `<unix>[-n]`: two archives in one second differ by the suffix, and
+        // the later one has the higher suffix.
+        names.sort_by_key(|name| std::cmp::Reverse(history_order(name)));
         Ok(names)
+    }
+
+    /// The stored history entries for a path, newest first, with the sealed
+    /// size of each (the read side of spec §8.2 and §9.3).
+    pub fn history_entries(
+        &self,
+        tier: Tier,
+        vault_id: &str,
+        path: &str,
+    ) -> io::Result<Vec<HistoryEntry>> {
+        let dir = self.history_dir(tier, vault_id, path);
+        self.list_history(tier, vault_id, path)?
+            .into_iter()
+            .map(|name| {
+                let size = fs::metadata(dir.join(&name))?.len();
+                Ok(HistoryEntry {
+                    ts: extract_timestamp(&name),
+                    name,
+                    size,
+                })
+            })
+            .collect()
+    }
+
+    /// One history entry's sealed bytes, by the name `history_entries` gave.
+    pub fn get_history(
+        &self,
+        tier: Tier,
+        vault_id: &str,
+        path: &str,
+        name: &str,
+    ) -> io::Result<Option<Vec<u8>>> {
+        if !valid_history_name(name) {
+            return Ok(None);
+        }
+        match fs::read(self.history_dir(tier, vault_id, path).join(name)) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     /// Vault directories present under a tier (for orphan sweeps).
@@ -258,6 +300,24 @@ impl BlobStore {
     }
 }
 
+/// One archived version or trashed copy of a file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryEntry {
+    /// The directory entry, `<unix>[-n]`; what the blob route takes.
+    pub name: String,
+    pub ts: u64,
+    /// The sealed size on disk (the client blob plus the envelope).
+    pub size: u64,
+}
+
+/// History entry names are `<unix>[-n]`; anything else could walk the tree.
+fn valid_history_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 32
+        && name.chars().all(|c| c.is_ascii_digit() || c == '-')
+        && !name.starts_with('-')
+}
+
 pub fn remove_dir_if_present(dir: &Path) -> io::Result<()> {
     match fs::remove_dir_all(dir) {
         Ok(()) => Ok(()),
@@ -267,6 +327,15 @@ pub fn remove_dir_if_present(dir: &Path) -> io::Result<()> {
 }
 
 /// Leading digits of a history file name (`<unix>` or `<unix>-<n>`), 0 if none.
+/// The (timestamp, suffix) pair a history entry name sorts by.
+fn history_order(name: &str) -> (u64, u64) {
+    let suffix = name
+        .split_once('-')
+        .and_then(|(_, n)| n.parse().ok())
+        .unwrap_or(0);
+    (extract_timestamp(name), suffix)
+}
+
 pub fn extract_timestamp(name: &str) -> u64 {
     let digits: String = name.chars().take_while(|c| c.is_ascii_digit()).collect();
     digits.parse().unwrap_or(0)
