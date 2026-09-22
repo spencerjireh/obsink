@@ -4,8 +4,8 @@
 # ///
 """TestFlight helper on the App Store Connect API (run with `uv run`).
 
-Credentials come from the gitignored .env (ASC_KEY_ID, ASC_ISSUER_ID,
-ASC_KEY_PATH); source it first: `set -a; . ./.env; set +a`.
+Credentials come from the gitignored .env.deploy (ASC_KEY_ID, ASC_ISSUER_ID,
+ASC_KEY_PATH); source it first: `set -a; . ./.env.deploy; set +a`.
 
   uv run scripts/testflight.py status
       Latest builds for the app and their processing state.

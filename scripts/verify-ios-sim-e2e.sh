@@ -8,7 +8,7 @@
 # On-disk state on the iOS side is verified straight through the app-group
 # container (`simctl get_app_container … groups`), which the host can read.
 #
-# Requires: .env at the repo root (OBSINK_SERVER_URL, OBSINK_API_KEY,
+# Requires: .env.deploy at the repo root (OBSINK_SERVER_URL, OBSINK_API_KEY,
 # DEVELOPMENT_TEAM), a server reachable at OBSINK_SERVER_URL started with the
 # same OBSINK_API_KEY (e.g. `docker compose up -d`), a built xcframework +
 # generated project (scripts/build-ios.sh), and Xcode.
@@ -31,7 +31,7 @@ APP_BUNDLE_ID="com.obsink.ios"
 
 mkdir -p "$WORK"
 exec > >(tee "$WORK/run.log") 2>&1
-set -a; . "$REPO_ROOT/.env"; set +a
+set -a; . "$REPO_ROOT/.env.deploy"; set +a
 export DEVELOPMENT_TEAM="${DEVELOPMENT_TEAM:-}"
 # Baked into the app by xcodegen below; the UI tests also pass it at launch
 # (OBSINK_UITEST_SERVER_URL), so the phases do not depend on the baked value.

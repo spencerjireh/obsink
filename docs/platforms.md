@@ -136,7 +136,7 @@ xcodebuild test -project ios/ObSink.xcodeproj -scheme ObSink -sdk iphonesimulato
 The Mac↔iOS scenarios are automated end to end on a simulator against a running server (start one with `docker compose up -d`):
 
 ```bash
-# Uses .env (OBSINK_SERVER_URL, OBSINK_API_KEY, DEVELOPMENT_TEAM) and a throwaway vault.
+# Uses .env.deploy (OBSINK_SERVER_URL, OBSINK_API_KEY, DEVELOPMENT_TEAM) and a throwaway vault.
 OBSINK_SIM_NAME=obsink-e2e ./scripts/verify-ios-sim-e2e.sh
 ```
 
@@ -161,10 +161,10 @@ loading).
 ### TestFlight release
 
 ```bash
-# .env: DEVELOPMENT_TEAM, ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_PATH (App Store
+# .env.deploy: DEVELOPMENT_TEAM, ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_PATH (App Store
 # Connect team API key, App Manager role — drives signing and upload).
 ./scripts/release-ios.sh                 # archive + sign + upload; build = commit count
-set -a; . ./.env; set +a
+set -a; . ./.env.deploy; set +a
 uv run scripts/testflight.py status      # processing state per build
 uv run scripts/testflight.py distribute --group "Internal Testers" --encryption exempt
 ```

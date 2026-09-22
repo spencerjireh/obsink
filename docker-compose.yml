@@ -1,7 +1,8 @@
 # Local development stack: the server built from this checkout, Postgres,
-# and Mailpit (catches sign-in emails at http://localhost:8025).
+# and Mailpit (catches sign-in emails at http://localhost:8025). It runs with
+# its own defaults (dev-operator-key, Mailpit); it does not read .env.deploy.
 #
-#   docker compose up -d
+#   docker compose up -d --wait      # OBSINK_PORT=18080 if 8080 is taken
 #   OBSINK_SERVER_URL=http://localhost:8080 OBSINK_API_KEY=dev-operator-key scripts/verify-server-deploy.sh
 #
 # AUTH_DEV_RETURN_CODE=1 makes /auth/email/start return the code inline so

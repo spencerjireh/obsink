@@ -2,7 +2,7 @@
 #
 # Archive, sign, and upload the iOS app to App Store Connect (TestFlight).
 #
-# Credentials come from the gitignored .env:
+# Credentials come from the gitignored .env.deploy:
 #   DEVELOPMENT_TEAM   Apple team ID (also used by XcodeGen for signing)
 #   ASC_KEY_ID         App Store Connect API key ID
 #   ASC_ISSUER_ID      App Store Connect API issuer ID
@@ -20,12 +20,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 IOS_DIR="$REPO_ROOT/ios"
 
-[ -f "$REPO_ROOT/.env" ] || { echo "no .env at the repo root; copy .env.example and fill in the ASC_* values"; exit 1; }
-set -a; . "$REPO_ROOT/.env"; set +a
-: "${DEVELOPMENT_TEAM:?set DEVELOPMENT_TEAM in .env}"
-: "${ASC_KEY_ID:?set ASC_KEY_ID in .env}"
-: "${ASC_ISSUER_ID:?set ASC_ISSUER_ID in .env}"
-: "${ASC_KEY_PATH:?set ASC_KEY_PATH in .env}"
+[ -f "$REPO_ROOT/.env.deploy" ] || { echo "no .env.deploy at the repo root; copy .env.deploy.example and fill in the ASC_* values"; exit 1; }
+set -a; . "$REPO_ROOT/.env.deploy"; set +a
+: "${DEVELOPMENT_TEAM:?set DEVELOPMENT_TEAM in .env.deploy}"
+: "${ASC_KEY_ID:?set ASC_KEY_ID in .env.deploy}"
+: "${ASC_ISSUER_ID:?set ASC_ISSUER_ID in .env.deploy}"
+: "${ASC_KEY_PATH:?set ASC_KEY_PATH in .env.deploy}"
 [ -f "$ASC_KEY_PATH" ] || { echo "ASC_KEY_PATH not found: $ASC_KEY_PATH"; exit 1; }
 export DEVELOPMENT_TEAM
 # The server URL is baked into the app. A TestFlight build must not carry a

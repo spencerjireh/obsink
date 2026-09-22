@@ -17,13 +17,13 @@ settings:
     # The Rust xcframework ships an arm64-only simulator slice.
     "EXCLUDED_ARCHS[sdk=iphonesimulator*]": x86_64
     # Resolved by XcodeGen from the environment at generate time (see
-    # scripts/build-ios.sh, which loads it from the gitignored .env). Empty is
+    # scripts/build-ios.sh, which loads it from the gitignored .env.deploy). Empty is
     # fine for simulator builds (CODE_SIGNING_ALLOWED=NO); device/TestFlight
     # builds need DEVELOPMENT_TEAM set before regenerating the project.
     DEVELOPMENT_TEAM: ${DEVELOPMENT_TEAM}
     CODE_SIGN_STYLE: Automatic
     # The one server this build talks to, resolved the same way and read by
-    # the app through Info.plist (ObSinkServerURL). Empty (CI, no .env) means
+    # the app through Info.plist (ObSinkServerURL). Empty (CI, no .env.deploy) means
     # the built-in default in ServerConfig.swift.
     OBSINK_SERVER_URL: ${OBSINK_SERVER_URL}
 
