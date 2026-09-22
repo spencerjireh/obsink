@@ -165,7 +165,7 @@ npm ci && npm run lint && npm run format:check && npm run typecheck -w ui && npm
 docker compose up -d && ./scripts/verify-server-deploy.sh    # contract check against the local stack
 ```
 
-`main` only accepts pull requests with green CI, rebase-merged through the merge queue; see [CONTRIBUTING.md](CONTRIBUTING.md)
+`main` only accepts rebase-merged pull requests with green CI; see [CONTRIBUTING.md](CONTRIBUTING.md)
 for branch and commit conventions.
 
 `RUST_LOG=obsink_core=debug` enables per-request and per-sync-plan logging (stderr; stdout stays

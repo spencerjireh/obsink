@@ -12,15 +12,15 @@ Conventions for agents and humans live in [AGENTS.md](AGENTS.md); this is the sh
 
 ## Branches, commits, pull requests
 
-- Never push to `main`; it only accepts pull requests with green CI, rebase-merged
-  through the merge queue (`gh pr merge --rebase <n>` enqueues).
+- Never push to `main`; it only accepts rebase-merged pull requests with green CI on
+  a branch that is up to date with `main` (`scripts/merge-pr.sh <n>` does the
+  rebase, the wait and the merge).
 - Branch: `<type>/obs-<n>-<slug>` (e.g. `fix/obs-91-batch-invite-reuse`).
 - Commit: `<type>(<scope>)?: <subject> (OBS-<n>)`. Types
   `feat|fix|refactor|test|perf|build|chore|docs|ci`; `(OBS-<n>)` is required except for
   `chore|docs|ci`. `scripts/check-commit-msg.sh` is the rule.
 - Rebase onto `main` instead of merging it in; merge commits fail the commit check.
-- Fill in the pull request template. All CI jobs must pass on the PR and again in
-  the queue; merges are rebase-only.
+- Fill in the pull request template. All CI jobs must pass; merges are rebase-only.
 
 ## Before you push
 

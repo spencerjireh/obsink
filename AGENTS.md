@@ -71,7 +71,7 @@ obsink/
   docker-compose.yml     # local stack; docker-compose.coolify.yml for production
   scripts/               # build-ios, release-ios, testflight.py, ci-import-signing-cert, gen-icons,
                          #   verify-* harnesses (server, CLI, iOS sim, web e2e, desktop live + smoke),
-                         #   test-web-container, test-install-sh, check-commit-msg
+                         #   test-web-container, test-install-sh, check-commit-msg, merge-pr
   docs/                  # self-hosting, architecture, platforms, troubleshooting, p4-plan
   .github/               # ci.yml, release.yml, rulesets/main.json, PR template
   lefthook.yml           # git hooks: rustfmt, prettier, commit message
@@ -212,12 +212,13 @@ P8 pivot are decommissioned; nothing in the repo references them.
 ## Git workflow
 
 - **Never push to `main`.** A ruleset (`.github/rulesets/main.json`, applied with
-  `gh api`) requires a pull request with every CI job green, allows rebase merges
-  only through a serial merge queue, and blocks force-pushes and deletion; there
-  are no bypass actors. Branch -> PR -> CI green -> `gh pr merge --rebase <n>`,
-  which adds the PR to the queue; the queue rebases it onto `main`, runs CI on
-  the result (the `merge_group` trigger in `ci.yml`), and merges. Several PRs
-  can be queued at once; nobody rebases them by hand.
+  `gh api`) requires a pull request with every CI job green on a branch that is
+  up to date with `main`, allows rebase merges only, and blocks force-pushes
+  and deletion; there are no bypass actors. Branch -> PR -> CI green ->
+  `scripts/merge-pr.sh <n> [<n> ...]`, which rebases each PR onto `main` in a
+  worktree, waits for its checks and rebase-merges it, in order (GitHub's own
+  merge queue is not offered to user-owned repositories). Nobody rebases a
+  chain of PRs by hand.
 - **Branches:** `<type>/obs-<n>-<slug>`, e.g. `feat/obs-95-batch-undo`,
   `ci/obs-94-repo-hygiene`.
 - **Commits:** `<type>(<scope>)?: <subject> (OBS-<n>)`. Types
@@ -230,8 +231,8 @@ P8 pivot are decommissioned; nothing in the repo references them.
   or `^(chore|docs|ci)(\([a-z0-9-]+([,/][a-z0-9-]+)*\))?: .+$`. Rebase branches
   onto `main`; merge commits fail the check.
 - **PRs:** fill in `.github/pull_request_template.md` (Plane item, summary, how
-  tested, spec impact). Rebase merge only, through the queue; the branch is
-  deleted on merge.
+  tested, spec impact). Rebase merge only, through `scripts/merge-pr.sh`; the
+  branch is deleted on merge.
   Required checks are the seven CI jobs by display name (`commits`,
   `core + CLI + mobile`, `cargo deny`, `server (postgres)`, `web`,
   `desktop (macOS)`, `ios (simulator)`); renaming or adding a job means updating `rulesets/main.json` and
@@ -241,7 +242,7 @@ P8 pivot are decommissioned; nothing in the repo references them.
   set `[workspace.package].version` in `Cargo.toml`, run
   `npm version --no-git-tag-version X.Y.Z` in `desktop/`, `ui/` and `web/`, set
   `version` in `desktop/src-tauri/tauri.conf.json`, and set `MARKETING_VERSION`
-  in `ios/project.yml` (TestFlight builds read it). After the queue lands it:
+  in `ios/project.yml` (TestFlight builds read it). After it merges:
   `git fetch origin && git tag -a vX.Y.Z -m "ObSink X.Y.Z" origin/main && git push origin vX.Y.Z`.
   The Release workflow fails if any of those six versions differs from the tag,
   then builds the universal (Apple Silicon + Intel) CLI tarball and the
