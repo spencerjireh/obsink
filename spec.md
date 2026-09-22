@@ -233,14 +233,14 @@ Batch operations as `multipart/form-data`:
 
 `action` must be exactly `put` or `delete`; any other value (or none) rejects the whole batch with `400` before anything runs. Operations run in order, each with the same transaction as the single-file routes. The response is `200 { "results": [ { path, status, conflict } ] }`; `409` entries carry the conflicting `current` entry, so a batch can partly succeed. A non-multipart body is `415`; a body over `MAX_BATCH_BYTES` (default 128 MiB) is `413`.
 
-**`GET /vaults/:vault_id/files/:path/versions`**
-`{ "versions": [ { "ts": 1713100800, "size": 2048 } ] }`, newest first: the entries under `_versions/` for this path token (§8).
+**`GET /vaults/:vault_id/history/:path`**
+`{ "versions": [ { "name": "1713100800", "ts": 1713100800, "size": 2060 } ] }`, newest first: the entries under `_versions/` for this path token (§8). `name` is the directory entry (`<unix>[-n]`, two versions in one second get a suffix) and is what the blob route takes; `size` is the sealed size on the server. (The path token is a wildcard segment and the router allows nothing after it, which is why the list is not under `/files/:path/versions`.)
 
-**`GET /vaults/:vault_id/files/:path/versions/:ts`**
+**`GET /vaults/:vault_id/versions/:name/:path`**
 That version's encrypted blob.
 
 **`GET /vaults/:vault_id/trash`**
-`{ "entries": [ { "path": "<path token>", "encPath": "…", "hash": "…", "size": 2048, "deleted_at": 1713100800 } ] }`: the manifest's tombstones (the volume's directory names are one-way, so the listing comes from `files WHERE deleted`, with the newest `_trash/` entry's timestamp).
+`{ "entries": [ { "path": "<path token>", "encPath": "…", "hash": "…", "size": 2048, "deleted_at": 1713100800 } ] }`: the manifest's tombstones (the volume's directory names are one-way, so the listing comes from `files WHERE deleted`; `deleted_at` is the tombstone's receipt time).
 
 **`GET /vaults/:vault_id/trash/:path`**
 The newest trashed blob for that path token.
