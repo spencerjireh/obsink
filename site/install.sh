@@ -31,7 +31,7 @@ trap 'rm -rf "$work"' EXIT
 echo "==> Downloading obsink $tag"
 curl -fsSL -o "$work/obsink.tar.gz" "$url"
 curl -fsSL -o "$work/obsink.tar.gz.sha256" "$url.sha256"
-(cd "$work" && sed 's# .*# obsink.tar.gz#' obsink.tar.gz.sha256 | shasum -a 256 -c - >/dev/null) \
+(cd "$work" && awk '{ print $1 "  obsink.tar.gz" }' obsink.tar.gz.sha256 | shasum -a 256 -c - >/dev/null) \
     || { echo "checksum mismatch; not installing" >&2; exit 1; }
 tar -C "$work" -xzf "$work/obsink.tar.gz" obsink
 
