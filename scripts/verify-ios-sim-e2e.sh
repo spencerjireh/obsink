@@ -20,7 +20,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-SIM_NAME="${OBSINK_SIM_NAME:-iPhone 17 Pro}"
+# The newest available iPhone simulator unless OBSINK_SIM_NAME says otherwise
+# (the same selection as ci.yml, so the two cannot drift at an Xcode bump).
+SIM_NAME="${OBSINK_SIM_NAME:-$(xcrun simctl list -j devices available \
+    | jq -r '[.devices[][] | select(.isAvailable and (.name | test("^iPhone [0-9]+( Pro)?$")))] | sort_by((.name | capture("(?<n>[0-9]+)").n | tonumber), .name) | last | .name')}"
+[ -n "$SIM_NAME" ] && [ "$SIM_NAME" != "null" ] || { echo "no iPhone simulator available; set OBSINK_SIM_NAME"; exit 1; }
 WORK="${1:-$(mktemp -d /tmp/obsink-ios-e2e.XXXXXX)}"
 DERIVED="$REPO_ROOT/ios/build/DerivedData"
 APP_BUNDLE_ID="com.obsink.ios"
