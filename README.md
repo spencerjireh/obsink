@@ -101,12 +101,18 @@ exponential backoff; HTTP status errors surface immediately as typed `ApiError`s
 ## Install
 
 The public server's site, [obsink.spencerjireh.com](https://obsink.spencerjireh.com), has the
-signed macOS app (universal DMG), the command line tool, the browser client at `/app` (Chrome,
-Edge) and the TestFlight note. The CLI installs with one line:
+signed macOS app (universal DMG), the command line tool, the browser client at `/app` (Chromium
+browsers) and the TestFlight note. The CLI installs with one line:
 
 ```bash
 curl -fsSL https://obsink.spencerjireh.com/install.sh | sh
 ```
+
+It verifies the release checksum, installs into `/usr/local/bin` (or `~/.local/bin` when it cannot
+ask for a password) and prints the login command; the public API host is
+`https://obsink-api.spencerjireh.com`. To install by hand, take `obsink-<tag>-universal-apple-darwin.tar.gz`
+and its `.sha256` from the [releases page](https://github.com/spencerjireh/obsink/releases),
+check it with `shasum -a 256 -c`, and put the `obsink` binary on your PATH.
 
 Accounts on that server are invite-only: ask an existing user for a code. The rest of this
 section builds the CLI from source against any server.

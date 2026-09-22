@@ -6,10 +6,21 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta
       name="description"
-      content="ObSink syncs Obsidian vaults through a server that never sees your notes. Downloads for macOS, the command line, iOS and the browser."
+      content="ObSink syncs Obsidian vaults through a server that stores only encrypted files. Downloads for macOS, the command line, iOS and the browser."
     />
     <title>ObSink</title>
     <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+    <link rel="canonical" href="https://obsink.spencerjireh.com/" />
+    <meta name="theme-color" content="#f2efe6" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#15141b" media="(prefers-color-scheme: dark)" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="ObSink" />
+    <meta
+      property="og:description"
+      content="End-to-end encrypted Obsidian vault sync. Downloads for macOS, the command line, iOS and the browser."
+    />
+    <meta property="og:url" content="https://obsink.spencerjireh.com/" />
+    <meta name="twitter:card" content="summary" />
     <style>
       /* Tokens from DESIGN.md; light values are the default, dark follows the system. */
       :root {
@@ -193,16 +204,17 @@
           </a>
           <span class="muted" id="version">Apple Silicon and Intel, one download.</span>
         </div>
-        <p class="muted" id="checksum"></p>
+        <p class="muted" id="checksum" hidden></p>
       </section>
 
       <section id="cli">
         <h2>Command line</h2>
         <p>The same sync as a tool for scripts, servers and terminals.</p>
-        <pre><code>curl -fsSL https://obsink.spencerjireh.com/install.sh | sh</code></pre>
+        <pre><code id="install-command">curl -fsSL https://obsink.spencerjireh.com/install.sh | sh</code></pre>
         <p class="muted">
           The script downloads the latest release, checks its SHA-256 and installs
-          <code>obsink</code> into <code>/usr/local/bin</code>. Or take the
+          <code>obsink</code> into <code>/usr/local/bin</code> (it asks for your password) or, when
+          it cannot ask, into <code>~/.local/bin</code>. Or take the
           <a id="cli-tar" href="https://github.com/spencerjireh/obsink/releases/latest">tarball</a>
           yourself.
         </p>
@@ -212,8 +224,8 @@
         <h2>Browser</h2>
         <p>
           No install: <a href="/app/">open ObSink in the browser</a>, sign in and pick the vault
-          folder. It syncs while the tab is open. Chrome and Edge only, since the folder is read
-          through the File System Access API.
+          folder. It syncs while the tab is open. Chrome, Edge and other Chromium browsers only,
+          since the folder is read through the File System Access API.
         </p>
       </section>
 
@@ -243,14 +255,35 @@
     </main>
 
     <script>
+      // A self-hosted copy of this page serves its own install.sh.
+      if (location.protocol.startsWith('http')) {
+        document.getElementById('install-command').textContent =
+          `curl -fsSL ${location.origin}/install.sh | sh`
+      }
+
       // Fill in the latest release: the DMG, its checksum and the CLI tarball.
-      // If GitHub cannot be reached the buttons keep pointing at the releases page.
+      // If GitHub cannot be reached (offline, or its unauthenticated rate limit)
+      // the buttons keep pointing at the releases page and the checksum line
+      // says where the digests are.
+      const releases = 'https://github.com/spencerjireh/obsink/releases'
+      const checksum = document.getElementById('checksum')
+      const showChecksum = (text, href) => {
+        checksum.innerHTML = ''
+        const link = document.createElement('a')
+        link.href = href
+        link.textContent = text
+        checksum.append('Checksum: ', link)
+        checksum.hidden = false
+      }
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), 5000)
       fetch('https://api.github.com/repos/spencerjireh/obsink/releases/latest', {
         headers: { Accept: 'application/vnd.github+json' },
+        signal: controller.signal,
       })
         .then((response) => (response.ok ? response.json() : null))
         .then((release) => {
-          if (!release || !Array.isArray(release.assets)) return
+          if (!release || !Array.isArray(release.assets)) throw new Error('no release data')
           const asset = (suffix) => release.assets.find((entry) => entry.name.endsWith(suffix))
           const dmg = asset('-universal.dmg')
           const sha = asset('-universal.dmg.sha256')
@@ -260,17 +293,12 @@
             document.getElementById('version').textContent =
               `${release.tag_name} · Apple Silicon and Intel, one download.`
           }
-          if (sha) {
-            const line = document.getElementById('checksum')
-            line.innerHTML = ''
-            const link = document.createElement('a')
-            link.href = sha.browser_download_url
-            link.textContent = 'SHA-256'
-            line.append('Checksum: ', link)
-          }
+          if (sha) showChecksum('SHA-256', sha.browser_download_url)
+          else showChecksum('next to each file on the releases page', releases)
           if (tar) document.getElementById('cli-tar').href = tar.browser_download_url
         })
-        .catch(() => undefined)
+        .catch(() => showChecksum('next to each file on the releases page', releases))
+        .finally(() => clearTimeout(timer))
     </script>
   </body>
 </html>

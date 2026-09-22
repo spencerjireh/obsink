@@ -133,6 +133,13 @@ jobs:
         run: npm run build -w desktop
       - name: Clippy the Tauri shell and the CLI (macOS keychain path)
         run: cargo clippy -p obsink-desktop -p obsink --all-targets -- -D warnings
+      - name: Lint the shell scripts (install.sh and the test scripts strictly, the rest for errors)
+        run: |
+          shellcheck -s sh site/install.sh
+          shellcheck scripts/test-*.sh
+          shellcheck -S error scripts/*.sh
+      - name: Test install.sh against a fake release (macOS only, like the script)
+        run: scripts/test-install-sh.sh
 
   ios:
     name: ios (simulator)
