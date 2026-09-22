@@ -74,6 +74,7 @@ type Options = {
   json?: unknown
   body?: BodyInit
   headers?: Record<string, string>
+  cache?: RequestCache
   timeoutMs?: number
   // Statuses the caller handles itself (returned instead of thrown).
   accept?: number[]
@@ -115,6 +116,7 @@ export class Api {
           body,
           signal: controller.signal,
           credentials: 'omit',
+          cache: options.cache,
         })
         clearTimeout(timer)
         if (response.ok || options.accept?.includes(response.status)) return response
@@ -139,8 +141,10 @@ export class Api {
   }
 
   capabilities(): Promise<Capabilities> {
-    // Fetch's default Accept is */*, which the proxy routes to the API.
-    return this.json('GET', '/', { headers: { Accept: 'application/json' } })
+    // Fetch's default Accept is */*, which the proxy routes to the API. The
+    // same URL serves the landing page to navigations, so bypass the HTTP
+    // cache: a cached HTML response must never answer this probe.
+    return this.json('GET', '/', { headers: { Accept: 'application/json' }, cache: 'no-store' })
   }
 
   emailStart(email: string): Promise<{ sent: boolean; code?: string | null }> {

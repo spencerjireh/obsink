@@ -106,7 +106,9 @@ jobs:
       - name: Type-check, test and build the browser client
         run: npm run typecheck -w web && npm run test -w web && npm run build -w web
       - name: Build the web image (site, client, API proxy)
-        run: docker build -f web/Dockerfile .
+        run: docker build -f web/Dockerfile -t obsink-web:ci .
+      - name: Check the Caddyfile, the site and the image's routes
+        run: OBSINK_WEB_IMAGE=obsink-web:ci scripts/test-web-container.sh
 
   desktop:
     name: desktop (macOS)
