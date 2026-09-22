@@ -89,6 +89,13 @@ export const tauriBackend: Backend = {
   resolveConflict: (vaultId, resolutions) => call('resolve_conflict', { vaultId, resolutions }),
   getConflictPreview: (vaultId, path) => call('get_conflict_preview', { vaultId, path }),
   listActivity: (vaultId, limit) => call('list_activity', { vaultId, limit }),
+  listFiles: () => notYet('File history'),
+  listVersions: () => notYet('File history'),
+  previewVersion: () => notYet('File history'),
+  restoreVersion: () => notYet('Restoring a version'),
+  listTrash: () => notYet('Recently deleted'),
+  previewTrash: () => notYet('Recently deleted'),
+  restoreTrash: () => notYet('Restoring a deleted file'),
   openVaultFolder: (vaultId) => call('open_vault_folder', { vaultId }),
   // Ask Rust to raise the settings window at a tab (the popover hides).
   openSettings: (target = {}) =>

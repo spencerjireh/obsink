@@ -345,3 +345,61 @@ describe('the vault page (spec §15.2)', () => {
     expect(screen.queryByTestId('moveFolderButton')).toBeNull()
   })
 })
+
+describe('history (spec §8.2, §9.3)', () => {
+  it('lists the versions of a picked file, previews one and restores it', async () => {
+    const backend = mockBackend({
+      listVaults: () => Promise.resolve([vault()]),
+      listFiles: () => Promise.resolve(['a.md', 'notes/b.md']),
+      listVersions: (_vaultId: string, path: string) =>
+        Promise.resolve(
+          path === 'a.md' ? [{ name: '1700000000', ts: 1_700_000_000, size: 120 }] : [],
+        ),
+      previewVersion: () => Promise.resolve({ text: '# the old text', size: 14 }),
+      restoreVersion: () => Promise.resolve(),
+    })
+    renderApp(backend)
+    const picker = await screen.findByTestId('historyFilePicker')
+    expect(screen.getByText('Pick a file to see its versions.')).toBeTruthy()
+    fireEvent.change(picker, { target: { value: 'notes/b.md' } })
+    expect(await screen.findByText('No earlier versions kept.')).toBeTruthy()
+    fireEvent.change(picker, { target: { value: 'a.md' } })
+    const row = await screen.findByTestId('historyRow')
+    expect(row.getAttribute('data-ts')).toBe('1700000000')
+    fireEvent.click(within(row).getByTestId('previewButton'))
+    expect(await screen.findByText('# the old text')).toBeTruthy()
+    fireEvent.click(within(row).getByTestId('restoreButton'))
+    expect(await screen.findByText('Restored a.md. Sync to upload it.')).toBeTruthy()
+    expect(backend.calls.find((entry) => entry.method === 'restoreVersion')?.args).toEqual([
+      'vault_1',
+      'a.md',
+      '1700000000',
+    ])
+  })
+
+  it('lists recently deleted files with their paths and restores one', async () => {
+    const backend = mockBackend({
+      listVaults: () => Promise.resolve([vault()]),
+      listTrash: () =>
+        Promise.resolve([{ path: 'gone.md', hash: 'h', size: 40, deleted_at: 1_700_000_000 }]),
+      previewTrash: () => Promise.resolve({ text: null, size: 40 }),
+      restoreTrash: () => Promise.resolve(),
+    })
+    renderApp(backend)
+    const row = await screen.findByTestId('trashRow')
+    expect(row.getAttribute('data-path')).toBe('gone.md')
+    fireEvent.click(within(row).getByTestId('previewButton'))
+    expect(await screen.findByText('No preview for this file.')).toBeTruthy()
+    fireEvent.click(within(row).getByTestId('restoreButton'))
+    expect(await screen.findByText('Restored gone.md. Sync to upload it.')).toBeTruthy()
+    expect(backend.calls.find((entry) => entry.method === 'restoreTrash')?.args).toEqual([
+      'vault_1',
+      'gone.md',
+    ])
+  })
+
+  it('says when nothing was deleted', async () => {
+    renderApp(mockBackend({ listVaults: () => Promise.resolve([vault()]) }))
+    expect(await screen.findByText('Nothing deleted in the last 30 days.')).toBeTruthy()
+  })
+})

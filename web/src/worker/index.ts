@@ -4,6 +4,7 @@ import { listActivity } from './activity'
 import { emit, stateChanged } from './bus'
 import { getConflictPreview, resolveConflict, setPaused, syncVault } from './driver'
 import { asCommandError } from './errors'
+import * as history from './history'
 import { serverUrl } from './session'
 import * as vaults from './vaults'
 
@@ -38,6 +39,13 @@ const handlers: Record<string, (...args: any[]) => Promise<unknown> | unknown> =
   getConflictPreview,
   listActivity,
   setVisibility: (hidden: boolean) => setPaused(hidden),
+  listFiles: history.listFiles,
+  listVersions: history.listVersions,
+  previewVersion: history.previewVersion,
+  restoreVersion: history.restoreVersion,
+  listTrash: history.listTrash,
+  previewTrash: history.previewTrash,
+  restoreTrash: history.restoreTrash,
 }
 
 // Methods that change what the screens show; the worker announces it the
@@ -53,13 +61,21 @@ const CHANGES_STATE = new Set([
   'createVault',
   'downloadVault',
   'renameVault',
+  'restoreVersion',
+  'restoreTrash',
   'removeVault',
   'deleteRemoteVault',
 ])
 
 // The methods whose first argument is the vault id (`state://changed` then
 // names it).
-const VAULT_METHODS = new Set(['renameVault', 'removeVault', 'deleteRemoteVault'])
+const VAULT_METHODS = new Set([
+  'renameVault',
+  'restoreVersion',
+  'restoreTrash',
+  'removeVault',
+  'deleteRemoteVault',
+])
 
 self.onmessage = async (message: MessageEvent<WorkerRequest>) => {
   const { id, method, args } = message.data

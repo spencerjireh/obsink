@@ -776,6 +776,18 @@ select {
   display: block;
 }
 
+.row-item__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  width: 100%;
+}
+
+.row-item--stacked > .preview {
+  width: 100%;
+}
+
 .inline-field {
   display: flex;
   align-items: center;

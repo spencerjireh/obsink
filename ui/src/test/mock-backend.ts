@@ -78,6 +78,13 @@ export function mockBackend(overrides: Partial<Backend> = {}): MockBackend {
     resolveConflict: notImplemented('resolveConflict'),
     getConflictPreview: notImplemented('getConflictPreview'),
     listActivity: () => Promise.resolve([]),
+    listFiles: () => Promise.resolve([]),
+    listVersions: () => Promise.resolve([]),
+    previewVersion: notImplemented('previewVersion'),
+    restoreVersion: notImplemented('restoreVersion'),
+    listTrash: () => Promise.resolve([]),
+    previewTrash: notImplemented('previewTrash'),
+    restoreTrash: notImplemented('restoreTrash'),
     openVaultFolder: () => Promise.resolve(),
     openSettings: () => Promise.resolve(),
     on(event, handler) {

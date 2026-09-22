@@ -190,6 +190,27 @@ export type SettingsTarget = {
   download?: boolean
 }
 
+// Spec §8.2: one archived version of a file (`GET /vaults/:id/history/:path`).
+export type VersionInfo = {
+  // What the blob route takes (`<unix>[-n]`).
+  name: string
+  ts: number
+  // The sealed size on the server, a few bytes over the file.
+  size: number
+}
+
+// Spec §9.3: one tombstone with its real path (`GET /vaults/:id/trash`).
+export type TrashEntry = {
+  path: string
+  hash: string
+  size: number
+  deleted_at: number
+}
+
+// A decrypted file for the read-only preview; `text` is null when the bytes
+// are not UTF-8 text (restore is still offered).
+export type FilePreview = { text: string | null; size: number }
+
 // One line of the per-vault activity log (Rust `activity::ActivityEvent`),
 // newest first as returned by `list_activity`.
 export type ActivityKind =

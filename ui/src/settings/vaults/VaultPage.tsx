@@ -6,6 +6,7 @@ import { SESSION_EXPIRED } from '../../lib/errors'
 import { formatRelative, phaseLabel, plural, vaultUsageLine } from '../../lib/format'
 import { canSync, onThisDevice, remoteChanges, stateText, stateTone } from '../../lib/vault-state'
 import { Conflicts } from '../../components/Conflicts'
+import { HistorySection } from '../../components/HistorySection'
 import { InlineEdit } from '../../components/InlineEdit'
 import { FailureNotice, Notice } from '../../components/Notices'
 import { StateDot } from '../../components/StateDot'
@@ -306,6 +307,10 @@ export function VaultPage({
       <VaultDevices devices={info.devices} revision={info.revision} />
 
       <VaultActivity vaultId={info.id} onError={onError} />
+
+      {syncable ? (
+        <HistorySection vaultId={info.id} busy={busy} notify={notify} onError={onError} />
+      ) : null}
 
       <VaultActions
         vault={info}

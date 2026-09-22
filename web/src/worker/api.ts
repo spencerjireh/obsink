@@ -89,6 +89,16 @@ export type VaultSummary = {
   devices?: VaultSummaryDevice[]
 }
 
+// Spec §8.2 and §9.3 read routes; `path` in the trash entry is the token.
+export type WireVersion = { name: string; ts: number; size: number }
+export type WireTrashEntry = {
+  path: string
+  encPath: string
+  hash: string
+  size: number
+  deleted_at: number
+}
+
 export type ManifestFetch =
   | { status: 'not_modified' }
   | { status: 'ok'; etag: string | null; manifest: Record<string, WireFileEntry> }
@@ -321,6 +331,41 @@ export class Api {
 
   async getFile(bearer: string, vaultId: string, token: string): Promise<Uint8Array> {
     const response = await this.send('GET', `/vaults/${vaultId}/files/${token}`, { bearer })
+    return new Uint8Array(await response.arrayBuffer())
+  }
+
+  async listVersions(bearer: string, vaultId: string, token: string): Promise<WireVersion[]> {
+    const { versions } = await this.json<{ versions: WireVersion[] }>(
+      'GET',
+      `/vaults/${vaultId}/history/${token}`,
+      { bearer },
+    )
+    return versions
+  }
+
+  async getVersion(
+    bearer: string,
+    vaultId: string,
+    name: string,
+    token: string,
+  ): Promise<Uint8Array> {
+    const response = await this.send('GET', `/vaults/${vaultId}/versions/${name}/${token}`, {
+      bearer,
+    })
+    return new Uint8Array(await response.arrayBuffer())
+  }
+
+  async listTrash(bearer: string, vaultId: string): Promise<WireTrashEntry[]> {
+    const { entries } = await this.json<{ entries: WireTrashEntry[] }>(
+      'GET',
+      `/vaults/${vaultId}/trash`,
+      { bearer },
+    )
+    return entries
+  }
+
+  async getTrash(bearer: string, vaultId: string, token: string): Promise<Uint8Array> {
+    const response = await this.send('GET', `/vaults/${vaultId}/trash/${token}`, { bearer })
     return new Uint8Array(await response.arrayBuffer())
   }
 
