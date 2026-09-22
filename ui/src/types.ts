@@ -180,7 +180,7 @@ export type ProtocolInfo = { server: number | null; client: number }
 
 // The settings window's tabs, and what the popover asks it to show
 // (`settings://navigate`, Rust `SettingsTarget`).
-export type SettingsTab = 'vaults' | 'account' | 'activity'
+export type SettingsTab = 'vaults' | 'devices' | 'settings'
 export type SettingsTarget = {
   tab: SettingsTab
   vault_id: string | null

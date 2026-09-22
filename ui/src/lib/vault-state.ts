@@ -99,5 +99,8 @@ export function globalLine(states: VaultStateInfo[], deviceNoun = 'this device')
   const pending = here.some((s) => s.state.kind === 'pending')
   const head = pending ? 'Changes pending' : 'Up to date'
   const line = latest ? `${head} · synced ${formatRelative(latest).toLowerCase()}` : head
-  return elsewhere > 0 ? `${line} · ${plural(elsewhere, 'vault')} not on ${deviceNoun}` : line
+  // The vaults elsewhere are worth a note only when everything here is fine.
+  return elsewhere > 0 && !pending
+    ? `${line} · ${plural(elsewhere, 'vault')} not on ${deviceNoun}`
+    : line
 }

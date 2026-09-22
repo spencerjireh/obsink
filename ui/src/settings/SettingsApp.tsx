@@ -4,10 +4,10 @@ import { useBackend } from '../backend'
 import { useAccount } from '../hooks/useAccount'
 import { useVaultStates } from '../hooks/useVaultStates'
 import { Notice } from '../components/Notices'
-import { AccountTab } from './account/AccountTab'
+import { SettingsTab as SettingsPane } from './account/SettingsTab'
 import { SignInForm } from './account/SignInForm'
 import { UnlockForm } from './account/UnlockForm'
-import { ActivityTab } from './activity/ActivityTab'
+import { DevicesTab } from './devices/DevicesTab'
 import { Tabs } from './Tabs'
 import { UpdateRequired } from './UpdateRequired'
 import { VaultsTab, type VaultFlowTarget } from './vaults/VaultsTab'
@@ -83,8 +83,9 @@ export function SettingsApp() {
     )
   }
 
-  // Signed out or locked: the Vaults tab is the sign-in, then the unlock
-  // (spec §12.1); nothing about vaults shows before the key is at hand.
+  // Signed out or locked: the Vaults and Devices tabs show the sign-in, then
+  // the unlock (spec §12.1); nothing about vaults shows before the key is at
+  // hand.
   const gate =
     account.account?.kind === 'signed_out' ? (
       <section className="section" aria-labelledby="signin-heading">
@@ -129,19 +130,25 @@ export function SettingsApp() {
                 setFlow(next)
                 setMessage('')
               }}
-              onSignIn={() => changeTab('account')}
+              onChanged={() => void refresh()}
+              onSignIn={() => changeTab('settings')}
             />
           )
         ) : null}
-        {tab === 'account' ? (
+        {tab === 'devices' ? (
           <main className="main">
-            {message ? <Notice>{message}</Notice> : null}
-            <AccountTab account={account} busy={account.busy} />
+            {gate ?? (
+              <>
+                {message ? <Notice>{message}</Notice> : null}
+                <DevicesTab account={account} states={states} busy={account.busy} />
+              </>
+            )}
           </main>
         ) : null}
-        {tab === 'activity' ? (
+        {tab === 'settings' ? (
           <main className="main">
-            <ActivityTab states={states} onError={account.fail} />
+            {message ? <Notice>{message}</Notice> : null}
+            <SettingsPane account={account} busy={account.busy} />
           </main>
         ) : null}
       </div>

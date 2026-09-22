@@ -24,6 +24,8 @@ type Props = {
   // A vault landed on this device; the flow stays open on its done card.
   onAdded: (vaultId: string) => void
   onFlow: (flow: VaultFlowTarget | null) => void
+  // A vault's name or folder changed here; re-read the list.
+  onChanged: () => void
   onSignIn: () => void
 }
 
@@ -41,6 +43,7 @@ export function VaultsTab({
   onSelect,
   onAdded,
   onFlow,
+  onChanged,
   onSignIn,
 }: Props) {
   const selected = states.find((s) => s.id === selectedId) ?? null
@@ -124,6 +127,7 @@ export function VaultsTab({
             message={message}
             notify={notify}
             onError={onError}
+            onChanged={onChanged}
             onSignIn={onSignIn}
             onDownload={() =>
               onFlow({ kind: 'download', vault_id: selected.id, vault_name: selected.name })

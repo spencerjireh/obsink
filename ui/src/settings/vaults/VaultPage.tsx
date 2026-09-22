@@ -6,9 +6,11 @@ import { SESSION_EXPIRED } from '../../lib/errors'
 import { formatRelative, phaseLabel, plural, vaultUsageLine } from '../../lib/format'
 import { canSync, onThisDevice, remoteChanges, stateText, stateTone } from '../../lib/vault-state'
 import { Conflicts } from '../../components/Conflicts'
+import { InlineEdit } from '../../components/InlineEdit'
 import { FailureNotice, Notice } from '../../components/Notices'
 import { StateDot } from '../../components/StateDot'
 import { VaultActions } from '../../components/VaultActions'
+import { VaultActivity } from '../../components/VaultActivity'
 import { VaultDevices } from '../../components/VaultDevices'
 
 type Props = {
@@ -17,6 +19,8 @@ type Props = {
   message: string
   notify: (message: string) => void
   onError: (error: unknown) => void
+  // The name or the folder changed; the list re-reads.
+  onChanged: () => void
   onSignIn: () => void
   // Put this vault on this device (spec §15.1).
   onDownload: () => void
@@ -33,6 +37,7 @@ export function VaultPage({
   message,
   notify,
   onError,
+  onChanged,
   onSignIn,
   onDownload,
   onGone,
@@ -77,13 +82,41 @@ export function VaultPage({
     backend.openVaultFolder(info.id).catch(onError)
   }
 
+  // Spec §15.2 `Rename` and `Move folder`: in place, the list follows.
+  async function change(action: () => Promise<void>, done: string): Promise<boolean> {
+    try {
+      await action()
+      onChanged()
+      notify(done)
+      return true
+    } catch (error) {
+      onError(error)
+      return false
+    }
+  }
+
+  const rename = (name: string) =>
+    change(() => backend.renameVault(info.id, name), `Renamed to ${name}.`)
+  const title = (
+    <InlineEdit
+      value={info.name}
+      label="Rename"
+      fieldTestId="renameVaultField"
+      buttonTestId="renameVaultButton"
+      busy={busy || sessionExpired}
+      onSave={rename}
+    >
+      <h1>{info.name}</h1>
+    </InlineEdit>
+  )
+
   // A vault the account owns that is not on this device: one action.
   if (info.state.kind === 'not_on_device') {
     return (
       <div className="vault-page">
         <header className="pane-header">
           <div className="pane-header__title">
-            <h1>{info.name}</h1>
+            {title}
             <p className="state-line">
               <StateDot tone={stateTone(info)} />
               <span data-testid="vaultStateText">{stateText(info)}</span>
@@ -116,7 +149,7 @@ export function VaultPage({
     <div className="vault-page">
       <header className="pane-header">
         <div className="pane-header__title">
-          <h1>{info.name}</h1>
+          {title}
           <p className="state-line">
             <StateDot tone={stateTone(info)} />
             <span data-testid="vaultStateText">{runner.busy ? 'Syncing…' : stateText(info)}</span>
@@ -134,16 +167,44 @@ export function VaultPage({
             ) : null}
           </p>
           <p className="pane-header__meta">
-            <code>{info.local_path ?? ''}</code>{' '}
-            {backend.platform.canOpenFolder && here ? (
-              <button
-                className="button button--ghost button--small"
-                onClick={openFolder}
-                type="button"
+            {backend.moveVaultFolder && here ? (
+              <InlineEdit
+                value={info.local_path ?? ''}
+                label="Move folder"
+                fieldTestId="moveFolderField"
+                buttonTestId="moveFolderButton"
+                busy={busy || sessionExpired}
+                mono
+                placeholder={backend.platform.folderPlaceholder}
+                onSave={(path) =>
+                  change(() => backend.moveVaultFolder!(info.id, path), `Moved ${info.name}.`)
+                }
               >
-                Open folder
-              </button>
-            ) : null}
+                <code>{info.local_path ?? ''}</code>
+                {backend.platform.canOpenFolder ? (
+                  <button
+                    className="button button--ghost button--small"
+                    onClick={openFolder}
+                    type="button"
+                  >
+                    Open folder
+                  </button>
+                ) : null}
+              </InlineEdit>
+            ) : (
+              <>
+                <code>{info.local_path ?? ''}</code>{' '}
+                {backend.platform.canOpenFolder && here ? (
+                  <button
+                    className="button button--ghost button--small"
+                    onClick={openFolder}
+                    type="button"
+                  >
+                    Open folder
+                  </button>
+                ) : null}
+              </>
+            )}
           </p>
         </div>
         <button
@@ -243,6 +304,8 @@ export function VaultPage({
       />
 
       <VaultDevices devices={info.devices} revision={info.revision} />
+
+      <VaultActivity vaultId={info.id} onError={onError} />
 
       <VaultActions
         vault={info}

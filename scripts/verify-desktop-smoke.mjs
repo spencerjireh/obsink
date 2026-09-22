@@ -349,14 +349,12 @@ try {
   )
   await click('settings', '[data-testid=syncButton]')
   await noticeIncludes('settings', 'Sync complete.')
-  await click('settings', '[data-testid=settingsTab][data-tab=activity]')
+  // The vault page carries its own activity log (spec §15.2).
   await until(
     'settings',
     `return [...document.querySelectorAll('[data-testid=activityRow]')].some((el) => el.textContent.includes(${JSON.stringify(NOTE)}))`,
     'an activity row for the note',
   )
-  await click('settings', '[data-testid=settingsTab][data-tab=vaults]')
-  await navigate(vaultId)
   console.log('settings: synced through the UI, activity row present')
 
   // Device B is the CLI; it gets the note, then both sides edit it. A's edit

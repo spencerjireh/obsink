@@ -1670,7 +1670,7 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
             }
             "check_updates" => {
                 // The download page shows the latest release; the app's own
-                // version is in the settings window's Account tab.
+                // version is in the settings window's Settings tab.
                 let _ = tauri_plugin_opener::open_url(format!("{SITE_URL}/#mac"), None::<&str>);
             }
             "quit" => app.exit(0),

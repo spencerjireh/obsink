@@ -33,7 +33,8 @@ export function ConfirmForm({
 
   // The form opens below the button that asked for it, often past the fold.
   useEffect(() => {
-    formRef.current?.scrollIntoView({ block: 'nearest' })
+    // jsdom (the ui unit tests) has no scrollIntoView.
+    formRef.current?.scrollIntoView?.({ block: 'nearest' })
   }, [])
   const matches =
     expected === undefined ||

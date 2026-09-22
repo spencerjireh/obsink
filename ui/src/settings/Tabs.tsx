@@ -2,8 +2,8 @@ import type { SettingsTab } from '../types'
 
 const TABS: { id: SettingsTab; label: string }[] = [
   { id: 'vaults', label: 'Vaults' },
-  { id: 'account', label: 'Account' },
-  { id: 'activity', label: 'Activity' },
+  { id: 'devices', label: 'Devices' },
+  { id: 'settings', label: 'Settings' },
 ]
 
 export function Tabs({

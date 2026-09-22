@@ -163,15 +163,48 @@ export function useAccount(notify: Notify) {
     }
   }
 
-  const revokeDevice = (deviceId: string) =>
-    withBusy(async () => {
-      try {
-        setAccount(await backend.revokeDevice(deviceId))
-        notifyRef.current('Device signed out.')
-      } catch (error) {
-        fail(error)
-      }
-    })
+  // Returns whether it succeeded so a confirmation form knows to close.
+  const revokeDevice = async (deviceId: string): Promise<boolean> => {
+    setBusy(true)
+    try {
+      setAccount(await backend.revokeDevice(deviceId))
+      notifyRef.current('Device signed out.')
+      return true
+    } catch (error) {
+      fail(error)
+      return false
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const renameDevice = async (deviceId: string, name: string): Promise<boolean> => {
+    setBusy(true)
+    try {
+      setAccount(await backend.renameDevice(deviceId, name.trim()))
+      notifyRef.current('Device renamed.')
+      return true
+    } catch (error) {
+      fail(error)
+      return false
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const changePassphrase = async (current: string, next: string): Promise<boolean> => {
+    setBusy(true)
+    try {
+      await backend.changePassphrase(current, next)
+      notifyRef.current('Passphrase changed.')
+      return true
+    } catch (error) {
+      fail(error)
+      return false
+    } finally {
+      setBusy(false)
+    }
+  }
 
   // Returns whether the account is now unlocked.
   const setPassphrase = async (passphrase: string): Promise<boolean> => {
@@ -282,6 +315,8 @@ export function useAccount(notify: Notify) {
     createInvite,
     copyInvite,
     revokeDevice,
+    renameDevice,
+    changePassphrase,
     signOut,
     deleteAccount,
     vaultUsage,
