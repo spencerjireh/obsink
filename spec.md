@@ -489,7 +489,7 @@ obsink/
 ├── docs/                     self-hosting, architecture, platforms, troubleshooting
 ├── scripts/                  build-ios, release-ios, testflight.py, ci-import-signing-cert, gen-icons,
 │                             verify-* harnesses (server, CLI, iOS sim, web e2e, desktop live + smoke),
-│                             test-web-container, test-install-sh, check-commit-msg
+│                             test-web-container, test-install-sh, check-commit-msg, merge-pr
 ├── package.json              npm workspaces: ui, desktop, web (lint, format, typecheck, build, test)
 ├── docker-compose.yml        local stack: server and web (built), Postgres, Mailpit
 ├── docker-compose.coolify.yml production stack: server and web built from source, Postgres
