@@ -14,12 +14,15 @@ use std::{collections::BTreeSet, time::Duration};
 
 use obsink_core::{
     backoff_wait, checkpoint_manifest, chunk_uploads, conflict_copy_path, conflict_to_upload,
-    content_hmac, decrypt, decrypt_path, derive_key, derive_keys, diff_manifests, effective_choice,
-    encrypt, encrypt_path, hash_cache_key_id, normalize_server_url, path_token, Conflict,
+    content_hmac, create_account_key, decode_base64, decrypt, decrypt_path, derive_key,
+    derive_keys, diff_manifests, effective_choice, encode_base64, encrypt, encrypt_path,
+    hash_cache_key_id, new_key, normalize_server_url, path_token, rewrap_account_key,
+    unlock_account_key, unwrap_vault_key, wrap_vault_key, AccountKeyMaterial, Conflict,
     ConflictResolutionChoice, CryptoKeys, IgnoreRules, KeyBytes, Manifest, PollPacing,
     DEFAULT_IGNORE, PROTOCOL_VERSION,
 };
 use wasm_bindgen::prelude::*;
+use zeroize::Zeroize;
 
 fn key_bytes(bytes: &[u8]) -> Result<KeyBytes, JsError> {
     bytes
@@ -55,12 +58,19 @@ impl VaultKeys {
         })
     }
 
-    /// Sub-keys from an already-derived 32-byte master key (tests, harnesses).
+    /// Sub-keys from a 32-byte vault key (v3: the key an [`AccountKey`]
+    /// unwrapped from the vault's member blob).
+    #[wasm_bindgen(js_name = fromVaultKey)]
+    pub fn from_vault_key(vault_key: &[u8]) -> Result<VaultKeys, JsError> {
+        Ok(VaultKeys {
+            keys: derive_keys(&key_bytes(vault_key)?),
+        })
+    }
+
+    /// The v2 name of [`VaultKeys::from_vault_key`] (tests, harnesses).
     #[wasm_bindgen(js_name = fromMaster)]
     pub fn from_master(master: &[u8]) -> Result<VaultKeys, JsError> {
-        Ok(VaultKeys {
-            keys: derive_keys(&key_bytes(master)?),
-        })
+        Self::from_vault_key(master)
     }
 
     /// AES-256-GCM: `nonce || ciphertext || tag`, the blob the server stores.
@@ -100,6 +110,127 @@ impl VaultKeys {
     #[wasm_bindgen(js_name = hashCacheKeyId)]
     pub fn hash_cache_key_id(&self) -> String {
         hash_cache_key_id(&self.keys.content_mac)
+    }
+}
+
+/// A fresh 32-byte vault key for `Create vault`; the caller wraps it with
+/// [`AccountKey::wrap_vault_key`] and feeds it to [`VaultKeys::from_vault_key`].
+#[wasm_bindgen(js_name = newVaultKey)]
+pub fn new_vault_key() -> Vec<u8> {
+    new_key().to_vec()
+}
+
+/// What `PUT /auth/keys` and `/auth/keys/rewrap` send, base64 fields.
+fn material_json(material: &AccountKeyMaterial) -> Result<String, JsError> {
+    Ok(serde_json::to_string(&serde_json::json!({
+        "wrapped": material.wrapped_b64(),
+        "salt": material.salt_b64(),
+        "verifier": material.verifier_b64(),
+    }))?)
+}
+
+/// The account key of a signed-in user, unlocked from the passphrase (spec
+/// §6.1). Lives in worker memory for the tab's lifetime; `free()` wipes it.
+#[wasm_bindgen]
+pub struct AccountKey {
+    key: KeyBytes,
+    user_id: String,
+    material: Option<AccountKeyMaterial>,
+}
+
+impl Drop for AccountKey {
+    fn drop(&mut self) {
+        self.key.zeroize();
+    }
+}
+
+#[wasm_bindgen]
+impl AccountKey {
+    /// Set the passphrase for the first time: a fresh account key. `material()`
+    /// then holds what `PUT /auth/keys` needs.
+    pub fn create(passphrase: &str, user_id: &str) -> Result<AccountKey, JsError> {
+        let (key, material) = create_account_key(passphrase, user_id)?;
+        Ok(AccountKey {
+            key,
+            user_id: user_id.to_string(),
+            material: Some(material),
+        })
+    }
+
+    /// Unlock from what `GET /auth/keys` returned. A wrong passphrase is an
+    /// error (the GCM tag), before anything is downloaded.
+    pub fn unlock(
+        passphrase: &str,
+        salt_b64: &str,
+        wrapped_b64: &str,
+        user_id: &str,
+    ) -> Result<AccountKey, JsError> {
+        let salt = decode_base64(salt_b64)?;
+        let wrapped = decode_base64(wrapped_b64)?;
+        let key = unlock_account_key(passphrase, &salt, &wrapped, user_id)?;
+        Ok(AccountKey {
+            key,
+            user_id: user_id.to_string(),
+            material: None,
+        })
+    }
+
+    /// Rebuild the handle from raw bytes kept elsewhere in the worker.
+    #[wasm_bindgen(js_name = fromBytes)]
+    pub fn from_bytes(key: &[u8], user_id: &str) -> Result<AccountKey, JsError> {
+        Ok(AccountKey {
+            key: key_bytes(key)?,
+            user_id: user_id.to_string(),
+            material: None,
+        })
+    }
+
+    /// JSON `{ wrapped, salt, verifier }` (base64) from the last `create` or
+    /// `rewrap`; an error on a handle that came from `unlock`.
+    pub fn material(&self) -> Result<String, JsError> {
+        let material = self
+            .material
+            .as_ref()
+            .ok_or_else(|| JsError::new("no material: this key was unlocked, not created"))?;
+        material_json(material)
+    }
+
+    /// Change the passphrase: the same key under a new KEK. Returns the JSON
+    /// for `PUT /auth/keys/rewrap` (the verifier is unchanged).
+    pub fn rewrap(&mut self, passphrase: &str) -> Result<String, JsError> {
+        let material = rewrap_account_key(&self.key, passphrase, &self.user_id)?;
+        let json = material_json(&material)?;
+        self.material = Some(material);
+        Ok(json)
+    }
+
+    /// The base64 verifier for this account (what a rewrap must present).
+    pub fn verifier(&self) -> String {
+        encode_base64(&obsink_core::account_verifier(&self.key, &self.user_id))
+    }
+
+    /// Wrap a vault key for this account: the `wrapped_key` of `POST /vaults`.
+    #[wasm_bindgen(js_name = wrapVaultKey)]
+    pub fn wrap_vault_key(&self, vault_key: &[u8], vault_id: &str) -> Result<String, JsError> {
+        let wrapped = wrap_vault_key(&self.key, &key_bytes(vault_key)?, vault_id)?;
+        Ok(encode_base64(&wrapped))
+    }
+
+    /// Recover a vault key from the member blob `GET /vaults` returned.
+    #[wasm_bindgen(js_name = unwrapVaultKey)]
+    pub fn unwrap_vault_key(&self, wrapped_b64: &str, vault_id: &str) -> Result<Vec<u8>, JsError> {
+        let wrapped = decode_base64(wrapped_b64)?;
+        Ok(unwrap_vault_key(&self.key, &wrapped, vault_id)?.to_vec())
+    }
+
+    /// The raw key, for the worker to keep alongside the handle.
+    pub fn bytes(&self) -> Vec<u8> {
+        self.key.to_vec()
+    }
+
+    #[wasm_bindgen(js_name = userId)]
+    pub fn user_id(&self) -> String {
+        self.user_id.clone()
     }
 }
 
@@ -261,6 +392,42 @@ mod tests {
             bound.content_hmac(b"same"),
             content_hmac(&native.content_mac, b"same")
         );
+    }
+
+    #[test]
+    fn account_key_wraps_vault_keys_and_speaks_json() {
+        let created = AccountKey::create("correct horse battery", "usr_1").unwrap();
+        let material: serde_json::Value =
+            serde_json::from_str(&created.material().unwrap()).unwrap();
+        let salt = material["salt"].as_str().unwrap();
+        let wrapped = material["wrapped"].as_str().unwrap();
+        assert_eq!(material["verifier"].as_str().unwrap(), created.verifier());
+
+        let unlocked = AccountKey::unlock("correct horse battery", salt, wrapped, "usr_1").unwrap();
+        assert_eq!(unlocked.bytes(), created.bytes());
+        assert_eq!(unlocked.user_id(), "usr_1");
+        // (A wrong passphrase is a JsError, covered in tests/node.rs.)
+
+        let vault_key = new_vault_key();
+        let blob = created.wrap_vault_key(&vault_key, "vault_a").unwrap();
+        assert_eq!(
+            unlocked.unwrap_vault_key(&blob, "vault_a").unwrap(),
+            vault_key
+        );
+        let keys = VaultKeys::from_vault_key(&vault_key).unwrap();
+        assert_eq!(
+            keys.content_hmac(b"x"),
+            content_hmac(
+                &derive_keys(&vault_key.as_slice().try_into().unwrap()).content_mac,
+                b"x"
+            )
+        );
+
+        let mut rewrapping = AccountKey::from_bytes(&created.bytes(), "usr_1").unwrap();
+        let rewrapped: serde_json::Value =
+            serde_json::from_str(&rewrapping.rewrap("another passphrase").unwrap()).unwrap();
+        assert_eq!(rewrapped["verifier"], material["verifier"]);
+        assert_ne!(rewrapped["salt"], material["salt"]);
     }
 
     #[test]

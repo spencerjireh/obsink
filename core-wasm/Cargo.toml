@@ -17,6 +17,8 @@ wasm-bindgen = "0.2"
 # Manifests, diffs, plans and choices cross the boundary as JSON strings
 # (already a core dependency; no extra serialisation layer).
 serde_json = "1"
+# Wipes the account key on drop, as core does for its sub-keys (same crate core uses).
+zeroize = "1"
 
 [dev-dependencies]
 # Runs the same tests inside a wasm runtime (`wasm-pack test --node`).
