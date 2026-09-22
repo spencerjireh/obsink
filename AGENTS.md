@@ -70,7 +70,8 @@ obsink/
   ios/                   # Xcode project: ObSink app + FileProvider ext + Tests (XcodeGen)
   docker-compose.yml     # local stack; docker-compose.coolify.yml for production
   scripts/               # build-ios, release-ios, testflight.py, ci-import-signing-cert, gen-icons,
-                         #   verify-* harnesses, test-web-container, test-install-sh, check-commit-msg
+                         #   verify-* harnesses (server, CLI, iOS sim, web e2e, desktop live + smoke),
+                         #   test-web-container, test-install-sh, check-commit-msg
   docs/                  # self-hosting, architecture, platforms, troubleshooting, p4-plan
   .github/               # ci.yml, release.yml, rulesets/main.json, PR template
   lefthook.yml           # git hooks: rustfmt, prettier, commit message
@@ -115,9 +116,12 @@ obsink/
    && npm run typecheck -w ui && npm run build -w desktop && npm run typecheck -w web
    && npm run test -w web && npm run build -w web` (the web steps need
    `wasm-pack build core-wasm --target web` first). CI enforces all of them on
-   every PR, plus the container route checks (`scripts/test-web-container.sh`)
-   and the install script test (`scripts/test-install-sh.sh`); run them before
-   considering work done.
+   every PR, plus the container route checks (`scripts/test-web-container.sh`),
+   the install script test (`scripts/test-install-sh.sh`) and the desktop unit
+   tests (`cargo test -p obsink-desktop`); run them before considering work
+   done. The desktop's live command tests and the window smoke run locally
+   against the compose stack: `scripts/verify-desktop-live.sh` and
+   `node scripts/verify-desktop-smoke.mjs` (optional, not a release gate).
 8. **No new dependencies without a one-line justification.** The core crypto
    stack (aes-gcm, argon2, hkdf, hmac, sha2) is fixed — do not swap it out.
 
@@ -142,11 +146,13 @@ docker run -d --name obsink-test-pg -e POSTGRES_PASSWORD=postgres -p 5433:5432 p
 DATABASE_URL=postgres://postgres:postgres@localhost:5433/postgres OBSINK_TEST_REQUIRE_DB=1 cargo test -p obsink-server
 
 # Local server stack (server built from this checkout + Postgres + Mailpit on :8025)
-docker compose up -d            # OBSINK_PORT=18080 if 8080 is taken
+docker compose up -d --wait     # OBSINK_PORT=18080 if 8080 is taken; never reads .env.deploy
 docker compose exec server obsink-server invite
 
 # Desktop (lint + format check, build the web bundle, then check the Tauri Rust)
-npm ci && npm run lint && npm run format:check && npm run typecheck -w ui && npm run build -w desktop && cargo check -p obsink-desktop
+npm ci && npm run lint && npm run format:check && npm run typecheck -w ui && npm run build -w desktop && cargo test -p obsink-desktop
+scripts/verify-desktop-live.sh          # ignored live command tests against the compose stack on :18080
+node scripts/verify-desktop-smoke.mjs   # real windows + tray through the debug automation seam
 
 # Browser client (needs the wasm-pack build above first)
 npm run typecheck -w web && npm run test -w web && npm run build -w web

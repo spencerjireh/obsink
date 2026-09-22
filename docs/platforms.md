@@ -72,7 +72,7 @@ App, dock, and menu-bar icons are generated from `design/icon.svg` and
 `design/tray.svg` by `scripts/gen-icons.sh` (see `DESIGN.md`); rerun it after
 editing either SVG and commit the rasters.
 
-The app lives in the menu bar (no Dock icon). The server it talks to is baked in at build time from `OBSINK_SERVER_URL` (fallback `https://obsink-api.spencerjireh.com`; the old `obsink.spencerjireh.com` host is an alias of it in every client, and the website there still proxies the API); there is no URL field in the UI. Setting `OBSINK_SERVER_URL` at launch overrides it, which is how the live tests and the compose smoke point a build at a local server. Self-hosters build the clients with their own URL.
+The app lives in the menu bar (no Dock icon). The server it talks to is baked in at build time from `OBSINK_SERVER_URL` (fallback `https://obsink-api.spencerjireh.com`; the old `obsink.spencerjireh.com` host is an alias of it in every client, and the website there still proxies the API); there is no URL field in the UI. Setting `OBSINK_SERVER_URL` at launch overrides it, which is how the live tests and the smoke script (`scripts/verify-desktop-smoke.mjs`) point a build at a local server. Self-hosters build the clients with their own URL.
 
 Every vault that can sync (on this server, key in the Keychain, signed in) gets a **daemon** at launch and whenever that set changes (sign-in, add, remove, delete, sign-out): the same driver as `obsink watch`, so an edit in Obsidian is on the server a couple of seconds later and a change from another device lands within the poll interval. `Sync now` and conflict resolutions are commands to the vault's daemon, so no two cycles overlap; the daemon's events feed the same state the popover reads (`Syncing…` while a cycle runs, `n conflicts` for what it left for you, the activity log). A vault without a daemon (no key yet) still syncs through the manual path. Extra ignore patterns go in `~/.obsink/app.json` as `"ignore": ["drafts/"]` on the vault entry.
 
@@ -86,17 +86,19 @@ Point Obsidian at the vault's local folder — it opens as a normal vault with n
 
 ### End-to-end verification
 
-The desktop command layer (the exact Tauri commands the UI invokes) is covered by ignored live integration tests that run against a server (the local compose stack works):
+The desktop command layer (the exact Tauri commands the UI invokes) is covered by ignored live integration tests that run against a server. `scripts/verify-desktop-live.sh` runs them against the local compose stack (`OBSINK_PORT=18080 docker compose up -d --wait` first; `OBSINK_SERVER_URL` and `OBSINK_API_KEY` override the defaults, and a server that is not localhost is refused unless `OBSINK_LIVE_ALLOW_REMOTE=1`). Under the hood:
 
 ```bash
-OBSINK_TEST_SERVER_URL=http://localhost:8080 \
+OBSINK_TEST_SERVER_URL=http://localhost:18080 \
 OBSINK_TEST_API_KEY=dev-operator-key OBSINK_TEST_PASSPHRASE=... \
 cargo test -p obsink-desktop live_tests -- --ignored --nocapture --test-threads=1
 ```
 
-Both tests sandbox `HOME`, so they run one at a time. `account_flow_live` signs the same address in twice and waits out the server's 60 s email cooldown, so expect about a minute.
+Both tests sandbox `HOME`, so they run one at a time. `account_flow_live` signs the same address in twice and waits out the server's 60 s email cooldown, so expect about two minutes.
 
-`desktop_flows_live` seeds the operator bearer into the file keyring the way a sign-in would; `account_flow_live` signs in with the email code and, on a server that already has accounts, mints the invite it needs with `OBSINK_TEST_API_KEY`.
+`desktop_flows_live` seeds the operator bearer into the file keyring the way a sign-in would; `account_flow_live` signs in with the email code and, on a server that already has accounts, mints the invite it needs with `OBSINK_TEST_API_KEY`. CI runs only the crate's unit tests (`cargo test -p obsink-desktop`); the live tests stay a local step.
+
+The windows and the tray are covered by `node scripts/verify-desktop-smoke.mjs`, a full-flow smoke with assertions against the same stack. Debug builds carry an automation seam (`desktop/src-tauri/src/automation.rs`, compiled only under `debug_assertions`): with `OBSINK_AUTOMATION_PORT` set, the app listens on `127.0.0.1:<port>` for one JSON line per connection (`ping`, `eval` a script body inside the `settings` or `popover` web view and get its value back, `show`, `hide`, `bounds`). The script builds the app with the frontend embedded (`cargo build -p obsink-desktop --features tauri/custom-protocol`), launches it with a sandboxed `HOME`, the file keyring and `OBSINK_SERVER_URL`, signs in and creates a vault through the same commands the UI calls, then drives the real settings window and popover by `data-testid` (the names are listed in `DESIGN.md`): Sync now, the activity log, a conflict against the CLI as the second device, Keep both, vault deletion. The tray menu's items are read through System Events, which needs Accessibility permission for the terminal (without it that step is reported and the run still passes); a right-click screenshot of the menu is attempted on top when `uv` is installed (a pyobjc snippet posts the click). Screenshots land in `OBSINK_SMOKE_SHOTS` (default inside the sandbox); `OBSINK_SMOKE_KEEP=1` leaves the app and sandbox running for a look. Release builds contain none of the seam.
 
 It verifies vault create/connect + passphrase validation, the full sync cycle with cross-device propagation, all three conflict resolutions (KeepLocal / KeepRemote / KeepBoth) via a three-way conflict (another device overwrites the server copy while the local file is edited), stale-vault detection (the banner's data source), and multi-vault switching. It uses a sandboxed `HOME` and the file-backed keyring (`OBSINK_KEYRING_DIR`) so it never prompts the macOS keychain or pollutes `~/.obsink/app.json`.
 

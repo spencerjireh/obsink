@@ -98,3 +98,18 @@ The worker died (out of memory, or the page was restored from the back-forward c
 
 **`The browser is out of storage for ObSink.`**
 IndexedDB hit its quota. Free space in the browser's site settings, or clear other sites' data; the vault's files are on disk and on the server, so the local bookkeeping rebuilds on the next sync.
+
+## Desktop smoke script
+
+- **`WARN: tray step skipped: System Events could not read the menu`** — the tray
+  step of `scripts/verify-desktop-smoke.mjs` reads the menu through the
+  accessibility API. Grant the terminal you run it from Accessibility in
+  System Settings > Privacy & Security > Accessibility and run it again. The
+  flows before it decide pass or fail; the tray step only reports.
+- **`no automation seam on port`** — the app was built without
+  `--features tauri/custom-protocol` or is a release build; the script builds
+  the right binary itself, so a stale `target/debug/obsink-desktop` from
+  another build is the usual cause. Rerun the script.
+- **`refusing http://...`** — the live and smoke scripts create and delete
+  accounts, so they only run against localhost unless `OBSINK_LIVE_ALLOW_REMOTE=1`
+  or `OBSINK_SMOKE_ALLOW_REMOTE=1`.
