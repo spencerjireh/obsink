@@ -218,6 +218,8 @@ jobs:
         run: npm run build -w desktop
       - name: Clippy the Tauri shell and the CLI (macOS keychain path)
         run: cargo clippy -p obsink-desktop -p obsink --all-targets -- -D warnings
+      - name: Desktop unit tests (the live tests stay ignored; scripts/verify-desktop-live.sh runs them locally)
+        run: cargo test -p obsink-desktop
       - name: Install shellcheck (not on the macOS runner image)
         run: brew install shellcheck
       - name: Lint the shell scripts (install.sh and the test scripts strictly, the rest for errors)
