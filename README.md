@@ -90,7 +90,7 @@ exponential backoff; HTTP status errors surface immediately as typed `ApiError`s
 | `server/` | `obsink-server` (axum): accounts, invites, vaults, files, batch, retention; Dockerfile |
 | `ui/` | The React screens and the `Backend` interface they run on (npm workspace shared by `desktop/` and the browser client) |
 | `desktop/` | Tauri v2 shell (menu-bar on macOS) and its Tauri `Backend` |
-| `web/` | Browser client at `/app` (Chrome, Edge): the same screens over a worker that syncs a local folder through the File System Access API |
+| `web/` | Browser client at `/app` (Chromium browsers): the same screens over a worker that syncs a local folder through the File System Access API; Dockerfile + Caddyfile of the website container |
 | `ios/`, `mobile/` | SwiftUI app + File Provider extension over the shared core |
 | `docker-compose.yml` | Local stack: server built from the checkout, Postgres, Mailpit |
 | `site/` | The landing page and `install.sh`, served by the `web` container next to the client |

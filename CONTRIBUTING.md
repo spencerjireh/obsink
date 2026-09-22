@@ -26,6 +26,7 @@ Conventions for agents and humans live in [AGENTS.md](AGENTS.md); this is the sh
 cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace && cargo deny check
 npm run lint && npm run format:check && npm run typecheck -w ui && npm run build -w desktop
+wasm-pack build core-wasm --target web && npm run typecheck -w web && npm run test -w web && npm run build -w web
 ```
 
 Security issues: see [SECURITY.md](SECURITY.md).

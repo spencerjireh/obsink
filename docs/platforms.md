@@ -42,7 +42,7 @@ If you omit `--passphrase`, the CLI prompts for it interactively.
 
 ## Browser
 
-The same screens as the desktop settings window, served at `/app` on the website (`web/`), for a Mac or PC without the app installed. It syncs a local folder through the File System Access API, so it works in Chrome and Edge; other browsers get a page that points at the downloads. There is no popover and no daemon: everything runs in a Web Worker while the tab is open, and stops when it closes.
+The same screens as the desktop settings window, served at `/app` on the website (`web/`), for a Mac or PC without the app installed. It syncs a local folder through the File System Access API, so it works in Chrome, Edge and other Chromium browsers over HTTPS; other browsers (and plain HTTP) get a page that says why and points at the downloads. There is no popover and no daemon: everything runs in a Web Worker while the tab is open, and stops when it closes.
 
 ```bash
 wasm-pack build core-wasm --target web    # the pure core for the browser (once, and after core changes)

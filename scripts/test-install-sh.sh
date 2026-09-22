@@ -60,7 +60,7 @@ echo "==> Installs from a well-formed release"
 if run_install; then
     [ -x "$work/dest/obsink" ] && pass "binary installed" || fail "binary missing"
     grep -q 'Installed obsink 9.9.9 at' "$work/out.txt" && pass "reports the installed version" || fail "no Installed line: $(cat "$work/out.txt")"
-    grep -q 'obsink login --server-url' "$work/out.txt" && pass "prints the next step" || fail "no next-step hint"
+    grep -q 'obsink login --email' "$work/out.txt" && pass "prints the next step" || fail "no next-step hint"
 else
     fail "install.sh exited $? : $(cat "$work/out.txt")"
 fi

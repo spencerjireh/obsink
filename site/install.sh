@@ -78,7 +78,7 @@ main() {
     version=$("$dest/obsink" --version 2>/dev/null || echo obsink)
     echo "==> Installed $version at $dest/obsink"
     [ -z "$path_hint" ] || echo "$path_hint"
-    echo "Next: obsink login --server-url $SERVER_URL --email you@example.com"
+    echo "Next: obsink login --email you@example.com   (talks to $SERVER_URL; --server-url for your own)"
     echo "      (a new account needs an invite code from an existing user: --invite-code)"
 }
 
