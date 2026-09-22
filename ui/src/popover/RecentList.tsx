@@ -20,7 +20,12 @@ export function RecentList({
       ) : (
         <ol className="recent__list">
           {events.map((event, index) => (
-            <li key={`${event.at}-${index}`} className={`recent__item recent__item--${event.kind}`}>
+            <li
+              key={`${event.at}-${index}`}
+              className={`recent__item recent__item--${event.kind}`}
+              data-testid="recentRow"
+              data-kind={event.kind}
+            >
               <span className="recent__text mono">{activityLine(event)}</span>
               <span className="recent__meta">
                 {states.length > 1 ? `${names.get(event.vault_id) ?? '?'} · ` : ''}

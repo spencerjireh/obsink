@@ -26,6 +26,8 @@ use obsink_core::{
 use serde::{Deserialize, Serialize};
 
 mod activity;
+#[cfg(debug_assertions)]
+mod automation;
 use activity::ActivityEvent;
 
 const APP_CONFIG_FILE: &str = ".obsink/app.json";
@@ -310,8 +312,9 @@ fn get_server_url() -> String {
     default_server_url()
 }
 
-/// A vault configured against another server (an older build, a moved
-/// `.env`). It is shown read-only; only "Remove from this device" applies.
+/// A vault configured against another server (an older build, a different
+/// `OBSINK_SERVER_URL` at build time). It is shown read-only; only "Remove
+/// from this device" applies.
 fn is_foreign(vault: &StoredVault) -> bool {
     vault.server_url != default_server_url()
 }
@@ -1709,6 +1712,8 @@ fn main() {
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             setup_tray(app.handle())?;
             reconcile_daemons(app.handle());
+            #[cfg(debug_assertions)]
+            automation::start_if_requested(app.handle().clone());
             Ok(())
         })
         .on_window_event(|window, event| match (window.label(), event) {

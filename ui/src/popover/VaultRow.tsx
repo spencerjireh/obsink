@@ -12,7 +12,7 @@ type Props = {
 
 export function VaultRow({ info, syncing, onOpen, onOpenFolder }: Props) {
   return (
-    <li className="vault-row">
+    <li className="vault-row" data-testid="popoverVaultRow" data-vault-id={info.id}>
       <button className="vault-row__main" onClick={onOpen} type="button">
         <StateDot tone={syncing ? 'pending' : stateTone(info)} />
         <span className="vault-row__name">{info.name}</span>

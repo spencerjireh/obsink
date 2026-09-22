@@ -54,6 +54,8 @@ export function VaultsTab({
                 key={info.id}
                 className={`vault-item${current ? ' vault-item--active' : ''}`}
                 aria-current={current ? 'page' : undefined}
+                data-testid="vaultCard"
+                data-vault-id={info.id}
                 onClick={() => onSelect(info.id)}
                 type="button"
               >
@@ -66,7 +68,13 @@ export function VaultsTab({
           })}
         </nav>
         <div className="vault-list__footer">
-          <button className="button button--ghost" disabled={adding} onClick={onAdd} type="button">
+          <button
+            className="button button--ghost"
+            data-testid="addVaultButton"
+            disabled={adding}
+            onClick={onAdd}
+            type="button"
+          >
             Add vault
           </button>
         </div>
@@ -103,7 +111,12 @@ export function VaultsTab({
                     : 'Pick a vault on the left.'}
                 </p>
               </div>
-              <button className="button button--primary" onClick={onAdd} type="button">
+              <button
+                className="button button--primary"
+                data-testid="addVaultButton"
+                onClick={onAdd}
+                type="button"
+              >
                 Add vault
               </button>
             </header>

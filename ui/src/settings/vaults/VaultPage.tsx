@@ -89,9 +89,9 @@ export function VaultPage({ info, account, message, notify, onError, onSignIn, o
           <h1>{info.name}</h1>
           <p className="state-line">
             <StateDot tone={stateTone(info)} />
-            <span>{runner.busy ? 'Syncing…' : stateText(info)}</span>
+            <span data-testid="vaultStateText">{runner.busy ? 'Syncing…' : stateText(info)}</span>
             <span aria-hidden="true"> · </span>
-            <span className="state-line__muted">
+            <span className="state-line__muted" data-testid="lastSyncedText">
               {info.last_synced
                 ? `Last synced ${formatRelative(info.last_synced)}`
                 : 'Never synced'}
@@ -118,6 +118,7 @@ export function VaultPage({ info, account, message, notify, onError, onSignIn, o
         </div>
         <button
           className="button button--primary"
+          data-testid="syncButton"
           disabled={busy || sessionExpired || !syncable}
           onClick={() => void runner.sync()}
           type="button"
@@ -211,7 +212,7 @@ export function VaultPage({ info, account, message, notify, onError, onSignIn, o
           </Notice>
         ) : null}
         {stale > 0 ? (
-          <Notice kind="warning">
+          <Notice kind="warning" testId="staleBanner">
             {plural(stale, 'file')} changed on another device. Sync before editing.
           </Notice>
         ) : null}

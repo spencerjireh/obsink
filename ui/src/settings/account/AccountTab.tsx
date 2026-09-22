@@ -44,6 +44,7 @@ export function AccountTab({ account, busy }: { account: Account; busy: boolean 
           </button>
           <button
             className="button button--danger"
+            data-testid="deleteAccountButton"
             disabled={busy || confirmingDelete}
             onClick={() => setConfirmingDelete(true)}
             type="button"

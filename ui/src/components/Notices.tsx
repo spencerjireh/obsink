@@ -7,9 +7,12 @@ type NoticeKind = 'info' | 'warning' | 'danger'
 export function Notice({
   kind = 'info',
   action,
+  testId = 'statusText',
   children,
 }: {
   kind?: NoticeKind
+  // The data-testid the harnesses read this notice by (DESIGN.md lists them).
+  testId?: string
   // One button the notice offers next to its text (for example `Sign in`).
   action?: ReactNode
   children: ReactNode
@@ -18,6 +21,8 @@ export function Notice({
     <div
       className={`notice notice--${kind}${action ? ' notice--actionable' : ''}`}
       role={kind === 'info' ? 'status' : 'alert'}
+      data-testid={testId}
+      data-kind={kind}
     >
       {action ? <span>{children}</span> : children}
       {action ? <span className="notice__action">{action}</span> : null}

@@ -172,7 +172,12 @@ export function AddVaultFlow({ account, message, notify, onError, onAdded, onClo
                 Open folder
               </button>
             ) : null}
-            <button className="button button--primary" onClick={onClose} type="button">
+            <button
+              className="button button--primary"
+              data-testid="addVaultDoneButton"
+              onClick={onClose}
+              type="button"
+            >
               Done
             </button>
           </div>
@@ -242,6 +247,8 @@ export function AddVaultFlow({ account, message, notify, onError, onAdded, onClo
               className={mode === 'connect' ? 'is-selected' : ''}
               aria-pressed={mode === 'connect'}
               disabled={remoteVaults !== null && remoteVaults.length === 0}
+              data-testid="addVaultModeButton"
+              data-mode="connect"
               onClick={() => setMode('connect')}
               type="button"
             >
@@ -250,6 +257,8 @@ export function AddVaultFlow({ account, message, notify, onError, onAdded, onClo
             <button
               className={mode === 'create' ? 'is-selected' : ''}
               aria-pressed={mode === 'create'}
+              data-testid="addVaultModeButton"
+              data-mode="create"
               onClick={() => setMode('create')}
               type="button"
             >
@@ -261,6 +270,7 @@ export function AddVaultFlow({ account, message, notify, onError, onAdded, onClo
               <label>
                 <span>Vault name</span>
                 <input
+                  data-testid="addVaultNameField"
                   autoFocus
                   value={vaultName}
                   onChange={(event) => setVaultName(event.target.value)}
@@ -274,7 +284,11 @@ export function AddVaultFlow({ account, message, notify, onError, onAdded, onClo
                 ) : remoteVaults.length === 0 ? (
                   <span className="empty-state">No vaults on this server yet. Create one.</span>
                 ) : (
-                  <select value={vaultId} onChange={(event) => setVaultId(event.target.value)}>
+                  <select
+                    data-testid="vaultPicker"
+                    value={vaultId}
+                    onChange={(event) => setVaultId(event.target.value)}
+                  >
                     {remoteVaults.map((vault) => (
                       <option key={vault.id} value={vault.id}>
                         {vault.name}
@@ -285,7 +299,12 @@ export function AddVaultFlow({ account, message, notify, onError, onAdded, onClo
               </label>
             )}
             <div className="choice-row form-grid__actions">
-              <button className="button button--primary" disabled={!valid} type="submit">
+              <button
+                className="button button--primary"
+                data-testid="addVaultNextButton"
+                disabled={!valid}
+                type="submit"
+              >
                 Next
               </button>
             </div>
@@ -328,6 +347,7 @@ export function AddVaultFlow({ account, message, notify, onError, onAdded, onClo
               <label className="form-grid__wide">
                 <span>Local vault path</span>
                 <input
+                  data-testid="addVaultPathField"
                   className="mono"
                   autoCapitalize="off"
                   autoCorrect="off"
@@ -343,7 +363,12 @@ export function AddVaultFlow({ account, message, notify, onError, onAdded, onClo
               <button className="button button--ghost" disabled={busy} onClick={back} type="button">
                 Back
               </button>
-              <button className="button button--primary" disabled={busy || !valid} type="submit">
+              <button
+                className="button button--primary"
+                data-testid="addVaultNextButton"
+                disabled={busy || !valid}
+                type="submit"
+              >
                 Next
               </button>
             </div>
@@ -372,6 +397,7 @@ export function AddVaultFlow({ account, message, notify, onError, onAdded, onClo
             <label>
               <span>Passphrase</span>
               <input
+                data-testid="addVaultPassphraseField"
                 type="password"
                 autoComplete="off"
                 autoFocus
@@ -383,7 +409,12 @@ export function AddVaultFlow({ account, message, notify, onError, onAdded, onClo
               <button className="button button--ghost" disabled={busy} onClick={back} type="button">
                 Back
               </button>
-              <button className="button button--primary" disabled={busy || !valid} type="submit">
+              <button
+                className="button button--primary"
+                data-testid="addVaultSubmitButton"
+                disabled={busy || !valid}
+                type="submit"
+              >
                 {busy ? 'Working…' : mode === 'create' ? 'Create vault' : 'Connect vault'}
               </button>
             </div>

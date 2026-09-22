@@ -73,6 +73,7 @@ export function PopoverApp() {
         <span className="popover__name">ObSink</span>
         <button
           className="icon-button"
+          data-testid="popoverOpenSettingsButton"
           aria-label="Open settings"
           title="Settings"
           onClick={() => openSettings()}
@@ -89,7 +90,9 @@ export function PopoverApp() {
           </svg>
         </button>
       </header>
-      <p className="popover__global">{busy ? 'Syncing…' : globalLine(states)}</p>
+      <p className="popover__global" data-testid="popoverGlobalText">
+        {busy ? 'Syncing…' : globalLine(states)}
+      </p>
 
       <ul className="popover__vaults" aria-label="Vaults">
         {states.map((info) => (
@@ -129,13 +132,19 @@ export function PopoverApp() {
       <footer className="popover__footer">
         <button
           className="button button--primary"
+          data-testid="popoverSyncButton"
           disabled={busy || !anySyncable}
           onClick={() => void syncAll()}
           type="button"
         >
           {busy ? 'Working…' : 'Sync now'}
         </button>
-        <button className="button button--ghost" onClick={() => openSettings()} type="button">
+        <button
+          className="button button--ghost"
+          data-testid="popoverSettingsButton"
+          onClick={() => openSettings()}
+          type="button"
+        >
           Settings
         </button>
       </footer>

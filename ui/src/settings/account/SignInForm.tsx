@@ -29,6 +29,7 @@ export function SignInForm({ account, busy }: { account: Account; busy: boolean 
       <label>
         <span>Email</span>
         <input
+          data-testid="emailField"
           autoComplete="email"
           disabled={form.codeSent}
           value={form.authEmail}
@@ -39,6 +40,7 @@ export function SignInForm({ account, busy }: { account: Account; busy: boolean 
         <label>
           <span>Invite code</span>
           <input
+            data-testid="inviteField"
             ref={inviteRef}
             className="mono"
             autoCapitalize="characters"
@@ -52,6 +54,7 @@ export function SignInForm({ account, busy }: { account: Account; busy: boolean 
         <label>
           <span>6-digit code</span>
           <input
+            data-testid="codeField"
             className="mono"
             inputMode="numeric"
             autoFocus
@@ -66,6 +69,7 @@ export function SignInForm({ account, busy }: { account: Account; busy: boolean 
             <button
               className="button button--primary"
               disabled={busy || form.authCode.trim().length !== 6}
+              data-testid="signInButton"
               type="submit"
             >
               Verify and sign in
@@ -83,6 +87,7 @@ export function SignInForm({ account, busy }: { account: Account; busy: boolean 
           <button
             className="button button--primary"
             disabled={busy || !form.authEmail.includes('@')}
+            data-testid="sendCodeButton"
             type="submit"
           >
             Send sign-in code
