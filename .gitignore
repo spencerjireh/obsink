@@ -13,7 +13,7 @@ node_modules/
 # Secrets / local env (never commit)
 .env
 .env.*
-!.env.example
+!.env.deploy.example
 
 # macOS
 .DS_Store

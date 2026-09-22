@@ -3,7 +3,7 @@
 # Contract check for a running ObSink server using the operator bearer:
 # vault lifecycle, manifest ETag / 304, conflict gating, multipart batch,
 # soft delete, /auth/me, invites. Needs curl and node.
-#   set -a; . ./.env; set +a; scripts/verify-server-deploy.sh
+#   set -a; . ./.env.deploy; set +a; scripts/verify-server-deploy.sh
 
 set -euo pipefail
 

@@ -106,10 +106,10 @@ Friends enter the code in the "Invite code" field when they sign in for the firs
 
 ## 5. Verify
 
-With `.env` holding `OBSINK_SERVER_URL` and `OBSINK_API_KEY` (see `.env.example`):
+With `.env.deploy` holding `OBSINK_SERVER_URL` and `OBSINK_API_KEY` (see `.env.deploy.example`):
 
 ```bash
-set -a; . ./.env; set +a
+set -a; . ./.env.deploy; set +a
 scripts/verify-server-deploy.sh        # contract: vaults, manifest ETag, conflict 409, batch, invites
 scripts/verify-cli-deployed-sync.sh    # two CLI "devices" sync and resolve a conflict
 ```

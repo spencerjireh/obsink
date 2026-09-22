@@ -2,7 +2,7 @@
 #
 # Two-device CLI sync against a running server (operator bearer): create,
 # connect, propagate, and resolve a conflict; deletes the vault afterwards.
-#   set -a; . ./.env; set +a; scripts/verify-cli-deployed-sync.sh
+#   set -a; . ./.env.deploy; set +a; scripts/verify-cli-deployed-sync.sh
 
 set -euo pipefail
 
