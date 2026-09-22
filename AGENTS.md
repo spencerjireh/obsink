@@ -152,7 +152,7 @@ docker compose exec server obsink-server invite
 # Desktop (lint + format check, build the web bundle, then check the Tauri Rust)
 npm ci && npm run lint && npm run format:check && npm run typecheck -w ui && npm run build -w desktop && cargo test -p obsink-desktop
 scripts/verify-desktop-live.sh          # ignored live command tests against the compose stack on :18080
-node scripts/verify-desktop-smoke.mjs   # real windows + tray through the debug automation seam
+node scripts/verify-desktop-smoke.mjs   # hidden windows + tray through the debug automation seam; OBSINK_SMOKE_SHOTS=dir for screenshots
 
 # Browser client (needs the wasm-pack build above first)
 npm run typecheck -w web && npm run test -w web && npm run build -w web

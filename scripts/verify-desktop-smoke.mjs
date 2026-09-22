@@ -8,17 +8,20 @@
 // Env: OBSINK_SERVER_URL (default http://localhost:18080), OBSINK_API_KEY
 // (operator bearer, default dev-operator-key; mints the invite a new account
 // needs), OBSINK_SMOKE_KEEP=1 keeps the sandbox and the app running at the end,
-// OBSINK_SMOKE_SHOTS=<dir> for the screenshots (default <sandbox>/shots). A
-// server that is not localhost is refused unless OBSINK_SMOKE_ALLOW_REMOTE=1.
+// OBSINK_SMOKE_SHOTS=<dir> shows each window for a moment to capture
+// conflict.png and popover.png (off by default). A server that is not
+// localhost is refused unless OBSINK_SMOKE_ALLOW_REMOTE=1.
 //
 // It builds the debug binary with the frontend embedded, launches it with a
 // sandboxed HOME and the file-backed keyring, signs in and creates a vault
 // through the same commands the UI calls, then drives the real settings window
 // and popover by data-testid: sync, activity log, a conflict against the CLI
-// as the second device, Keep both, vault deletion. The tray menu is opened
-// with a real right-click (uv + pyobjc) and read through System Events; that
-// step needs Accessibility permission for the terminal and is reported, not
-// fatal, when it is missing.
+// as the second device, Keep both, vault deletion. Every window stays hidden
+// (the web views run either way) and no mouse or keyboard input is ever
+// posted, so the run does not interfere with whatever else is on the screen;
+// with OBSINK_SMOKE_SHOTS the windows are shown without taking focus. The tray
+// menu is read through System Events, which needs Accessibility permission
+// for the terminal; that step is reported, not fatal, when it is missing.
 
 import { spawn, spawnSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
@@ -32,6 +35,7 @@ const REPO = join(dirname(fileURLToPath(import.meta.url)), '..')
 const SERVER = process.env.OBSINK_SERVER_URL ?? 'http://localhost:18080'
 const API_KEY = process.env.OBSINK_API_KEY ?? 'dev-operator-key'
 const KEEP = process.env.OBSINK_SMOKE_KEEP === '1'
+const SHOTS = process.env.OBSINK_SMOKE_SHOTS
 const EMAIL = `desktop-smoke-${Date.now()}@example.test`
 const PASSPHRASE = 'smoke-passphrase'
 const VAULT = `smoke-${Date.now()}`
@@ -162,65 +166,39 @@ const noticeIncludes = (window, text) =>
     `notice "${text}"`,
   )
 
-async function screenshot(window, file) {
-  const bounds = await seam('bounds', { window })
-  const region = [bounds.x, bounds.y, bounds.width, bounds.height].map(Math.round).join(',')
-  run('screencapture', ['-x', '-R', region, file])
-  console.log(`shot: ${file}`)
+// Only with OBSINK_SMOKE_SHOTS: show the window (the seam's `show` does not
+// activate the app or focus the window), capture its bounds, hide it again.
+async function screenshot(window, name) {
+  if (!SHOTS) return
+  const file = join(SHOTS, name)
+  await seam('show', { window })
+  try {
+    await sleep(500)
+    const bounds = await seam('bounds', { window })
+    const region = [bounds.x, bounds.y, bounds.width, bounds.height].map(Math.round).join(',')
+    run('screencapture', ['-x', '-R', region, file])
+    console.log(`shot: ${file}`)
+  } finally {
+    await seam('hide', { window })
+  }
 }
 
-// ---- tray (System Events for the menu; uv + pyobjc for a best-effort shot)
+// Selects a vault in the settings window through the event the tray and the
+// popover use; `open_settings` would also show and focus the window.
+const navigate = (vaultId) =>
+  evalIn(
+    'settings',
+    `await window.__TAURI_INTERNALS__.invoke('plugin:event|emit', {
+       event: 'settings://navigate',
+       payload: { tab: 'vaults', vault_id: ${JSON.stringify(vaultId)}, add_vault: false },
+     })`,
+  )
 
-const TRAY_PY = `# /// script
-# requires-python = ">=3.11"
-# dependencies = ["pyobjc-framework-Quartz"]
-# ///
-import sys, time, Quartz
+// ---- tray (System Events reads the menu; nothing is clicked) ------------
 
-def find(pid):
-    # The status item is a layer-25 window hosted by Control Center and named
-    # after the app's pid, once per display; prefer the main display's copy.
-    main = Quartz.CGDisplayBounds(Quartz.CGMainDisplayID())
-    found = None
-    for w in Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionAll, Quartz.kCGNullWindowID):
-        if w.get("kCGWindowLayer") != 25 or str(w.get("kCGWindowName") or "") != str(pid):
-            continue
-        b = w["kCGWindowBounds"]
-        on_main = Quartz.CGRectContainsPoint(main, Quartz.CGPointMake(b["X"] + 1, b["Y"] + 1))
-        if found is None or on_main:
-            found = (int(b["X"]), int(b["Y"]), int(b["Width"]), int(b["Height"]))
-    if found is None:
-        sys.exit(2)
-    print(*found)
-
-def rclick(x, y):
-    p = Quartz.CGPointMake(x, y)
-    post = lambda kind, button: Quartz.CGEventPost(
-        Quartz.kCGHIDEventTap, Quartz.CGEventCreateMouseEvent(None, kind, p, button))
-    post(Quartz.kCGEventMouseMoved, 0)
-    time.sleep(0.05)
-    post(Quartz.kCGEventRightMouseDown, 1)
-    time.sleep(0.05)
-    post(Quartz.kCGEventRightMouseUp, 1)
-
-def escape():
-    for down in (True, False):
-        Quartz.CGEventPost(Quartz.kCGHIDEventTap, Quartz.CGEventCreateKeyboardEvent(None, 53, down))
-
-mode = sys.argv[1]
-if mode == "find":
-    find(int(sys.argv[2]))
-elif mode == "rclick":
-    rclick(float(sys.argv[2]), float(sys.argv[3]))
-elif mode == "escape":
-    escape()
-`
-
-// The menu's items are readable through the accessibility API whether or not
-// the menu is open, so that is the assertion. The right-click screenshot is a
-// bonus: the status item is listed once per display and the capture depends
-// on which copy the window list returns, so it is reported, not asserted.
-async function trayStep(app, sandbox, shots) {
+// The menu's items are readable through the accessibility API without opening
+// the menu, so the tray needs no synthetic input at all.
+async function trayStep() {
   const names = spawnSync(
     'osascript',
     [
@@ -235,27 +213,6 @@ async function trayStep(app, sandbox, shots) {
   const items = names.stdout.trim().split(', ')
   for (const label of ['Sync now', 'Open settings', 'Check for updates', 'Quit ObSink']) {
     if (!items.includes(label)) return `tray menu lacks "${label}": ${items.join(' | ')}`
-  }
-  if (spawnSync('uv', ['--version']).status !== 0) {
-    console.log('tray: no uv, skipping the menu screenshot')
-    return null
-  }
-  const script = join(sandbox, 'tray.py')
-  await writeFile(script, TRAY_PY)
-  const py = (...args) => spawnSync('uv', ['run', '--quiet', script, ...args], { encoding: 'utf8' })
-  const found = py('find', String(app.pid))
-  if (found.status !== 0) {
-    console.log('tray: status item not in the window list, skipping the menu screenshot')
-    return null
-  }
-  const [x, y, w, h] = found.stdout.trim().split(' ').map(Number)
-  py('rclick', String(x + w / 2), String(y + h / 2))
-  await sleep(700)
-  try {
-    run('screencapture', ['-x', '-R', `${x - 200},${y},${w + 400},260`, join(shots, 'tray.png')])
-    console.log(`shot: ${join(shots, 'tray.png')} (best effort)`)
-  } finally {
-    py('escape')
   }
   return null
 }
@@ -286,12 +243,11 @@ const APP = join(REPO, 'target/debug/obsink-desktop')
 const CLI = join(REPO, 'target/debug/obsink')
 
 const sandbox = await mkdtemp(join(tmpdir(), 'obsink-smoke-'))
-const shots = process.env.OBSINK_SMOKE_SHOTS ?? join(sandbox, 'shots')
 const vaultA = join(sandbox, 'vaultA')
 const vaultB = join(sandbox, 'vaultB')
 await mkdir(join(vaultA, 'notes'), { recursive: true })
 await mkdir(vaultB, { recursive: true })
-await mkdir(shots, { recursive: true })
+if (SHOTS) await mkdir(SHOTS, { recursive: true })
 const appLog = join(sandbox, 'app.log')
 
 port = 40_000 + Math.floor(Math.random() * 20_000)
@@ -378,8 +334,7 @@ try {
   console.log(`setup: signed in as ${EMAIL}, vault ${vaultId}`)
 
   // Settings window: the vault page, Sync now, the activity log.
-  await seam('show', { window: 'settings' })
-  await invoke('open_settings', { target: { tab: 'vaults', vault_id: vaultId, add_vault: false } })
+  await navigate(vaultId)
   await until(
     'settings',
     `return !!document.querySelector('[data-testid=syncButton]')`,
@@ -401,7 +356,7 @@ try {
     'an activity row for the note',
   )
   await click('settings', '[data-testid=settingsTab][data-tab=vaults]')
-  await invoke('open_settings', { target: { tab: 'vaults', vault_id: vaultId, add_vault: false } })
+  await navigate(vaultId)
   console.log('settings: synced through the UI, activity row present')
 
   // Device B is the CLI; it gets the note, then both sides edit it. A's edit
@@ -445,7 +400,7 @@ try {
     `return !!document.querySelector('[data-testid=conflictRowTitle][data-path=${JSON.stringify(NOTE)}]')`,
     'the conflict card',
   )
-  await screenshot('settings', join(shots, 'conflict.png'))
+  await screenshot('settings', 'conflict.png')
   await click('settings', '[data-testid=winnerPicker][data-choice=KeepBoth]')
   await click('settings', '[data-testid=applyResolutionsButton]')
   await noticeIncludes('settings', 'Conflict resolutions applied.')
@@ -463,10 +418,7 @@ try {
   expect(existsSync(join(vaultB, 'notes/a.conflict.md')), 'B did not receive a.conflict.md')
   console.log('conflict: Keep both applied through the UI, both devices have both versions')
 
-  // Popover: the row, Sync now, a screenshot. Showing settings hides it and
-  // it hides on focus loss, so hide settings first and capture right away.
-  await seam('hide', { window: 'settings' })
-  await seam('show', { window: 'popover' })
+  // Popover: the row and Sync now, driven hidden like the settings window.
   await until(
     'popover',
     `const row = document.querySelector('[data-testid=popoverVaultRow][data-vault-id="${vaultId}"]')
@@ -479,18 +431,16 @@ try {
     `return document.querySelector('[data-testid=popoverSyncButton]').textContent === 'Sync now'`,
     'the popover sync to finish',
   )
-  await screenshot('popover', join(shots, 'popover.png'))
-  await seam('hide', { window: 'popover' })
+  await screenshot('popover', 'popover.png')
   console.log('popover: row and Sync now work')
 
-  trayProblem = await trayStep(app, sandbox, shots)
+  trayProblem = await trayStep()
   if (trayProblem) console.log(`WARN: tray step skipped: ${trayProblem}`)
   else console.log('tray: menu has the four items')
 
   // Delete the vault on the server through the UI. A daemon cycle may be
   // running at this moment, in which case the delete is refused; retry.
-  await seam('show', { window: 'settings' })
-  await invoke('open_settings', { target: { tab: 'vaults', vault_id: vaultId, add_vault: false } })
+  await navigate(vaultId)
   await until(
     'settings',
     `return !!document.querySelector('[data-testid=deleteVaultButton]')`,
@@ -517,7 +467,7 @@ try {
   }
   await noticeIncludes('settings', `Deleted ${VAULT} on the server.`)
   console.log('cleanup: vault deleted on the server')
-  console.log(`PASS: desktop smoke (screenshots in ${shots})`)
+  console.log(SHOTS ? `PASS: desktop smoke (screenshots in ${SHOTS})` : 'PASS: desktop smoke')
 } catch (error) {
   console.error(error.message)
   console.error(`--- app log (${appLog})\n${log.split('\n').slice(-40).join('\n')}`)

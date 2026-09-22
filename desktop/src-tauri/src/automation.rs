@@ -13,9 +13,9 @@
 //!   commands the UI calls (`await window.__TAURI_INTERNALS__.invoke(...)`).
 //!   WKWebView reports script errors only to its own log, so a syntax error
 //!   in `js` surfaces as the 30 s timeout.
-//! - `show {window}` / `hide {window}`: `settings` goes through
-//!   `show_settings` like the tray item; `popover` is centred first because
-//!   nothing anchors it to the tray icon here.
+//! - `show {window}` / `hide {window}`: shows the window without activating
+//!   the app or focusing it (the smoke only shows a window to capture it);
+//!   `popover` is centred first because nothing anchors it to the tray icon.
 //! - `bounds {window}`: outer position and size in points, for
 //!   `screencapture -R`.
 //!
@@ -111,21 +111,30 @@ fn dispatch(app: &AppHandle, request: &Value) -> Result<Value, String> {
             eval(&window(app, request)?, js)
         }
         Some("show") => {
+            // Show without activating the app or taking focus, so a smoke run
+            // that wants a screenshot still leaves the keyboard where it was.
+            // An inactive app's window stays behind the active app's, so it
+            // floats while shown; `hide` puts it back (the popover always
+            // floats).
             let target = window(app, request)?;
-            if target.label() == "settings" {
-                crate::show_settings(app, crate::SettingsTarget::vaults())
-                    .map_err(|e| e.to_string())?;
-            } else {
+            if target.label() == "popover" {
                 target.center().map_err(|e| e.to_string())?;
-                target.show().map_err(|e| e.to_string())?;
-                target.set_focus().map_err(|e| e.to_string())?;
+            } else {
+                target.set_always_on_top(true).map_err(|e| e.to_string())?;
+            }
+            target.show().map_err(|e| e.to_string())?;
+            if target.label() == "popover" {
                 app.emit_to(target.label(), "popover://opened", ())
                     .map_err(|e| e.to_string())?;
             }
             Ok(Value::Null)
         }
         Some("hide") => {
-            window(app, request)?.hide().map_err(|e| e.to_string())?;
+            let target = window(app, request)?;
+            target.hide().map_err(|e| e.to_string())?;
+            if target.label() != "popover" {
+                target.set_always_on_top(false).map_err(|e| e.to_string())?;
+            }
             Ok(Value::Null)
         }
         Some("bounds") => {
