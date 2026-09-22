@@ -17,7 +17,7 @@ The CLI is the simplest way to use ObSink and the easiest to script.
 
 ```bash
 # Sign in once per machine (emailed 6-digit code), then work with vaults
-obsink login --server-url <url> [--email <you@example.com>] [--invite-code <code>]
+obsink login [--server-url <url>] [--email <you@example.com>] [--invite-code <code>]
 obsink whoami                                     # account, signed-in devices, storage usage
 obsink invite [--list]                            # mint a code for someone else
 obsink vaults
@@ -30,7 +30,7 @@ obsink watch                      # keep syncing: watch the folder, poll the ser
 obsink status [--directory <path>]
 ```
 
-- `--server-url` also reads `OBSINK_SERVER_URL`; after the first command it defaults to the URL in the saved config. `--api-key` (`OBSINK_API_KEY`) supplies the operator bearer for scripts and harnesses; normal use is `login`.
+- `--server-url` also reads `OBSINK_SERVER_URL`; after the first command it defaults to the URL in the saved config, and before any config exists to the public server `https://obsink-api.spencerjireh.com` (a self-hosted build bakes its own by setting `OBSINK_SERVER_URL` at compile time, as the desktop app does). `--api-key` (`OBSINK_API_KEY`) supplies the operator bearer for scripts and harnesses; normal use is `login`.
 - Config lives at `~/.obsink/config.toml` (server URL, vault ID, local path — **no secrets**). Set `OBSINK_HOME` to relocate it (used for per-device isolation in tests). Configs written before the server pivot (`worker_url`) still load.
 - The macOS Keychain (service `obsink`) holds the encryption key (account = vault ID) and the server bearer (account = `bearer:<server url>`). `OBSINK_KEYRING_DIR=<dir>` swaps it for a directory of files (CI, harnesses).
 - Each vault directory keeps `.obsink/manifest.json` (last completed sync), `.obsink/remote-manifest.json` (last server manifest + ETag, so an unchanged manifest costs a `304`) and `.obsink/hash-cache.json` (the `(mtime, size) → hash` memo).

@@ -11,7 +11,7 @@ RUST_LOG=obsink_core=debug obsink sync   # logs go to stderr
 ## Authentication
 
 **`401 unauthorized` / `unauthorized: sign in again`**
-The session was revoked (Sign out on another device, account deleted) or expired (180 days), or the operator bearer does not match the server's `OBSINK_API_KEY`. Run `obsink login --server-url <url>` again; the desktop and iOS apps show "Signed out" and offer sign-in.
+The session was revoked (Sign out on another device, account deleted) or expired (180 days), or the operator bearer does not match the server's `OBSINK_API_KEY`. Run `obsink login` again (`--server-url <url>` for a server other than the default); the desktop and iOS apps show "Signed out" and offer sign-in.
 
 **`403 an invite code is required to create an account`**
 The server already has accounts, so a new one needs an invite. Ask any existing user for `obsink invite` (or the operator for `obsink-server invite`) and pass it with `--invite-code` / the Invite code field. `invite code is invalid, used, or expired` means the code was spent or is older than 7 days.
