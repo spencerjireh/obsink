@@ -625,7 +625,29 @@ async fn checkpoint(
         let next = checkpoint_manifest(&previous_base, &remote_manifest, &hold_back);
         save_manifest_to_disk(&manifest_path, &next)
     })
-    .await
+    .await?;
+    report_checkpoint(client, local_root).await;
+    Ok(())
+}
+
+/// Tell the server how far this device has synced (spec §3.2 step 7). Best
+/// effort: the ETag the fetch above cached is the revision; a failure is
+/// logged and never fails the sync or holds a path back.
+async fn report_checkpoint(client: &ApiClient, local_root: &Path) {
+    if client.device_id().is_none() {
+        return;
+    }
+    let revision = {
+        let root = local_root.to_path_buf();
+        blocking(move || Ok(load_remote_cache(&root).and_then(|cache| cache.etag)))
+            .await
+            .ok()
+            .flatten()
+            .and_then(|etag| etag.trim().trim_matches('"').parse::<u64>().ok())
+    };
+    if let Err(error) = client.attach_device(revision).await {
+        tracing::warn!(%error, "checkpoint report failed");
+    }
 }
 
 /// The on-disk manifest plus a tombstone for every base entry that is no
@@ -1125,7 +1147,8 @@ mod tests {
     fn config(base_url: String, local_path: String) -> VaultConfig {
         VaultConfig {
             server_url: base_url,
-            api_key: "token".to_string(),
+            bearer: "token".to_string(),
+            device_id: None,
             vault_id: "vault_123".to_string(),
             local_path,
             ignore: Vec::new(),

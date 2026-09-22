@@ -16,8 +16,8 @@ use obsink_core::{
     complete_sync, decrypt, derive_key, derive_keys, diff_local_and_remote, fetch_remote_manifest,
     load_local_state, normalize_server_url, prepare_sync, ApiClient, ApiError, AuthClient,
     AuthError, ConflictResolution, ConflictResolutionChoice, CreateVaultRequest, CryptoError,
-    KeyBytes, ProgressEvent, ProgressSink, SyncActionKind, SyncEngineError, SyncFailure, SyncPhase,
-    SyncPlan, VaultConfig, VaultSummary,
+    KeyBytes, ProgressEvent, ProgressSink, SignInDevice, SyncActionKind, SyncEngineError,
+    SyncFailure, SyncPhase, SyncPlan, VaultConfig, VaultSummary,
 };
 
 uniffi::setup_scaffolding!();
@@ -79,6 +79,8 @@ fn from_auth(error: AuthError, kind: CallKind) -> MobileError {
             message: error.to_string(),
         },
         AuthError::Server { status, message } => map_status(status.as_u16(), message, kind),
+        // Surfaced as its own screen by OBS-142; until then a plain message.
+        error @ AuthError::ProtocolMismatch { .. } => MobileError::sync(error),
     }
 }
 
@@ -145,9 +147,10 @@ impl From<MobileVaultConfig> for VaultConfig {
     fn from(value: MobileVaultConfig) -> Self {
         VaultConfig {
             server_url: value.server_url,
-            api_key: value.api_key,
+            bearer: value.api_key,
             vault_id: value.vault_id,
             local_path: value.local_path,
+            device_id: None,
             ignore: Vec::new(),
         }
     }
@@ -301,9 +304,10 @@ pub struct MobileConflictPreview {
 fn server_only(server_url: String, api_key: String) -> VaultConfig {
     VaultConfig {
         server_url,
-        api_key,
+        bearer: api_key,
         vault_id: String::new(),
         local_path: String::new(),
+        device_id: None,
         ignore: Vec::new(),
     }
 }
@@ -336,6 +340,7 @@ pub fn create_vault(
         name,
         max_file_size: 50 * 1024 * 1024,
         // v2: the wrapped vault key arrives with OBS-142.
+        id: None,
         wrapped_key: None,
     };
     let response =
@@ -495,10 +500,11 @@ pub fn auth_email_verify(
     device_name: String,
     invite_code: Option<String>,
 ) -> Result<MobileSession, MobileError> {
+    // v2 device identity until OBS-142 (a stable device id per phone).
     let session = block_on(AuthClient::new(&server_url).email_verify(
         &email,
         &code,
-        &device_name,
+        SignInDevice::Legacy(&device_name),
         clean_invite(invite_code.as_deref()),
     ))
     .map_err(|error| from_auth(error, CallKind::SignIn))?;
@@ -524,7 +530,7 @@ pub fn auth_apple(
     let session = block_on(
         AuthClient::new(&server_url).apple_sign_in(
             &identity_token,
-            &device_name,
+            SignInDevice::Legacy(&device_name),
             email.as_deref(),
             code.as_deref()
                 .map(str::trim)
@@ -546,14 +552,15 @@ pub fn auth_me(server_url: String, token: String) -> Result<MobileAccount, Mobil
     Ok(MobileAccount {
         user_id: user.id,
         email: user.email,
+        // The Swift side still says "session"; OBS-142 renames the record.
         devices: me
-            .sessions
+            .devices
             .into_iter()
-            .map(|session| MobileDevice {
-                session_id: session.id,
-                device_name: session.device_name,
-                created: session.created,
-                current: session.current,
+            .map(|device| MobileDevice {
+                session_id: device.id,
+                device_name: device.name,
+                created: device.created,
+                current: device.current,
             })
             .collect(),
         usage: me.usage.map(|usage| MobileUsage {
@@ -605,7 +612,7 @@ pub fn auth_revoke_session(
     token: String,
     session_id: String,
 ) -> Result<(), MobileError> {
-    block_on(AuthClient::new(&server_url).revoke_session(&token, &session_id))
+    block_on(AuthClient::new(&server_url).revoke_device(&token, &session_id))
         .map_err(|error| from_auth(error, CallKind::Bearer))
 }
 
@@ -625,9 +632,10 @@ pub fn delete_vault(
 ) -> Result<(), MobileError> {
     let config = VaultConfig {
         server_url,
-        api_key,
+        bearer: api_key,
         vault_id,
         local_path: String::new(),
+        device_id: None,
         ignore: Vec::new(),
     };
     block_on(ApiClient::new(config).delete_vault()).map_err(from_api)

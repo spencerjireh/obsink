@@ -176,6 +176,23 @@ pub fn new_salt() -> [u8; SALT_LEN] {
     salt
 }
 
+/// A fresh vault id in the server's shape (`vault_` + a UUID-like string),
+/// minted by the client so the vault key can be wrapped under its real id
+/// before `POST /vaults` (spec §4.3).
+pub fn new_vault_id() -> String {
+    let mut bytes = [0_u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    let h = hex::encode(bytes);
+    format!(
+        "vault_{}-{}-{}-{}-{}",
+        &h[..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..]
+    )
+}
+
 /// 32 random bytes: a fresh account key or vault key.
 pub fn new_key() -> KeyBytes {
     let mut key = [0_u8; 32];
@@ -393,9 +410,9 @@ pub fn unwrap_vault_key(
 mod tests {
     use super::{
         account_verifier, content_hmac, create_account_key, decode_base64, decrypt, decrypt_path,
-        derive_key, derive_keys, encrypt, encrypt_path, new_key, new_salt, path_token,
-        rewrap_account_key, unlock_account_key, unwrap_key, unwrap_vault_key, vault_wrap_key,
-        wrap_key, wrap_vault_key, CryptoError, PROTOCOL_VERSION, WRAPPED_KEY_LEN,
+        derive_key, derive_keys, encrypt, encrypt_path, new_key, new_salt, new_vault_id,
+        path_token, rewrap_account_key, unlock_account_key, unwrap_key, unwrap_vault_key,
+        vault_wrap_key, wrap_key, wrap_vault_key, CryptoError, PROTOCOL_VERSION, WRAPPED_KEY_LEN,
     };
 
     #[test]
@@ -664,5 +681,10 @@ mod tests {
         assert_ne!(new_key(), new_key());
         assert_ne!(new_salt(), new_salt());
         assert_eq!(PROTOCOL_VERSION, 3);
+        let id = new_vault_id();
+        assert_ne!(id, new_vault_id());
+        assert_eq!(id.len(), "vault_".len() + 36);
+        assert!(id.starts_with("vault_"));
+        assert!(id[6..].chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
     }
 }

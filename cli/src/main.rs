@@ -9,13 +9,18 @@ use std::{
 use clap::{Parser, Subcommand};
 use dirs::home_dir;
 use obsink_core::{
-    complete_sync, daemon_channel, derive_key, derive_keys, diff_local_and_remote,
-    fetch_remote_manifest,
-    keychain::{delete_secret, load_bearer, load_secret, save_secret},
-    load_local_state, normalize_server_url, prepare_sync, run_daemon, sync_manifest_path,
+    complete_sync, create_account_key, daemon_channel, decode_base64, derive_keys,
+    diff_local_and_remote, encode_base64, fetch_remote_manifest,
+    keychain::{
+        delete_account_key, delete_secret, load_account_key, load_bearer, load_or_create_device_id,
+        load_secret, load_secret_opt, save_account_key, save_secret, user_account,
+    },
+    load_local_state, new_key, new_vault_id, normalize_server_url, prepare_sync,
+    rewrap_account_key, run_daemon, sync_manifest_path, unwrap_vault_key, wrap_vault_key,
     write_atomic, ApiClient, AuthClient, Conflict, ConflictResolution, ConflictResolutionChoice,
-    CreateVaultRequest, DaemonEvent, DaemonOptions, KeyBytes, ProgressEvent, ProgressSink,
-    SyncActionKind, SyncFailure, SyncPhase, SyncPlan, VaultConfig,
+    CreateVaultRequest, DaemonEvent, DaemonOptions, Device, DevicePlatform, KeyBytes,
+    ProgressEvent, ProgressSink, SetKeysOutcome, SignInDevice, SyncActionKind, SyncFailure,
+    SyncPhase, SyncPlan, VaultConfig,
 };
 use rpassword::prompt_password;
 use serde::{Deserialize, Serialize};
@@ -39,17 +44,20 @@ struct Cli {
     command: Commands,
 }
 
-/// Which server to talk to and how to authenticate. `--server-url` falls back
-/// to the URL in the saved config, then to the built-in default; `--api-key`
-/// is the operator bearer (admin and harness use) and is remembered in the
-/// keychain, so it is needed once.
+/// Which server to talk to. `--server-url` falls back to the URL in the saved
+/// config, then to the built-in default. The credential is always the session
+/// from `obsink login` (there is no operator bearer, spec §4.1).
 #[derive(Debug, clap::Args)]
 struct ServerArgs {
     #[arg(long, env = "OBSINK_SERVER_URL")]
     server_url: Option<String>,
-    #[arg(long, env = "OBSINK_API_KEY", hide_env_values = true)]
-    api_key: Option<String>,
 }
+
+/// The passphrase for scripts: `OBSINK_PASSPHRASE` skips the prompt.
+const PASSPHRASE_ENV: &str = "OBSINK_PASSPHRASE";
+/// Spec §6.1: the wrapped account key is the new exposure, so the passphrase
+/// has a floor.
+const MIN_PASSPHRASE_CHARS: usize = 12;
 
 impl ServerArgs {
     fn url(&self) -> Result<String, Box<dyn std::error::Error>> {
@@ -76,7 +84,8 @@ fn pick_server_url(explicit: Option<&str>, saved: Option<String>) -> String {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Sign in to a server with an emailed one-time code.
+    /// Sign in to a server with an emailed one-time code, then set or enter
+    /// the account passphrase (`OBSINK_PASSPHRASE` skips the prompt).
     Login {
         #[arg(long)]
         email: Option<String>,
@@ -109,7 +118,23 @@ enum Commands {
         #[arg(long, env = "OBSINK_SERVER_URL")]
         server_url: Option<String>,
     },
-    /// List the vaults the current credential can see.
+    /// The account's devices; rename or sign one out from here.
+    Devices {
+        #[arg(long, env = "OBSINK_SERVER_URL")]
+        server_url: Option<String>,
+        /// Rename a device: `--rename <id> <new name>`.
+        #[arg(long, num_args = 2, value_names = ["ID", "NAME"])]
+        rename: Option<Vec<String>>,
+        /// Sign a device out for good (its folders stay where they are).
+        #[arg(long, value_name = "ID")]
+        revoke: Option<String>,
+    },
+    /// Change the account passphrase (the same key, rewrapped).
+    Passphrase {
+        #[arg(long, env = "OBSINK_SERVER_URL")]
+        server_url: Option<String>,
+    },
+    /// Every vault of the account, with its state on this machine.
     Vaults {
         #[command(flatten)]
         server: ServerArgs,
@@ -122,19 +147,35 @@ enum Commands {
         vault_name: String,
         #[arg(short, long, default_value = ".")]
         directory: PathBuf,
-        #[arg(long)]
-        passphrase: Option<String>,
     },
-    /// Attach this directory to an existing vault.
-    Connect {
+    /// Put an existing vault of the account into this directory.
+    #[command(alias = "connect")]
+    Download {
         #[command(flatten)]
         server: ServerArgs,
         #[arg(long)]
         vault_id: String,
         #[arg(short, long, default_value = ".")]
         directory: PathBuf,
+    },
+    /// Rename the configured vault for every device.
+    Rename {
         #[arg(long)]
-        passphrase: Option<String>,
+        name: String,
+    },
+    /// The archived versions of a file in the configured vault.
+    History {
+        path: String,
+    },
+    /// Files deleted from the configured vault in the last 30 days.
+    Trash,
+    /// Put an archived version (`--version <name>` from `history`) or the
+    /// newest trashed copy of a file back into the folder; the next sync
+    /// uploads it.
+    Restore {
+        path: String,
+        #[arg(long, value_name = "NAME")]
+        version: Option<String>,
     },
     Status {
         #[arg(short, long)]
@@ -147,9 +188,10 @@ enum Commands {
     Watch,
 }
 
-/// On-disk config. The bearer (session token or operator API key) is NOT
-/// here — it lives in the keychain under `bearer:<server_url>`. The
-/// `server_url` alias reads configs written before the server pivot.
+/// On-disk config. The bearer (session token) is NOT here — it lives in the
+/// keychain under `bearer:<server_url>`, next to the device id and the
+/// account key. The `server_url` alias reads configs written before the
+/// server pivot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CliConfig {
     #[serde(alias = "server_url")]
@@ -211,6 +253,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("signed out of {url}");
         }
         Commands::Whoami { server_url } => run_whoami(server_url).await?,
+        Commands::Devices {
+            server_url,
+            rename,
+            revoke,
+        } => run_devices(server_url, rename, revoke).await?,
+        Commands::Passphrase { server_url } => run_passphrase(server_url).await?,
         Commands::Invite { server_url, list } => {
             let url = resolve_server_url(server_url.as_deref())?;
             let token = load_bearer(&url)
@@ -228,51 +276,27 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("invite code: {} (expires {})", invite.code, invite.expires);
             }
         }
-        Commands::Vaults { server } => {
-            let (url, bearer) = resolve_server(&server)?;
-            let client = ApiClient::new(VaultConfig {
-                server_url: url,
-                api_key: bearer,
-                vault_id: String::new(),
-                local_path: String::new(),
-                ignore: Vec::new(),
-            });
-            let vaults = client.list_vaults().await?;
-
-            for vault in vaults {
-                println!("{} {}", vault.id, vault.name);
-            }
-        }
+        Commands::Vaults { server } => run_vaults(server).await?,
         Commands::Init {
             server,
             vault_name,
             directory,
-            passphrase,
-        } => run_init(server, vault_name, directory, passphrase).await?,
-        Commands::Connect {
+        } => run_init(server, vault_name, directory).await?,
+        Commands::Download {
             server,
             vault_id,
             directory,
-            passphrase,
-        } => {
-            let (url, _bearer) = resolve_server(&server)?;
-            let directory = resolve_vault_dir(&directory)?;
-            let key = derive_key_from_passphrase(passphrase, &vault_id)?;
-
-            let config = CliConfig {
-                server_url: url,
-                vault_id,
-                local_path: directory.display().to_string(),
-                ignore: Vec::new(),
-            };
-
-            validate_passphrase(&config, &key).await?;
-            save_secret(&config.vault_id, &hex::encode(key))?;
-            save_config(&config)?;
-            run_sync_for_config(&config, &key).await?;
-
-            println!("config: {}", config_path()?.display());
+        } => run_download(server, vault_id, directory).await?,
+        Commands::Rename { name } => {
+            let config = load_config()?;
+            ApiClient::new(to_vault_config(&config)?)
+                .rename_vault(name.trim())
+                .await?;
+            println!("renamed vault {} to {}", config.vault_id, name.trim());
         }
+        Commands::History { path } => run_history(path).await?,
+        Commands::Trash => run_trash().await?,
+        Commands::Restore { path, version } => run_restore(path, version).await?,
         Commands::Status { directory } => run_status(directory).await?,
         Commands::Sync => {
             let config = load_config()?;
@@ -301,6 +325,7 @@ async fn run_login(
     let url = resolve_server_url(server_url.as_deref())?;
     let auth = AuthClient::new(&url);
     let caps = auth.capabilities().await?;
+    caps.check_protocol()?;
     if !caps.auth.email {
         return Err(format!(
             "{url} does not offer email sign-in (the operator has not configured SMTP)"
@@ -329,9 +354,18 @@ async fn run_login(
             }
         }
     };
-    let device = device_name.unwrap_or_else(default_device_name);
+    let device = Device {
+        id: load_or_create_device_id(&url)?,
+        name: device_name.unwrap_or_else(default_device_name),
+        platform: DevicePlatform::Cli,
+    };
     let session = match auth
-        .email_verify(&email, code.trim(), &device, invite_code.as_deref())
+        .email_verify(
+            &email,
+            code.trim(),
+            SignInDevice::Device(&device),
+            invite_code.as_deref(),
+        )
         .await
     {
         Ok(session) => session,
@@ -343,13 +377,144 @@ async fn run_login(
         Err(error) => return Err(error.into()),
     };
     save_secret(&bearer_account(&url), &session.token)?;
+    save_secret(&user_account(&url), &session.user.id)?;
     // The URL is the normalized one (an alias of an old host reads as the
     // current host here), so the user sees which server holds the session.
     println!(
         "Signed in as {} on {url}.",
-        session.user.email.unwrap_or(session.user.id)
+        session
+            .user
+            .email
+            .clone()
+            .unwrap_or(session.user.id.clone())
     );
+    unlock_account(&auth, &session.token, &session.user.id).await?;
     Ok(())
+}
+
+/// Spec §12.1: set the passphrase on a new account (create-only; a lost race
+/// unlocks the winner's key instead) or enter it on an existing one, and keep
+/// the account key in the keychain.
+async fn unlock_account(
+    auth: &AuthClient,
+    token: &str,
+    user_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let outcome = match auth.get_keys(token).await? {
+        None => {
+            let passphrase = read_new_passphrase()?;
+            let (key, material) = create_account_key(&passphrase, user_id)?;
+            match auth.set_keys(token, &material).await? {
+                SetKeysOutcome::Created { key_id } => {
+                    save_account_key(user_id, &key, &key_id)?;
+                    println!("Passphrase set. There is no recovery if it is lost.");
+                    return Ok(());
+                }
+                SetKeysOutcome::Exists(blob) => {
+                    println!("A passphrase was already set on another device. Enter it.");
+                    Some(blob)
+                }
+            }
+        }
+        Some(blob) => Some(blob),
+    };
+    let blob = outcome.expect("an existing blob");
+    if let Ok((_, key_id)) = load_account_key(user_id) {
+        if key_id == blob.key_id {
+            println!("Unlocked (key already on this machine).");
+            return Ok(());
+        }
+        // A key from a lost first-set race: not the account's.
+        delete_account_key(user_id);
+    }
+    let passphrase = read_passphrase("Passphrase: ")?;
+    let key = blob
+        .unlock(&passphrase, user_id)
+        .map_err(|_| "Passphrase does not match this account.")?;
+    save_account_key(user_id, &key, &blob.key_id)?;
+    println!("Unlocked.");
+    Ok(())
+}
+
+/// The passphrase from `OBSINK_PASSPHRASE` or the prompt.
+fn read_passphrase(prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
+    if let Some(value) = std::env::var(PASSPHRASE_ENV)
+        .ok()
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(value);
+    }
+    Ok(prompt_password(prompt)?)
+}
+
+/// A new passphrase: at least 12 characters, entered twice unless it comes
+/// from the environment.
+fn read_new_passphrase() -> Result<String, Box<dyn std::error::Error>> {
+    let from_env = std::env::var(PASSPHRASE_ENV)
+        .ok()
+        .filter(|value| !value.is_empty());
+    let passphrase = match from_env {
+        Some(value) => value,
+        None => {
+            println!("Set the account passphrase. It unlocks every vault on every device.");
+            let first = prompt_password("Passphrase: ")?;
+            let second = prompt_password("Again: ")?;
+            if first != second {
+                return Err("the passphrases do not match".into());
+            }
+            first
+        }
+    };
+    if passphrase.chars().count() < MIN_PASSPHRASE_CHARS {
+        return Err(
+            format!("the passphrase needs at least {MIN_PASSPHRASE_CHARS} characters").into(),
+        );
+    }
+    Ok(passphrase)
+}
+
+/// `obsink passphrase`: rewrap the account key under a new passphrase.
+async fn run_passphrase(server_url: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let url = resolve_server_url(server_url.as_deref())?;
+    let (token, user_id) = signed_in(&url)?;
+    let (key, _) = load_account_key(&user_id)
+        .map_err(|_| "this machine holds no account key; run `obsink login`")?;
+    let current = read_passphrase("Current passphrase: ")?;
+    let auth = AuthClient::new(&url);
+    let blob = auth
+        .get_keys(&token)
+        .await?
+        .ok_or("the account has no passphrase yet; run `obsink login`")?;
+    if blob
+        .unlock(&current, &user_id)
+        .map_err(|_| "Passphrase does not match this account.")?
+        != key
+    {
+        return Err("Passphrase does not match this account.".into());
+    }
+    std::env::remove_var(PASSPHRASE_ENV);
+    let next = read_new_passphrase()?;
+    let material = rewrap_account_key(&key, &next, &user_id)?;
+    auth.rewrap_keys(&token, &material).await?;
+    println!("Passphrase changed.");
+    Ok(())
+}
+
+/// The bearer and user id of the signed-in account for a server.
+fn signed_in(url: &str) -> Result<(String, String), Box<dyn std::error::Error>> {
+    let token =
+        load_bearer(url).map_err(|_| format!("not signed in to {url}; run `obsink login`"))?;
+    let user_id = load_secret_opt(&user_account(url))?
+        .ok_or_else(|| format!("no account recorded for {url}; run `obsink login` again"))?;
+    Ok((token, user_id))
+}
+
+/// The unlocked account key for a server, or a pointer at `obsink login`.
+fn account_key_for(url: &str) -> Result<(String, String, KeyBytes), Box<dyn std::error::Error>> {
+    let (token, user_id) = signed_in(url)?;
+    let (key, _) = load_account_key(&user_id)
+        .map_err(|_| "this machine holds no account key; run `obsink login`")?;
+    Ok((token, user_id, key))
 }
 
 /// `obsink whoami`: the account, its devices and its usage.
@@ -359,22 +524,17 @@ async fn run_whoami(server_url: Option<String>) -> Result<(), Box<dyn std::error
         load_bearer(&url).map_err(|_| format!("not signed in to {url}; run `obsink login`"))?;
     let me = AuthClient::new(&url).me(&token).await?;
     println!("server: {url}");
-    match me.user {
-        Some(user) => {
-            println!("account: {} ({})", user.email.unwrap_or_default(), user.id);
-            for session in me.sessions {
-                println!(
-                    "  device: {}{}",
-                    session.device_name,
-                    if session.current {
-                        " (this device)"
-                    } else {
-                        ""
-                    }
-                );
-            }
-        }
-        None => println!("credential: operator API key ({})", me.kind),
+    if let Some(user) = me.user {
+        println!("account: {} ({})", user.email.unwrap_or_default(), user.id);
+    }
+    for device in me.devices {
+        println!(
+            "  device: {} [{}] {}{}",
+            device.name,
+            device.platform,
+            device.id,
+            if device.current { " (this device)" } else { "" }
+        );
     }
     if let Some(usage) = me.usage {
         let limit = match (usage.max_vault_bytes, usage.max_vaults) {
@@ -395,35 +555,126 @@ async fn run_whoami(server_url: Option<String>) -> Result<(), Box<dyn std::error
     Ok(())
 }
 
-/// `obsink init`: create the vault on the server, derive and store the key,
-/// save the config and run the first sync.
+/// `obsink vaults`: every vault of the account and whether this directory's
+/// config holds it (the CLI is configured per directory).
+async fn run_vaults(server: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let (url, bearer) = resolve_server(&server)?;
+    let device_id = load_or_create_device_id(&url).ok();
+    let client = ApiClient::new(VaultConfig {
+        server_url: url,
+        bearer,
+        vault_id: String::new(),
+        local_path: String::new(),
+        device_id: device_id.clone(),
+        ignore: Vec::new(),
+    });
+    let configured = load_config().ok().map(|config| config.vault_id);
+    for vault in client.list_vaults().await? {
+        let here = if configured.as_deref() == Some(vault.id.as_str()) {
+            "configured here"
+        } else if device_id
+            .as_deref()
+            .is_some_and(|id| vault.devices.iter().any(|device| device.id == id))
+        {
+            "on this device"
+        } else {
+            "not on this device"
+        };
+        println!(
+            "{} {} ({here}; revision {}, {} bytes, {} device(s))",
+            vault.id,
+            vault.name,
+            vault.revision,
+            vault.bytes,
+            vault.devices.len()
+        );
+    }
+    Ok(())
+}
+
+/// `obsink init`: a fresh vault key wrapped under the account key, the vault
+/// on the server, this device attached, the first sync.
 async fn run_init(
     server: ServerArgs,
     vault_name: String,
     directory: PathBuf,
-    passphrase: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (url, bearer) = resolve_server(&server)?;
+    let url = server.url()?;
+    let (bearer, _, account_key) = account_key_for(&url)?;
     let directory = resolve_vault_dir(&directory)?;
+    let device_id = load_or_create_device_id(&url)?;
+    let vault_key = new_key();
+    // The wrap's AAD is the vault id, so the id is minted here (spec §4.3).
+    let vault_id = new_vault_id();
     let client = ApiClient::new(VaultConfig {
         server_url: url.clone(),
-        api_key: bearer,
-        vault_id: String::new(),
+        bearer: bearer.clone(),
+        vault_id: vault_id.clone(),
         local_path: directory.display().to_string(),
+        device_id: Some(device_id.clone()),
         ignore: Vec::new(),
     });
     let response = client
         .create_vault(&CreateVaultRequest {
+            id: Some(vault_id.clone()),
             name: vault_name,
             max_file_size: 50 * 1024 * 1024,
-            // v2: the wrapped vault key arrives with OBS-136.
-            wrapped_key: None,
+            wrapped_key: Some(encode_base64(&wrap_vault_key(
+                &account_key,
+                &vault_key,
+                &vault_id,
+            )?)),
         })
         .await?;
-
     let vault_id = response.vault.id;
-    let key = derive_key_from_passphrase(passphrase, &vault_id)?;
-    save_secret(&vault_id, &hex::encode(key))?;
+    save_secret(&vault_id, &hex::encode(vault_key))?;
+    let config = CliConfig {
+        server_url: url,
+        vault_id,
+        local_path: directory.display().to_string(),
+        ignore: Vec::new(),
+    };
+    save_config(&config)?;
+    ApiClient::new(to_vault_config(&config)?)
+        .attach_device(None)
+        .await?;
+    run_sync_for_config(&config, &vault_key).await?;
+
+    println!("created vault {}", config.vault_id);
+    println!("config: {}", config_path()?.display());
+    Ok(())
+}
+
+/// `obsink download`: an existing vault of the account into this directory.
+async fn run_download(
+    server: ServerArgs,
+    vault_id: String,
+    directory: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let url = server.url()?;
+    let (bearer, _, account_key) = account_key_for(&url)?;
+    let directory = resolve_vault_dir(&directory)?;
+    let device_id = load_or_create_device_id(&url)?;
+    let client = ApiClient::new(VaultConfig {
+        server_url: url.clone(),
+        bearer,
+        vault_id: vault_id.clone(),
+        local_path: directory.display().to_string(),
+        device_id: Some(device_id),
+        ignore: Vec::new(),
+    });
+    let vault = client
+        .list_vaults()
+        .await?
+        .into_iter()
+        .find(|vault| vault.id == vault_id)
+        .ok_or_else(|| format!("vault {vault_id} is not one of this account's"))?;
+    let wrapped = vault
+        .wrapped_key
+        .ok_or("this vault has no key for the account (it was created before the passphrase)")?;
+    let vault_key = unwrap_vault_key(&account_key, &decode_base64(&wrapped)?, &vault_id)
+        .map_err(|_| "the vault key does not unwrap with this account key; sign in again")?;
+    save_secret(&vault_id, &hex::encode(vault_key))?;
 
     let config = CliConfig {
         server_url: url,
@@ -432,10 +683,102 @@ async fn run_init(
         ignore: Vec::new(),
     };
     save_config(&config)?;
-    run_sync_for_config(&config, &key).await?;
+    client.attach_device(None).await?;
+    run_sync_for_config(&config, &vault_key).await?;
 
-    println!("connected vault {}", config.vault_id);
+    println!("downloaded vault {} ({})", config.vault_id, vault.name);
     println!("config: {}", config_path()?.display());
+    Ok(())
+}
+
+/// `obsink devices`: list, rename, or revoke.
+async fn run_devices(
+    server_url: Option<String>,
+    rename: Option<Vec<String>>,
+    revoke: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let url = resolve_server_url(server_url.as_deref())?;
+    let (token, _) = signed_in(&url)?;
+    let auth = AuthClient::new(&url);
+    if let Some(args) = rename {
+        auth.rename_device(&token, &args[0], &args[1]).await?;
+        println!("renamed device {} to {}", args[0], args[1]);
+    }
+    if let Some(id) = revoke {
+        auth.revoke_device(&token, &id).await?;
+        println!("signed out device {id}; its folders stay where they are");
+    }
+    for device in auth.me(&token).await?.devices {
+        println!(
+            "{} [{}] {}{} last seen {} vaults {}",
+            device.id,
+            device.platform,
+            device.name,
+            if device.current { " (this device)" } else { "" },
+            device.last_seen,
+            device.vault_ids.len()
+        );
+    }
+    Ok(())
+}
+
+/// `obsink history <path>`: the archived versions of one file.
+async fn run_history(path: String) -> Result<(), Box<dyn std::error::Error>> {
+    let config = load_config()?;
+    let keys = derive_keys(&load_key_from_keychain(&config.vault_id)?);
+    let client = ApiClient::new(to_vault_config(&config)?);
+    let versions = client.list_versions(&path, &keys).await?;
+    if versions.is_empty() {
+        println!("no earlier versions kept for {path}");
+    }
+    for version in versions {
+        println!("{} ts {} size {}", version.name, version.ts, version.size);
+    }
+    Ok(())
+}
+
+/// `obsink trash`: the vault's recently deleted files.
+async fn run_trash() -> Result<(), Box<dyn std::error::Error>> {
+    let config = load_config()?;
+    let keys = derive_keys(&load_key_from_keychain(&config.vault_id)?);
+    let client = ApiClient::new(to_vault_config(&config)?);
+    let entries = client.list_trash(&keys).await?;
+    if entries.is_empty() {
+        println!("nothing deleted in the last 30 days");
+    }
+    for entry in entries {
+        println!(
+            "{} deleted {} size {}",
+            entry.path, entry.deleted_at, entry.size
+        );
+    }
+    Ok(())
+}
+
+/// `obsink restore <path> [--version <name>]`: write the version (or the
+/// newest trashed copy) into the folder. The next sync uploads it through the
+/// conflict-gated PUT (spec §8.2, §9.3).
+async fn run_restore(
+    path: String,
+    version: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = load_config()?;
+    let keys = derive_keys(&load_key_from_keychain(&config.vault_id)?);
+    let client = ApiClient::new(to_vault_config(&config)?);
+    let bytes = match &version {
+        Some(name) => client.get_version(&path, name, &keys).await?,
+        None => client.get_trash(&path, &keys).await?,
+    };
+    let target = Path::new(&config.local_path).join(&path);
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    write_atomic(&target, &bytes)?;
+    println!(
+        "restored {path} ({} bytes) from {}; run `obsink sync` to upload it",
+        bytes.len(),
+        version.as_deref().unwrap_or("the trash")
+    );
     Ok(())
 }
 
@@ -537,22 +880,15 @@ async fn run_watch(config: &CliConfig, key: &KeyBytes) -> Result<(), Box<dyn std
     Ok(())
 }
 
-/// Work out the server URL and bearer for a server-facing command. A supplied
-/// `--api-key` is remembered in the keychain for the URL; otherwise the stored
-/// credential (session token from `login`, or an earlier `--api-key`) is used.
+/// Work out the server URL and bearer for a server-facing command: the
+/// session token `login` stored for the URL.
 fn resolve_server(server: &ServerArgs) -> Result<(String, String), Box<dyn std::error::Error>> {
     let url = server.url()?;
-    let account = bearer_account(&url);
-    if let Some(api_key) = server.api_key.as_deref().filter(|key| !key.is_empty()) {
-        save_secret(&account, api_key)?;
-        return Ok((url, api_key.to_string()));
-    }
     match load_bearer(&url) {
         Ok(bearer) => Ok((url, bearer)),
-        Err(_) => Err(format!(
-            "no credential for {url}: run `obsink login --server-url {url}` (or pass --api-key for the operator bearer)"
-        )
-        .into()),
+        Err(_) => {
+            Err(format!("no credential for {url}: run `obsink login --server-url {url}`").into())
+        }
     }
 }
 
@@ -736,48 +1072,19 @@ fn prompt_conflict_resolutions(
     Ok(resolutions)
 }
 
-async fn validate_passphrase(
-    config: &CliConfig,
-    key: &KeyBytes,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let keys = derive_keys(key);
-    let client = ApiClient::new(to_vault_config(config)?);
-    let manifest = fetch_remote_manifest(&client, Path::new(&config.local_path), &keys).await?;
-
-    if let Some((path, entry)) = manifest.iter().find(|(_, entry)| !entry.deleted) {
-        let blob = client.get_file(path, &keys).await?;
-        obsink_core::decrypt(&keys.content_enc, &blob)?;
-        println!("validated passphrase against {path}");
-        println!("remote size: {} bytes", entry.size);
-    }
-
-    Ok(())
-}
-
-fn derive_key_from_passphrase(
-    passphrase: Option<String>,
-    vault_id: &str,
-) -> Result<KeyBytes, Box<dyn std::error::Error>> {
-    let passphrase = match passphrase {
-        Some(passphrase) => passphrase,
-        None => prompt_password("Passphrase: ")?,
-    };
-
-    Ok(derive_key(&passphrase, vault_id.as_bytes())?)
-}
-
 fn to_vault_config(config: &CliConfig) -> Result<VaultConfig, Box<dyn std::error::Error>> {
     let bearer = load_secret(&bearer_account(&config.server_url)).map_err(|_| {
         format!(
-            "no credential for {}: run `obsink login` or `obsink connect --api-key ...`",
+            "no credential for {}: run `obsink login`",
             config.server_url
         )
     })?;
     Ok(VaultConfig {
         server_url: config.server_url.clone(),
-        api_key: bearer,
+        bearer,
         vault_id: config.vault_id.clone(),
         local_path: config.local_path.clone(),
+        device_id: load_or_create_device_id(&config.server_url).ok(),
         ignore: config.ignore.clone(),
     })
 }

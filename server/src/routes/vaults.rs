@@ -27,6 +27,9 @@ use crate::{
 
 #[derive(Deserialize)]
 pub struct CreateVaultBody {
+    /// A client-minted id (`vault_` + 36 hex/dash characters) so the wrapped
+    /// key's AAD is the real id. The server mints one when absent.
+    pub id: Option<String>,
     pub name: Option<String>,
     pub max_file_size: Option<u64>,
     /// The vault key wrapped under the caller's account key (base64). Optional
@@ -195,6 +198,20 @@ pub async fn create(
         return Err(ApiError::bad_request("vault name is required"));
     }
     let wrapped_key = decode_wrapped_key(body.wrapped_key.as_deref())?;
+    let id = match body
+        .id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        Some(id) if valid_vault_id(id) => id.to_string(),
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "id must be vault_ followed by a UUID",
+            ))
+        }
+        None => crypto::new_id("vault"),
+    };
     let max_file_size = body
         .max_file_size
         .unwrap_or(state.config.max_file_bytes)
@@ -223,7 +240,16 @@ pub async fn create(
             state.config.max_vaults_per_user
         )));
     }
-    let id = crypto::new_id("vault");
+    let taken: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM vaults WHERE id = $1")
+        .bind(&id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if taken.is_some() {
+        return Err(ApiError::status(
+            StatusCode::CONFLICT,
+            "a vault with that id already exists",
+        ));
+    }
     sqlx::query("INSERT INTO vaults (id, owner, name_enc, created, max_file_size, last_write) VALUES ($1, $2, $3, $4, $5, $4)")
         .bind(&id)
         .bind(owner)

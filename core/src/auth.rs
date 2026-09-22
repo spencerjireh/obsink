@@ -1,10 +1,10 @@
-//! Account sign-in against an ObSink server.
+//! Account sign-in, the account key, and devices against an ObSink server
+//! (spec §4.1, §6.1).
 //!
 //! The server offers two ways to obtain a session bearer: an emailed one-time
-//! code (all platforms) and Sign in with Apple (iOS). The resulting token is
-//! stored by the client in the OS keychain and used as
-//! [`VaultConfig::api_key`](crate::VaultConfig) — the sync engine does not
-//! distinguish a session from the operator `API_KEY`.
+//! code (all platforms) and Sign in with Apple (iOS). Every sign-in names the
+//! device (spec §4.1); the resulting token is stored by the client in the OS
+//! keychain and used as [`VaultConfig::bearer`](crate::VaultConfig).
 
 use std::time::Duration;
 
@@ -12,7 +12,10 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::server_url::normalize_server_url;
+use crate::{
+    crypto::{decode_base64, AccountKeyMaterial, PROTOCOL_VERSION},
+    server_url::normalize_server_url,
+};
 
 #[derive(Debug, Error)]
 pub enum AuthError {
@@ -21,16 +24,110 @@ pub enum AuthError {
     /// The server answered with an error body: `{ "error": "..." }`.
     #[error("{message}")]
     Server { status: StatusCode, message: String },
+    /// The server speaks another wire format: the client shows `Update ObSink`.
+    #[error("this ObSink is too old for the server (protocol {server}, client {client})")]
+    ProtocolMismatch { server: u32, client: u32 },
 }
 
 /// What sign-in methods a server offers (`GET /`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capabilities {
     pub service: String,
+    /// The wire format the server speaks; `0` from a server too old to say.
+    #[serde(default)]
+    pub protocol: u32,
     pub auth: AuthMethods,
     /// True once the server has an account: new sign-ups need an invite code.
     #[serde(default)]
     pub invite_required: bool,
+}
+
+impl Capabilities {
+    /// The protocol gate (spec §15.5): a client speaks exactly one version.
+    pub fn check_protocol(&self) -> Result<(), AuthError> {
+        if self.protocol == PROTOCOL_VERSION {
+            Ok(())
+        } else {
+            Err(AuthError::ProtocolMismatch {
+                server: self.protocol,
+                client: PROTOCOL_VERSION,
+            })
+        }
+    }
+}
+
+/// The platform a device reports at sign-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DevicePlatform {
+    Macos,
+    Ios,
+    Browser,
+    Cli,
+}
+
+/// The physical machine signing in: a client-generated id the client keeps
+/// for good (spec §4.1), a display name, and the platform.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Device {
+    pub id: String,
+    pub name: String,
+    pub platform: DevicePlatform,
+}
+
+/// How a sign-in identifies its device. `Legacy` is the v2 body (a name
+/// only; the server synthesizes a device) that the desktop and iOS clients
+/// send until OBS-140 / OBS-142; removed in OBS-143.
+#[derive(Debug, Clone, Copy)]
+pub enum SignInDevice<'a> {
+    Device(&'a Device),
+    Legacy(&'a str),
+}
+
+impl SignInDevice<'_> {
+    fn apply(self, body: &mut serde_json::Value) {
+        match self {
+            SignInDevice::Device(device) => {
+                body["device"] = serde_json::to_value(device).expect("device serialises");
+            }
+            SignInDevice::Legacy(name) => {
+                body["device_name"] = serde_json::Value::String(name.to_string());
+            }
+        }
+    }
+}
+
+/// The wrapped account key as the server holds it (`GET /auth/keys`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountKeyBlob {
+    pub key_id: String,
+    /// Base64 of the wrapped key.
+    pub wrapped: String,
+    /// Base64 of the Argon2id salt.
+    pub salt: String,
+}
+
+impl AccountKeyBlob {
+    /// Unlock the account key with the passphrase (spec §12.1).
+    pub fn unlock(
+        &self,
+        passphrase: &str,
+        user_id: &str,
+    ) -> Result<crate::KeyBytes, crate::CryptoError> {
+        let salt = decode_base64(&self.salt)?;
+        let wrapped = decode_base64(&self.wrapped)?;
+        crate::unlock_account_key(passphrase, &salt, &wrapped, user_id)
+    }
+}
+
+/// What `PUT /auth/keys` answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetKeysOutcome {
+    /// This device set the passphrase; the generated key is the account key.
+    Created { key_id: String },
+    /// Another device set it first (spec §12.1): discard the generated key and
+    /// unlock this blob instead.
+    Exists(AccountKeyBlob),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,6 +161,9 @@ impl std::fmt::Debug for Session {
 pub struct SessionInfo {
     pub id: String,
     pub expires: u64,
+    /// The device this session belongs to (absent from a v2 server).
+    #[serde(default)]
+    pub device_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,13 +174,11 @@ pub struct UserInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Me {
-    /// `"user"` on v2 servers; absent from v3 responses (one principal).
-    #[serde(default)]
-    pub kind: String,
     pub user: Option<MeUser>,
+    /// Every device of the account, this one tagged `current`.
     #[serde(default)]
-    pub sessions: Vec<MeSession>,
-    /// Storage accounting for the principal's vaults.
+    pub devices: Vec<MeDevice>,
+    /// Storage accounting for the account's vaults.
     #[serde(default)]
     pub usage: Option<Usage>,
 }
@@ -127,12 +225,17 @@ pub struct MeUser {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MeSession {
+pub struct MeDevice {
     pub id: String,
-    #[serde(rename = "deviceName")]
-    pub device_name: String,
+    pub name: String,
+    pub platform: String,
     pub created: u64,
+    #[serde(default)]
+    pub last_seen: u64,
     pub current: bool,
+    /// The vaults this device holds.
+    #[serde(default)]
+    pub vault_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -191,15 +294,15 @@ impl AuthClient {
         &self,
         email: &str,
         code: &str,
-        device_name: &str,
+        device: SignInDevice<'_>,
         invite_code: Option<&str>,
     ) -> Result<Session, AuthError> {
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "email": email,
             "code": code,
-            "device_name": device_name,
             "invite_code": invite_code,
         });
+        device.apply(&mut body);
         parse(
             self.client
                 .post(self.url("auth/email/verify"))
@@ -219,18 +322,18 @@ impl AuthClient {
     pub async fn apple_sign_in(
         &self,
         identity_token: &str,
-        device_name: &str,
+        device: SignInDevice<'_>,
         email: Option<&str>,
         code: Option<&str>,
         invite_code: Option<&str>,
     ) -> Result<Session, AuthError> {
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "identity_token": identity_token,
-            "device_name": device_name,
             "email": email,
             "code": code,
             "invite_code": invite_code,
         });
+        device.apply(&mut body);
         parse(
             self.client
                 .post(self.url("auth/apple"))
@@ -264,12 +367,109 @@ impl AuthClient {
         .await
     }
 
-    /// Revoke another session of the same account.
-    pub async fn revoke_session(&self, token: &str, session_id: &str) -> Result<(), AuthError> {
+    /// Sign another device of the account out for good (spec §4.1): its
+    /// session and vault attachments go with it; its folders stay.
+    pub async fn revoke_device(&self, token: &str, device_id: &str) -> Result<(), AuthError> {
         expect_empty(
             self.client
-                .delete(self.url(&format!("auth/sessions/{session_id}")))
+                .delete(self.url(&format!("auth/devices/{device_id}")))
                 .bearer_auth(token)
+                .send()
+                .await?,
+        )
+        .await
+    }
+
+    /// Rename a device of the account, from any device.
+    pub async fn rename_device(
+        &self,
+        token: &str,
+        device_id: &str,
+        name: &str,
+    ) -> Result<(), AuthError> {
+        expect_empty(
+            self.client
+                .patch(self.url(&format!("auth/devices/{device_id}")))
+                .bearer_auth(token)
+                .json(&serde_json::json!({ "name": name }))
+                .send()
+                .await?,
+        )
+        .await
+    }
+
+    /// The wrapped account key, or `None` before the first `set_keys`.
+    pub async fn get_keys(&self, token: &str) -> Result<Option<AccountKeyBlob>, AuthError> {
+        #[derive(Deserialize)]
+        struct Body {
+            account_key: Option<AccountKeyBlob>,
+        }
+        let body: Body = parse(
+            self.client
+                .get(self.url("auth/keys"))
+                .bearer_auth(token)
+                .send()
+                .await?,
+        )
+        .await?;
+        Ok(body.account_key)
+    }
+
+    /// Set the passphrase for the first time. Create-only: when another
+    /// device won the race the answer is `Exists` with its blob.
+    pub async fn set_keys(
+        &self,
+        token: &str,
+        material: &AccountKeyMaterial,
+    ) -> Result<SetKeysOutcome, AuthError> {
+        let response = self
+            .client
+            .put(self.url("auth/keys"))
+            .bearer_auth(token)
+            .json(&material_json(material))
+            .send()
+            .await?;
+        match response.status() {
+            StatusCode::CREATED => {
+                #[derive(Deserialize)]
+                struct Body {
+                    key_id: String,
+                }
+                let body: Body = response.json().await?;
+                Ok(SetKeysOutcome::Created {
+                    key_id: body.key_id,
+                })
+            }
+            StatusCode::CONFLICT => {
+                #[derive(Deserialize)]
+                struct Body {
+                    account_key: Option<AccountKeyBlob>,
+                }
+                let body: Body = response.json().await?;
+                match body.account_key {
+                    Some(blob) => Ok(SetKeysOutcome::Exists(blob)),
+                    None => Err(AuthError::Server {
+                        status: StatusCode::CONFLICT,
+                        message: "the passphrase was set elsewhere; sign in again".to_string(),
+                    }),
+                }
+            }
+            status => Err(server_error(status, response).await),
+        }
+    }
+
+    /// A passphrase change: the same account key under a new KEK. The
+    /// material's verifier must match the one the server holds.
+    pub async fn rewrap_keys(
+        &self,
+        token: &str,
+        material: &AccountKeyMaterial,
+    ) -> Result<(), AuthError> {
+        expect_empty(
+            self.client
+                .put(self.url("auth/keys/rewrap"))
+                .bearer_auth(token)
+                .json(&material_json(material))
                 .send()
                 .await?,
         )
@@ -323,6 +523,14 @@ impl AuthClient {
     }
 }
 
+fn material_json(material: &AccountKeyMaterial) -> serde_json::Value {
+    serde_json::json!({
+        "wrapped": material.wrapped_b64(),
+        "salt": material.salt_b64(),
+        "verifier": material.verifier_b64(),
+    })
+}
+
 async fn parse<T: serde::de::DeserializeOwned>(
     response: reqwest::Response,
 ) -> Result<T, AuthError> {
@@ -361,9 +569,21 @@ async fn server_error(status: StatusCode, response: reqwest::Response) -> AuthEr
 
 #[cfg(test)]
 mod tests {
-    use httpmock::{Method::DELETE, Method::GET, Method::POST, MockServer};
+    use httpmock::{
+        Method::DELETE, Method::GET, Method::PATCH, Method::POST, Method::PUT, MockServer,
+    };
 
-    use super::{AuthClient, AuthError};
+    use super::{
+        AuthClient, AuthError, Capabilities, Device, DevicePlatform, SetKeysOutcome, SignInDevice,
+    };
+
+    fn cli_device() -> Device {
+        Device {
+            id: "dev-1".into(),
+            name: "cli".into(),
+            platform: DevicePlatform::Cli,
+        }
+    }
 
     #[test]
     fn session_debug_redacts_the_token() {
@@ -372,6 +592,7 @@ mod tests {
             session: super::SessionInfo {
                 id: "sess_1".into(),
                 expires: 0,
+                device_id: None,
             },
             user: super::UserInfo {
                 id: "user_1".into(),
@@ -397,12 +618,15 @@ mod tests {
             .await;
         let verify = server
             .mock_async(|when, then| {
-                when.method(POST).path("/auth/email/verify").json_body(serde_json::json!({
-                    "email": "a@b.co", "code": "123456", "device_name": "cli", "invite_code": "ABCD2345"
-                }));
+                when.method(POST)
+                    .path("/auth/email/verify")
+                    .json_body(serde_json::json!({
+                        "email": "a@b.co", "code": "123456", "invite_code": "ABCD2345",
+                        "device": { "id": "dev-1", "name": "cli", "platform": "cli" }
+                    }));
                 then.status(200).json_body(serde_json::json!({
                     "token": "os_abc",
-                    "session": { "id": "ses_1", "expires": 99 },
+                    "session": { "id": "ses_1", "expires": 99, "device_id": "dev-1" },
                     "user": { "id": "usr_1", "email": "a@b.co" }
                 }));
             })
@@ -413,9 +637,9 @@ mod tests {
                     .path("/auth/me")
                     .header("authorization", "Bearer os_abc");
                 then.status(200).json_body(serde_json::json!({
-                    "kind": "user",
                     "user": { "id": "usr_1", "email": "a@b.co", "created": 1 },
-                    "sessions": [{ "id": "ses_1", "deviceName": "cli", "created": 1, "current": true }],
+                    "devices": [{ "id": "dev-1", "name": "cli", "platform": "cli", "created": 1,
+                                  "last_seen": 2, "current": true, "vault_ids": ["vault_1"] }],
                     "usage": { "vaults": [{ "id": "vault_1", "bytes": 12 }], "total_bytes": 12,
                                "max_vault_bytes": 1024, "max_vaults": 10 }
                 }));
@@ -430,13 +654,22 @@ mod tests {
 
         let client = AuthClient::new(&server.base_url());
         assert!(client.email_start("a@b.co").await.unwrap().sent);
+        let device = cli_device();
         let session = client
-            .email_verify("a@b.co", "123456", "cli", Some("ABCD2345"))
+            .email_verify(
+                "a@b.co",
+                "123456",
+                SignInDevice::Device(&device),
+                Some("ABCD2345"),
+            )
             .await
             .unwrap();
         assert_eq!(session.token, "os_abc");
+        assert_eq!(session.session.device_id.as_deref(), Some("dev-1"));
         let me_response = client.me("os_abc").await.unwrap();
-        assert_eq!(me_response.sessions[0].device_name, "cli");
+        assert_eq!(me_response.devices[0].name, "cli");
+        assert!(me_response.devices[0].current);
+        assert_eq!(me_response.devices[0].vault_ids, vec!["vault_1"]);
         let usage = me_response.usage.unwrap();
         assert_eq!(usage.total_bytes, 12);
         assert_eq!(usage.vaults[0].id, "vault_1");
@@ -461,7 +694,7 @@ mod tests {
             .await;
         let client = AuthClient::new(&server.base_url());
         let error = client
-            .email_verify("a@b.co", "000000", "cli", None)
+            .email_verify("a@b.co", "000000", SignInDevice::Legacy("cli"), None)
             .await
             .unwrap_err();
         match error {
@@ -502,5 +735,116 @@ mod tests {
         assert_eq!(invites[0].used_at, Some(3));
         create.assert_async().await;
         list.assert_async().await;
+    }
+
+    #[test]
+    fn the_protocol_gate_accepts_only_the_client_version() {
+        let mut caps: Capabilities = serde_json::from_value(serde_json::json!({
+            "service": "obsink", "protocol": super::PROTOCOL_VERSION,
+            "auth": { "email": true, "apple": false }
+        }))
+        .unwrap();
+        assert!(caps.check_protocol().is_ok());
+        assert!(
+            !caps.auth.api_key,
+            "v3 servers advertise no operator bearer"
+        );
+        caps.protocol = 2;
+        assert!(matches!(
+            caps.check_protocol(),
+            Err(AuthError::ProtocolMismatch { server: 2, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn account_keys_set_unlock_race_and_rewrap() {
+        let server = MockServer::start_async().await;
+        let (key, material) = crate::create_account_key("correct horse battery", "usr_1").unwrap();
+        let empty = server
+            .mock_async(|when, then| {
+                when.method(GET).path("/auth/keys");
+                then.status(200)
+                    .json_body(serde_json::json!({ "account_key": null }));
+            })
+            .await;
+        let client = AuthClient::new(&server.base_url());
+        assert!(client.get_keys("os_abc").await.unwrap().is_none());
+        empty.delete_async().await;
+
+        let created = server
+            .mock_async(|when, then| {
+                when.method(PUT).path("/auth/keys").json_body_partial(
+                    serde_json::json!({ "wrapped": material.wrapped_b64() }).to_string(),
+                );
+                then.status(201)
+                    .json_body(serde_json::json!({ "key_id": "key_1" }));
+            })
+            .await;
+        assert_eq!(
+            client.set_keys("os_abc", &material).await.unwrap(),
+            SetKeysOutcome::Created {
+                key_id: "key_1".into()
+            }
+        );
+        created.delete_async().await;
+
+        // A second device lost the race: it gets the winner's blob and unlocks it.
+        let winner = serde_json::json!({ "account_key": {
+            "key_id": "key_1", "wrapped": material.wrapped_b64(), "salt": material.salt_b64()
+        }});
+        server
+            .mock_async(|when, then| {
+                when.method(PUT).path("/auth/keys");
+                then.status(409).json_body(winner.clone());
+            })
+            .await;
+        let (_, losing) = crate::create_account_key("other", "usr_1").unwrap();
+        let SetKeysOutcome::Exists(blob) = client.set_keys("os_abc", &losing).await.unwrap() else {
+            panic!("expected the winner's blob");
+        };
+        assert_eq!(blob.key_id, "key_1");
+        assert_eq!(blob.unlock("correct horse battery", "usr_1").unwrap(), key);
+        assert!(blob.unlock("wrong", "usr_1").is_err());
+
+        let rewrapped = crate::rewrap_account_key(&key, "new passphrase here", "usr_1").unwrap();
+        let rewrap = server
+            .mock_async(|when, then| {
+                when.method(PUT)
+                    .path("/auth/keys/rewrap")
+                    .json_body_partial(
+                        serde_json::json!({ "verifier": rewrapped.verifier_b64() }).to_string(),
+                    );
+                then.status(204);
+            })
+            .await;
+        client.rewrap_keys("os_abc", &rewrapped).await.unwrap();
+        rewrap.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn devices_rename_and_revoke() {
+        let server = MockServer::start_async().await;
+        let rename = server
+            .mock_async(|when, then| {
+                when.method(PATCH)
+                    .path("/auth/devices/dev-2")
+                    .json_body(serde_json::json!({ "name": "Kitchen iPad" }));
+                then.status(204);
+            })
+            .await;
+        let revoke = server
+            .mock_async(|when, then| {
+                when.method(DELETE).path("/auth/devices/dev-2");
+                then.status(204);
+            })
+            .await;
+        let client = AuthClient::new(&server.base_url());
+        client
+            .rename_device("os_abc", "dev-2", "Kitchen iPad")
+            .await
+            .unwrap();
+        client.revoke_device("os_abc", "dev-2").await.unwrap();
+        rename.assert_async().await;
+        revoke.assert_async().await;
     }
 }

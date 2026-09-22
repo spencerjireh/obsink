@@ -21,7 +21,8 @@ use obsink_core::{
     load_local_state, normalize_server_url, prepare_sync, run_daemon, write_atomic, ApiClient,
     ApiError, AuthClient, AuthError, Conflict, ConflictResolution, CreateVaultRequest,
     DaemonCallError, DaemonEvent, DaemonHandle, DaemonOptions, KeyBytes, ManifestDiff,
-    ProgressEvent, ProgressSink, SyncEngineError, SyncPlan, SyncResult, VaultConfig, VaultSummary,
+    ProgressEvent, ProgressSink, SignInDevice, SyncEngineError, SyncPlan, SyncResult, VaultConfig,
+    VaultSummary,
 };
 use serde::{Deserialize, Serialize};
 
@@ -468,7 +469,13 @@ async fn auth_email_verify_inner(
         .map(str::trim)
         .filter(|code| !code.is_empty());
     let session = AuthClient::new(&server_url)
-        .email_verify(email.trim(), code.trim(), &device_name(), invite)
+        // v2 device identity until OBS-140 (a stable device id per Mac).
+        .email_verify(
+            email.trim(),
+            code.trim(),
+            SignInDevice::Legacy(&device_name()),
+            invite,
+        )
         .await?;
     save_secret(&bearer_account(&server_url), &session.token)?;
     get_account().await
@@ -485,14 +492,15 @@ async fn get_account() -> Result<AccountState, CommandError> {
             Some(user) => Ok(AccountState::Account {
                 user_id: user.id,
                 email: user.email,
+                // The UI still says "session"; OBS-140 renames the shape.
                 devices: me
-                    .sessions
+                    .devices
                     .into_iter()
-                    .map(|session| DeviceInfo {
-                        session_id: session.id,
-                        device_name: session.device_name,
-                        created: session.created,
-                        current: session.current,
+                    .map(|device| DeviceInfo {
+                        session_id: device.id,
+                        device_name: device.name,
+                        created: device.created,
+                        current: device.current,
                     })
                     .collect(),
                 usage: me.usage.map(|usage| UsageInfo {
@@ -559,7 +567,7 @@ async fn revoke_session(session_id: String) -> Result<AccountState, CommandError
     let bearer = load_bearer(&server_url)?;
     bearer_call(
         &server_url,
-        AuthClient::new(&server_url).revoke_session(&bearer, &session_id),
+        AuthClient::new(&server_url).revoke_device(&bearer, &session_id),
     )
     .await?;
     get_account().await
@@ -617,7 +625,8 @@ async fn list_remote_vaults() -> Result<Vec<VaultSummary>, CommandError> {
     let bearer = load_bearer(&server_url)?;
     let client = ApiClient::new(VaultConfig {
         server_url: normalize_server_url(&server_url),
-        api_key: bearer,
+        bearer,
+        device_id: None,
         vault_id: String::new(),
         local_path: String::new(),
         ignore: Vec::new(),
@@ -772,7 +781,8 @@ async fn add_vault_inner(request: AddVaultRequest) -> Result<LocalVaultSummary, 
 
     let client = ApiClient::new(VaultConfig {
         server_url: server_url.clone(),
-        api_key: bearer,
+        bearer,
+        device_id: None,
         vault_id: String::new(),
         local_path: request.local_path.clone(),
         ignore: Vec::new(),
@@ -786,6 +796,7 @@ async fn add_vault_inner(request: AddVaultRequest) -> Result<LocalVaultSummary, 
                     name: request.vault_name.clone(),
                     max_file_size: 50 * 1024 * 1024,
                     // v2: the wrapped vault key arrives with OBS-140.
+                    id: None,
                     wrapped_key: None,
                 }),
             )
@@ -1220,7 +1231,8 @@ fn selected_vault(vault_id: Option<String>) -> Result<StoredVault, io::Error> {
 fn to_vault_config(vault: &StoredVault) -> VaultConfig {
     VaultConfig {
         server_url: vault.server_url.clone(),
-        api_key: load_stored_bearer(&vault.server_url).unwrap_or_default(),
+        bearer: load_stored_bearer(&vault.server_url).unwrap_or_default(),
+        device_id: None,
         vault_id: vault.id.clone(),
         local_path: vault.local_path.clone(),
         ignore: vault.ignore.clone(),
@@ -1424,6 +1436,8 @@ impl From<AuthError> for CommandError {
                 status: None,
             },
             AuthError::Server { status, message } => Self::from_status(status.as_u16(), message),
+            // OBS-140 gives this its own page (`Update ObSink`).
+            error @ AuthError::ProtocolMismatch { .. } => Self::other(error.to_string()),
         }
     }
 }
@@ -2392,7 +2406,8 @@ mod live_tests {
         let keys = derive_keys(&key);
         let config = VaultConfig {
             server_url: server_url.to_string(),
-            api_key: api_key.to_string(),
+            bearer: api_key.to_string(),
+            device_id: None,
             vault_id: vault_id.to_string(),
             local_path: String::new(),
             ignore: Vec::new(),
@@ -2411,7 +2426,8 @@ mod live_tests {
         let keys = derive_keys(&key);
         let config = VaultConfig {
             server_url: server_url.to_string(),
-            api_key: api_key.to_string(),
+            bearer: api_key.to_string(),
+            device_id: None,
             vault_id: vault_id.to_string(),
             local_path: String::new(),
             ignore: Vec::new(),

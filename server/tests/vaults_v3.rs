@@ -38,16 +38,32 @@ async fn lists_vaults_with_wrapped_keys_devices_and_revisions() {
         created.json::<serde_json::Value>().await.unwrap()["error"],
         "wrapped_key must decode to 60 bytes"
     );
-    let wrapped = obsink_core::wrap_vault_key(&account_key, &vault_key, "pending").unwrap();
+    let minted = obsink_core::new_vault_id();
+    let wrapped = obsink_core::wrap_vault_key(&account_key, &vault_key, &minted).unwrap();
+    let bad_id = env
+        .owner(Method::POST, "/vaults")
+        .json(&serde_json::json!({ "id": "../etc", "name": "notes" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_id.status(), 400);
     let created = env
         .owner(Method::POST, "/vaults")
-        .json(&serde_json::json!({ "name": "notes", "wrapped_key": obsink_core::encode_base64(&wrapped) }))
+        .json(&serde_json::json!({ "id": minted, "name": "notes", "wrapped_key": obsink_core::encode_base64(&wrapped) }))
         .send()
         .await
         .unwrap();
     assert_eq!(created.status(), 201);
     let created: serde_json::Value = created.json().await.unwrap();
     let notes = created["vault"]["id"].as_str().unwrap().to_string();
+    assert_eq!(notes, minted, "the client-minted id is the vault's id");
+    let taken = env
+        .owner(Method::POST, "/vaults")
+        .json(&serde_json::json!({ "id": minted, "name": "again" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(taken.status(), 409);
     assert_eq!(created["vault"]["revision"], 0);
     assert_eq!(created["vault"]["bytes"], 0);
 
@@ -85,7 +101,7 @@ async fn lists_vaults_with_wrapped_keys_devices_and_revisions() {
     let core_entry = core_list.iter().find(|v| v.id == notes).unwrap();
     let blob = obsink_core::decode_base64(core_entry.wrapped_key.as_deref().unwrap()).unwrap();
     assert_eq!(
-        obsink_core::unwrap_vault_key(&account_key, &blob, "pending").unwrap(),
+        obsink_core::unwrap_vault_key(&account_key, &blob, &notes).unwrap(),
         vault_key
     );
 

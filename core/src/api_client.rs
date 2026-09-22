@@ -5,11 +5,33 @@ use serde::de::DeserializeOwned;
 use thiserror::Error;
 use tracing::{debug, warn};
 
-use crate::crypto::{decrypt_path, encrypt_path, path_token, CryptoError, CryptoKeys};
+use serde::Deserialize;
+
+use crate::crypto::{decrypt, decrypt_path, encrypt_path, path_token, CryptoError, CryptoKeys};
 use crate::types::{
     BatchOp, BatchOperationResult, BatchResponse, CreateVaultRequest, CreateVaultResponse,
     ListVaultsResponse, Manifest, ServerConflict, VaultConfig, VaultSummary,
 };
+
+/// One archived version of a file (`GET /vaults/:id/history/:path`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct VersionInfo {
+    /// The entry to pass to [`ApiClient::get_version`] (`<unix>[-n]`).
+    pub name: String,
+    pub ts: u64,
+    /// The sealed size on the server, a few bytes over the plaintext.
+    pub size: u64,
+}
+
+/// One tombstone with its real path recovered (`GET /vaults/:id/trash`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrashEntry {
+    pub path: String,
+    /// The tombstone's hash: the `X-Parent-Hash` a restore presents.
+    pub hash: String,
+    pub size: u64,
+    pub deleted_at: u64,
+}
 
 /// Whole-request budget for the small metadata calls (manifest, vault list,
 /// delete). Blob transfers get no total budget: a 50 MB upload on a slow
@@ -117,7 +139,7 @@ impl ApiClient {
             .client
             .get(self.root_url("vaults"))
             .timeout(SMALL_REQUEST_TIMEOUT)
-            .bearer_auth(&self.config.api_key);
+            .bearer_auth(&self.config.bearer);
 
         let response: ListVaultsResponse = parse_json(self.send_with_retry(request).await?).await?;
         Ok(response.vaults)
@@ -132,10 +154,132 @@ impl ApiClient {
             .client
             .post(self.root_url("vaults"))
             .timeout(SMALL_REQUEST_TIMEOUT)
-            .bearer_auth(&self.config.api_key)
+            .bearer_auth(&self.config.bearer)
             .json(request);
 
         parse_json(self.send_with_retry(http_request).await?).await
+    }
+
+    /// The device id this client reports with, when the caller set one.
+    pub fn device_id(&self) -> Option<&str> {
+        self.config.device_id.as_deref()
+    }
+
+    /// `PATCH /vaults/:id`: rename the configured vault for every device.
+    pub async fn rename_vault(&self, name: &str) -> Result<(), ApiError> {
+        let request = self
+            .client
+            .patch(self.vault_url(""))
+            .timeout(SMALL_REQUEST_TIMEOUT)
+            .bearer_auth(&self.config.bearer)
+            .json(&serde_json::json!({ "name": name }));
+        parse_empty("", self.send_with_retry(request).await?).await
+    }
+
+    /// `PUT /vaults/:id/devices/self`: this device holds the vault (no
+    /// revision) or just synced it to `revision` (the checkpoint report).
+    pub async fn attach_device(&self, revision: Option<u64>) -> Result<(), ApiError> {
+        let body = match revision {
+            Some(revision) => serde_json::json!({ "revision": revision }),
+            None => serde_json::json!({}),
+        };
+        let request = self
+            .client
+            .put(self.vault_url("devices/self"))
+            .timeout(SMALL_REQUEST_TIMEOUT)
+            .bearer_auth(&self.config.bearer)
+            .json(&body);
+        parse_empty("", self.send_with_retry(request).await?).await
+    }
+
+    /// `DELETE /vaults/:id/devices/self`: this device no longer holds the vault.
+    pub async fn detach_device(&self) -> Result<(), ApiError> {
+        let request = self
+            .client
+            .delete(self.vault_url("devices/self"))
+            .timeout(SMALL_REQUEST_TIMEOUT)
+            .bearer_auth(&self.config.bearer);
+        parse_empty("", self.send_with_retry(request).await?).await
+    }
+
+    /// The archived versions of a real path, newest first.
+    pub async fn list_versions(
+        &self,
+        path: &str,
+        keys: &CryptoKeys,
+    ) -> Result<Vec<VersionInfo>, ApiError> {
+        #[derive(Deserialize)]
+        struct Body {
+            versions: Vec<VersionInfo>,
+        }
+        let token = path_token(&keys.path_token, path);
+        let request = self
+            .client
+            .get(self.vault_url(&format!("history/{token}")))
+            .timeout(SMALL_REQUEST_TIMEOUT)
+            .bearer_auth(&self.config.bearer);
+        let body: Body = parse_json(self.send_with_retry(request).await?).await?;
+        Ok(body.versions)
+    }
+
+    /// One archived version, decrypted.
+    pub async fn get_version(
+        &self,
+        path: &str,
+        name: &str,
+        keys: &CryptoKeys,
+    ) -> Result<Vec<u8>, ApiError> {
+        let token = path_token(&keys.path_token, path);
+        let request = self
+            .client
+            .get(self.vault_url(&format!("versions/{name}/{token}")))
+            .bearer_auth(&self.config.bearer);
+        let blob = parse_bytes(self.send_with_retry(request).await?).await?;
+        Ok(decrypt(&keys.content_enc, &blob)?)
+    }
+
+    /// The vault's tombstones with their real paths, newest first.
+    pub async fn list_trash(&self, keys: &CryptoKeys) -> Result<Vec<TrashEntry>, ApiError> {
+        #[derive(Deserialize)]
+        struct Wire {
+            #[serde(rename = "encPath")]
+            enc_path: String,
+            hash: String,
+            size: u64,
+            deleted_at: u64,
+        }
+        #[derive(Deserialize)]
+        struct Body {
+            entries: Vec<Wire>,
+        }
+        let request = self
+            .client
+            .get(self.vault_url("trash"))
+            .timeout(SMALL_REQUEST_TIMEOUT)
+            .bearer_auth(&self.config.bearer);
+        let body: Body = parse_json(self.send_with_retry(request).await?).await?;
+        body.entries
+            .into_iter()
+            .map(|entry| {
+                Ok(TrashEntry {
+                    path: decrypt_path(&keys.path_enc, &entry.enc_path)?,
+                    hash: entry.hash,
+                    size: entry.size,
+                    deleted_at: entry.deleted_at,
+                })
+            })
+            .collect()
+    }
+
+    /// The newest trashed copy of a real path, decrypted.
+    pub async fn get_trash(&self, path: &str, keys: &CryptoKeys) -> Result<Vec<u8>, ApiError> {
+        let token = path_token(&keys.path_token, path);
+        let request = self
+            .client
+            .get(self.vault_url(&format!("trash/{token}")))
+            .bearer_auth(&self.config.bearer);
+        let blob = parse_bytes(self.send_with_retry(request).await?).await?;
+        Ok(decrypt(&keys.content_enc, &blob)?)
     }
 
     /// Delete the configured vault and every blob it owns on the server.
@@ -145,7 +289,7 @@ impl ApiClient {
             .client
             .delete(self.vault_url(""))
             .timeout(SMALL_REQUEST_TIMEOUT)
-            .bearer_auth(&self.config.api_key);
+            .bearer_auth(&self.config.bearer);
         parse_empty("", self.send_with_retry(request).await?).await
     }
 
@@ -174,7 +318,7 @@ impl ApiClient {
             .client
             .get(self.vault_url("manifest"))
             .timeout(SMALL_REQUEST_TIMEOUT)
-            .bearer_auth(&self.config.api_key);
+            .bearer_auth(&self.config.bearer);
         if let Some(etag) = if_none_match {
             request = request.header("If-None-Match", etag);
         }
@@ -209,7 +353,7 @@ impl ApiClient {
         let request = self
             .client
             .get(self.vault_url(&format!("files/{token}")))
-            .bearer_auth(&self.config.api_key);
+            .bearer_auth(&self.config.bearer);
 
         parse_bytes(self.send_with_retry(request).await?).await
     }
@@ -228,7 +372,7 @@ impl ApiClient {
         let mut request = self
             .client
             .put(self.vault_url(&format!("files/{token}")))
-            .bearer_auth(&self.config.api_key)
+            .bearer_auth(&self.config.bearer)
             .header("X-Content-Hash", content_hash)
             .header("X-Enc-Path", enc_path)
             .body(content);
@@ -260,7 +404,7 @@ impl ApiClient {
                 .client
                 .post(self.vault_url("batch"))
                 .timeout(BATCH_REQUEST_TIMEOUT)
-                .bearer_auth(&self.config.api_key)
+                .bearer_auth(&self.config.bearer)
                 .multipart(form);
             match request.send().await {
                 Ok(response) => break response,
@@ -445,8 +589,9 @@ mod tests {
     fn api_client_debug_redacts_the_bearer() {
         let client = super::ApiClient::new(crate::VaultConfig {
             server_url: "https://s.test".into(),
-            api_key: "secret-bearer-xyz".into(),
+            bearer: "secret-bearer-xyz".into(),
             vault_id: "vault_1".into(),
+            device_id: None,
             local_path: "/tmp/v".into(),
             ignore: Vec::new(),
         });
@@ -464,8 +609,9 @@ mod tests {
     fn config(base_url: String) -> VaultConfig {
         VaultConfig {
             server_url: base_url,
-            api_key: "token".to_string(),
+            bearer: "token".to_string(),
             vault_id: "vault_123".to_string(),
+            device_id: None,
             local_path: ".".to_string(),
             ignore: Vec::new(),
         }
