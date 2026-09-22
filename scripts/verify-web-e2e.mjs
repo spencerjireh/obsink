@@ -133,8 +133,16 @@ async function folderAndPassphrase(page, submitLabel) {
   await page.getByRole('button', { name: 'Done' }).click()
 }
 
+// The notice from an earlier sync may still be on the page, so the wait
+// follows the cycle itself: the button reads Working… while it runs.
 async function syncNow(page) {
-  await page.getByRole('button', { name: 'Sync now' }).click()
+  const button = page.getByRole('button', { name: 'Sync now' })
+  await button.click()
+  await page
+    .getByRole('button', { name: 'Working…' })
+    .waitFor({ timeout: 5_000 })
+    .catch(() => undefined)
+  await button.waitFor({ timeout: 60_000 })
   await page.getByText(/Sync complete|needs attention|Sync finished/).waitFor({ timeout: 60_000 })
 }
 
