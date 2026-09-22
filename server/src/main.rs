@@ -146,7 +146,7 @@ async fn serve() -> Result<(), String> {
         listen = %config.listen,
         email = config.email_enabled(),
         apple = config.apple_enabled(),
-        api_key = config.api_key.is_some(),
+        protocol = obsink_core::PROTOCOL_VERSION,
         "obsink-server listening"
     );
     axum::serve(listener, router(state))

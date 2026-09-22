@@ -1,16 +1,16 @@
 mod common;
 
-use common::{TestEnv, API_KEY};
+use common::TestEnv;
 use reqwest::Method;
 
 #[tokio::test]
 async fn manifest_returns_etag_and_304_on_if_none_match() {
-    let Some(env) = TestEnv::try_new().await else {
+    let Some(env) = TestEnv::try_with_owner().await else {
         return;
     };
-    let id = env.create_vault(API_KEY, "notes").await;
+    let id = env.create_vault(env.owner_token(), "notes").await;
     let first = env
-        .operator(Method::GET, &format!("/vaults/{id}/manifest"))
+        .owner(Method::GET, &format!("/vaults/{id}/manifest"))
         .send()
         .await
         .unwrap();
@@ -20,7 +20,7 @@ async fn manifest_returns_etag_and_304_on_if_none_match() {
     assert_eq!(first.headers()["cache-control"], "private, no-cache");
 
     let cached = env
-        .operator(Method::GET, &format!("/vaults/{id}/manifest"))
+        .owner(Method::GET, &format!("/vaults/{id}/manifest"))
         .header("If-None-Match", &etag)
         .send()
         .await
@@ -35,7 +35,7 @@ async fn manifest_returns_etag_and_304_on_if_none_match() {
         "*".to_string(),
     ] {
         let response = env
-            .operator(Method::GET, &format!("/vaults/{id}/manifest"))
+            .owner(Method::GET, &format!("/vaults/{id}/manifest"))
             .header("If-None-Match", variant.clone())
             .send()
             .await
@@ -43,7 +43,7 @@ async fn manifest_returns_etag_and_304_on_if_none_match() {
         assert_eq!(response.status(), 304, "{variant}");
     }
     let other = env
-        .operator(Method::GET, &format!("/vaults/{id}/manifest"))
+        .owner(Method::GET, &format!("/vaults/{id}/manifest"))
         .header("If-None-Match", "\"99\"")
         .send()
         .await
@@ -54,21 +54,22 @@ async fn manifest_returns_etag_and_304_on_if_none_match() {
 
 #[tokio::test]
 async fn etag_changes_after_write_and_delete() {
-    let Some(env) = TestEnv::try_new().await else {
+    let Some(env) = TestEnv::try_with_owner().await else {
         return;
     };
-    let id = env.create_vault(API_KEY, "notes").await;
+    let id = env.create_vault(env.owner_token(), "notes").await;
     let etag_of = |env: &TestEnv| {
         let url = env.url(&format!("/vaults/{id}/manifest"));
         let client = env.http.clone();
+        let token = env.owner_token().to_string();
         async move {
-            let response = client.get(url).bearer_auth(API_KEY).send().await.unwrap();
+            let response = client.get(url).bearer_auth(token).send().await.unwrap();
             response.headers()["etag"].to_str().unwrap().to_string()
         }
     };
     let e0 = etag_of(&env).await;
     let put = env
-        .operator(Method::PUT, &format!("/vaults/{id}/files/tok"))
+        .owner(Method::PUT, &format!("/vaults/{id}/files/tok"))
         .header("X-Content-Hash", "h1")
         .body("a")
         .send()
@@ -79,7 +80,7 @@ async fn etag_changes_after_write_and_delete() {
     assert_ne!(e0, e1);
     // A rejected write leaves the ETag alone.
     let conflict = env
-        .operator(Method::PUT, &format!("/vaults/{id}/files/tok"))
+        .owner(Method::PUT, &format!("/vaults/{id}/files/tok"))
         .header("X-Parent-Hash", "stale")
         .header("X-Content-Hash", "h2")
         .body("b")
@@ -89,7 +90,7 @@ async fn etag_changes_after_write_and_delete() {
     assert_eq!(conflict.status(), 409);
     assert_eq!(etag_of(&env).await, e1);
     let del = env
-        .operator(Method::DELETE, &format!("/vaults/{id}/files/tok"))
+        .owner(Method::DELETE, &format!("/vaults/{id}/files/tok"))
         .header("X-Parent-Hash", "h1")
         .send()
         .await

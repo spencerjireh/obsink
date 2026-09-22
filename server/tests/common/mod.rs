@@ -25,8 +25,20 @@ use obsink_server::{
 };
 use sqlx::{postgres::PgPoolOptions, PgPool};
 
-pub const API_KEY: &str = "secret";
 pub const APPLE_AUDIENCE: &str = "com.obsink.ios";
+
+/// The account `try_with_owner` signs in before the test starts: the stand-in
+/// for what used to be the operator bearer.
+pub const OWNER_EMAIL: &str = "owner@example.com";
+pub const OWNER_DEVICE: &str = "owner-device";
+
+/// A signed-in account as the tests see it.
+#[derive(Debug, Clone)]
+pub struct Account {
+    pub token: String,
+    pub user_id: String,
+    pub device_id: String,
+}
 
 #[derive(Default)]
 pub struct RecordingMailer {
@@ -53,6 +65,8 @@ pub struct TestEnv {
     pub http: reqwest::Client,
     pub mailer: Arc<RecordingMailer>,
     pub data_dir: tempfile::TempDir,
+    /// Set by `try_with_owner`.
+    pub owner: Option<Account>,
     admin_url: String,
     db_name: String,
     server: tokio::task::JoinHandle<()>,
@@ -67,7 +81,6 @@ pub fn test_config(data_dir: &std::path::Path, database_url: String) -> Config {
         database_url,
         data_dir: data_dir.to_path_buf(),
         server_key: None,
-        api_key: Some(API_KEY.to_string()),
         apple_client_ids: vec![APPLE_AUDIENCE.to_string()],
         apple_jwks_url: "http://127.0.0.1:9/keys".to_string(),
         smtp: None,
@@ -89,8 +102,22 @@ pub fn db_available() -> bool {
 }
 
 impl TestEnv {
+    /// A fresh server with no accounts.
     pub async fn try_new() -> Option<TestEnv> {
         Self::try_with(|_| {}).await
+    }
+
+    /// A server with one signed-in account (`owner`), for suites that test
+    /// vault and file routes rather than sign-up.
+    pub async fn try_with_owner() -> Option<TestEnv> {
+        Self::try_with_owner_and(|_| {}).await
+    }
+
+    pub async fn try_with_owner_and(customize: impl FnOnce(&mut Config)) -> Option<TestEnv> {
+        let mut env = Self::try_with(customize).await?;
+        let owner = env.sign_in(OWNER_EMAIL, OWNER_DEVICE, None).await;
+        env.owner = Some(owner);
+        Some(env)
     }
 
     pub async fn try_with(customize: impl FnOnce(&mut Config)) -> Option<TestEnv> {
@@ -144,6 +171,7 @@ impl TestEnv {
             http: reqwest::Client::new(),
             mailer,
             data_dir,
+            owner: None,
             admin_url,
             db_name,
             server,
@@ -180,8 +208,73 @@ impl TestEnv {
         self.http.request(method, self.url(path))
     }
 
-    pub fn operator(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
-        self.req(method, path).bearer_auth(API_KEY)
+    /// The owner account's bearer (`try_with_owner`).
+    pub fn owner_token(&self) -> &str {
+        &self.owner.as_ref().expect("try_with_owner").token
+    }
+
+    pub fn owner(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
+        self.req(method, path).bearer_auth(self.owner_token())
+    }
+
+    /// The `device` object of a sign-in body: the id doubles as the name.
+    pub fn device(id: &str) -> serde_json::Value {
+        serde_json::json!({ "id": id, "name": id, "platform": "cli" })
+    }
+
+    /// Sign in (or up) and return the account; panics on a refusal.
+    pub async fn sign_in(&self, email: &str, device: &str, invite_code: Option<&str>) -> Account {
+        let response = self.email_sign_in(email, device, invite_code).await;
+        assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+        let body: serde_json::Value = response.json().await.unwrap();
+        Account {
+            token: body["token"].as_str().unwrap().to_string(),
+            user_id: body["user"]["id"].as_str().unwrap().to_string(),
+            device_id: body["session"]["device_id"].as_str().unwrap().to_string(),
+        }
+    }
+
+    /// Mint an invite as `token`.
+    pub async fn mint_invite(&self, token: &str) -> String {
+        let response = self
+            .with_token(token, reqwest::Method::POST, "/auth/invites")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 201, "{}", response.text().await.unwrap());
+        response.json::<serde_json::Value>().await.unwrap()["invite"]["code"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// A second account, invited by the owner.
+    pub async fn invited(&self, email: &str, device: &str) -> Account {
+        let code = self.mint_invite(self.owner_token()).await;
+        self.sign_in(email, device, Some(&code)).await
+    }
+
+    /// Set the account passphrase through `PUT /auth/keys`; returns the
+    /// account key and the material the server now holds.
+    pub async fn set_passphrase(
+        &self,
+        account: &Account,
+        passphrase: &str,
+    ) -> (obsink_core::KeyBytes, obsink_core::AccountKeyMaterial) {
+        let (key, material) =
+            obsink_core::create_account_key(passphrase, &account.user_id).unwrap();
+        let response = self
+            .with_token(&account.token, reqwest::Method::PUT, "/auth/keys")
+            .json(&serde_json::json!({
+                "wrapped": material.wrapped_b64(),
+                "salt": material.salt_b64(),
+                "verifier": material.verifier_b64(),
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 201, "{}", response.text().await.unwrap());
+        (key, material)
     }
 
     pub fn with_token(
@@ -194,6 +287,7 @@ impl TestEnv {
     }
 
     pub fn api_client(&self, bearer: &str, vault_id: &str) -> obsink_core::ApiClient {
+        // `api_key` is core's v2 name for the bearer; renamed in OBS-136.
         obsink_core::ApiClient::new(obsink_core::VaultConfig {
             server_url: self.base_url.clone(),
             api_key: bearer.to_string(),
@@ -242,7 +336,7 @@ impl TestEnv {
             .to_string();
         self.req(reqwest::Method::POST, "/auth/email/verify")
             .json(&serde_json::json!({
-                "email": email, "code": code, "device_name": device, "invite_code": invite_code
+                "email": email, "code": code, "device": Self::device(device), "invite_code": invite_code
             }))
             .send()
             .await

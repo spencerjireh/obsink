@@ -1,50 +1,48 @@
 mod common;
 
-use common::{TestEnv, API_KEY};
+use common::TestEnv;
 use reqwest::Method;
 
 #[tokio::test]
-async fn isolates_vault_lists_between_accounts_and_the_operator() {
-    let Some(env) = TestEnv::try_new().await else {
+async fn isolates_vault_lists_between_accounts() {
+    let Some(env) = TestEnv::try_with_owner().await else {
         return;
     };
-    let alice = env.email_token("alice@example.com", "a", None).await;
-    let invite: serde_json::Value = env
-        .with_token(&alice, Method::POST, "/auth/invites")
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let bob = env
-        .email_token("bob@example.com", "b", invite["invite"]["code"].as_str())
-        .await;
+    let alice = env.invited("alice@example.com", "a").await;
+    let bob = env.invited("bob@example.com", "b").await;
 
-    let alice_vault = env.create_vault(&alice, "alice").await;
-    let bob_vault = env.create_vault(&bob, "bob").await;
-    let operator_vault = env.create_vault(API_KEY, "ops").await;
+    let alice_vault = env.create_vault(&alice.token, "alice").await;
+    let bob_vault = env.create_vault(&bob.token, "bob").await;
+    let owner_vault = env.create_vault(env.owner_token(), "ops").await;
 
     let ids =
         |list: Vec<obsink_core::VaultSummary>| list.into_iter().map(|v| v.id).collect::<Vec<_>>();
     assert_eq!(
-        ids(env.api_client(&alice, "").list_vaults().await.unwrap()),
+        ids(env
+            .api_client(&alice.token, "")
+            .list_vaults()
+            .await
+            .unwrap()),
         vec![alice_vault.clone()]
     );
     assert_eq!(
-        ids(env.api_client(&bob, "").list_vaults().await.unwrap()),
+        ids(env.api_client(&bob.token, "").list_vaults().await.unwrap()),
         vec![bob_vault.clone()]
     );
     assert_eq!(
-        ids(env.api_client(API_KEY, "").list_vaults().await.unwrap()),
-        vec![operator_vault.clone()]
+        ids(env
+            .api_client(env.owner_token(), "")
+            .list_vaults()
+            .await
+            .unwrap()),
+        vec![owner_vault.clone()]
     );
 
-    // Cross-tenant access is indistinguishable from a missing vault.
+    // Cross-account access is indistinguishable from a missing vault.
     for (token, vault) in [
-        (bob.as_str(), &alice_vault),
-        (API_KEY, &alice_vault),
-        (alice.as_str(), &operator_vault),
+        (bob.token.as_str(), &alice_vault),
+        (env.owner_token(), &alice_vault),
+        (alice.token.as_str(), &owner_vault),
     ] {
         let manifest = env
             .with_token(token, Method::GET, &format!("/vaults/{vault}/manifest"))
@@ -68,6 +66,8 @@ async fn isolates_vault_lists_between_accounts_and_the_operator() {
         assert_eq!(del.status(), 404);
     }
     assert_eq!(env.table_count("vaults").await, 3);
+    // Every vault has exactly one member row: its owner.
+    assert_eq!(env.table_count("vault_members").await, 3);
     env.finish().await;
 }
 
@@ -81,7 +81,7 @@ async fn enforces_the_per_account_vault_limit_and_per_vault_byte_budget() {
     else {
         return;
     };
-    let user = env.email_token("quota@example.com", "q", None).await;
+    let user = env.sign_in("quota@example.com", "q", None).await.token;
     let first = env.create_vault(&user, "one").await;
     env.create_vault(&user, "two").await;
     let third = env
@@ -132,28 +132,6 @@ async fn enforces_the_per_account_vault_limit_and_per_vault_byte_budget() {
     assert_eq!(me["usage"]["max_vault_bytes"], 10);
     assert_eq!(me["usage"]["max_vaults"], 2);
     assert_eq!(me["usage"]["vaults"].as_array().unwrap().len(), 2);
-
-    // The operator has no budget.
-    let ops = env.create_vault(API_KEY, "ops").await;
-    let big = env
-        .operator(Method::PUT, &format!("/vaults/{ops}/files/tok"))
-        .header("X-Content-Hash", "h")
-        .body("more than ten bytes here")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(big.status(), 200);
-    let me: serde_json::Value = env
-        .operator(Method::GET, "/auth/me")
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(me["kind"], "operator");
-    assert!(me["usage"]["max_vault_bytes"].is_null());
-    assert_eq!(me["usage"]["vaults"][0]["id"], ops);
     env.finish().await;
 }
 

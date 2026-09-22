@@ -37,8 +37,6 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Raw `OBSINK_SERVER_KEY` (base64). `None` = read or create `<data>/server.key`.
     pub server_key: Option<String>,
-    /// Operator bearer. `None` disables the operator principal.
-    pub api_key: Option<String>,
     /// Accepted `aud` values for Apple identity tokens. Empty disables Apple.
     pub apple_client_ids: Vec<String>,
     pub apple_jwks_url: String,
@@ -84,7 +82,6 @@ impl Config {
             database_url,
             data_dir: PathBuf::from(env("OBSINK_DATA_DIR").unwrap_or_else(|| "/data".to_string())),
             server_key: env("OBSINK_SERVER_KEY"),
-            api_key: env("OBSINK_API_KEY"),
             apple_client_ids: std::env::var("APPLE_CLIENT_IDS")
                 .map(|value| split_csv(&value))
                 .unwrap_or_else(|_| vec!["com.obsink.ios".to_string()]),
@@ -210,7 +207,6 @@ mod tests {
             database_url: String::new(),
             data_dir: dir.to_path_buf(),
             server_key: None,
-            api_key: None,
             apple_client_ids: Vec::new(),
             apple_jwks_url: String::new(),
             smtp: None,

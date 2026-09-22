@@ -23,13 +23,13 @@ pub struct CreateVaultBody {
     pub max_file_size: Option<u64>,
 }
 
-pub async fn list_for_tenant(
+pub async fn list_for_owner(
     conn: &mut PgConnection,
     state: &AppState,
-    tenant: &str,
+    user_id: &str,
 ) -> Result<Vec<VaultSummary>, ApiError> {
-    let rows = sqlx::query("SELECT id, name_enc, created, max_file_size FROM vaults WHERE tenant = $1 ORDER BY created ASC, id ASC")
-        .bind(tenant)
+    let rows = sqlx::query("SELECT id, name_enc, created, max_file_size FROM vaults WHERE owner = $1 ORDER BY created ASC, id ASC")
+        .bind(user_id)
         .fetch_all(conn)
         .await?;
     rows.into_iter()
@@ -55,7 +55,7 @@ pub async fn list(
 ) -> Result<Json<Vec<VaultSummary>>, ApiError> {
     let mut conn = state.pool.acquire().await?;
     Ok(Json(
-        list_for_tenant(&mut conn, &state, principal.tenant()).await?,
+        list_for_owner(&mut conn, &state, &principal.user_id).await?,
     ))
 }
 
@@ -73,35 +73,41 @@ pub async fn create(
         .unwrap_or(state.config.max_file_bytes)
         .min(state.config.max_file_bytes);
     let now = db::now();
-    let tenant = principal.tenant();
+    let owner = principal.user_id.as_str();
 
     let mut tx = state.pool.begin().await?;
-    // Serialise creates per tenant so the quota check cannot race.
+    // Serialise creates per owner so the quota check cannot race.
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
-        .bind(tenant)
+        .bind(owner)
         .execute(&mut *tx)
         .await?;
-    if principal.is_user() {
-        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM vaults WHERE tenant = $1")
-            .bind(tenant)
-            .fetch_one(&mut *tx)
-            .await?;
-        if count >= i64::from(state.config.max_vaults_per_user) {
-            return Err(ApiError::forbidden(format!(
-                "vault limit reached ({} per account)",
-                state.config.max_vaults_per_user
-            )));
-        }
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM vaults WHERE owner = $1")
+        .bind(owner)
+        .fetch_one(&mut *tx)
+        .await?;
+    if count >= i64::from(state.config.max_vaults_per_user) {
+        return Err(ApiError::forbidden(format!(
+            "vault limit reached ({} per account)",
+            state.config.max_vaults_per_user
+        )));
     }
     let id = crypto::new_id("vault");
-    sqlx::query("INSERT INTO vaults (id, tenant, name_enc, created, max_file_size) VALUES ($1, $2, $3, $4, $5)")
+    sqlx::query("INSERT INTO vaults (id, owner, name_enc, created, max_file_size, last_write) VALUES ($1, $2, $3, $4, $5, $4)")
         .bind(&id)
-        .bind(tenant)
+        .bind(owner)
         .bind(state.keys.seal_field("vaults", "name", &id, name))
         .bind(db::to_i64(now))
         .bind(db::to_i64(max_file_size))
         .execute(&mut *tx)
         .await?;
+    sqlx::query(
+        "INSERT INTO vault_members (vault_id, user_id, role, wrapped_key, created) VALUES ($1, $2, 'owner', NULL, $3)",
+    )
+    .bind(&id)
+    .bind(owner)
+    .bind(db::to_i64(now))
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
 
     Ok((
@@ -125,9 +131,9 @@ pub async fn delete_vault(
     if !valid_vault_id(&vault_id) {
         return Err(ApiError::not_found("vault not found"));
     }
-    let deleted = sqlx::query("DELETE FROM vaults WHERE id = $1 AND tenant = $2")
+    let deleted = sqlx::query("DELETE FROM vaults WHERE id = $1 AND owner = $2")
         .bind(&vault_id)
-        .bind(principal.tenant())
+        .bind(&principal.user_id)
         .execute(&state.pool)
         .await?
         .rows_affected();
@@ -141,14 +147,14 @@ pub async fn delete_vault(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Delete every vault a tenant owns (account deletion). Returns the ids so the
-/// caller can remove blob directories after commit.
-pub async fn delete_all_for_tenant(
+/// Delete every vault an account owns (account deletion). Returns the ids so
+/// the caller can remove blob directories after commit.
+pub async fn delete_all_for_owner(
     conn: &mut PgConnection,
-    tenant: &str,
+    user_id: &str,
 ) -> Result<Vec<String>, ApiError> {
-    let rows: Vec<(String,)> = sqlx::query_as("DELETE FROM vaults WHERE tenant = $1 RETURNING id")
-        .bind(tenant)
+    let rows: Vec<(String,)> = sqlx::query_as("DELETE FROM vaults WHERE owner = $1 RETURNING id")
+        .bind(user_id)
         .fetch_all(conn)
         .await?;
     Ok(rows.into_iter().map(|(id,)| id).collect())

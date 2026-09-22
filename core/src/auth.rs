@@ -37,6 +37,8 @@ pub struct Capabilities {
 pub struct AuthMethods {
     pub email: bool,
     pub apple: bool,
+    /// v2 servers advertised an operator bearer; a v3 server has none.
+    #[serde(default)]
     pub api_key: bool,
 }
 
@@ -72,6 +74,8 @@ pub struct UserInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Me {
+    /// `"user"` on v2 servers; absent from v3 responses (one principal).
+    #[serde(default)]
     pub kind: String,
     pub user: Option<MeUser>,
     #[serde(default)]

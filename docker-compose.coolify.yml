@@ -9,7 +9,6 @@
 # builds that bake the old host keep working. Set these in the Coolify
 # environment:
 #   OBSINK_SERVER_KEY   `obsink-server keygen` output; back it up
-#   OBSINK_API_KEY      operator bearer for the admin CLI and verify scripts
 #   POSTGRES_PASSWORD   database password
 #   SMTP_HOST/PORT/USERNAME/PASSWORD/FROM/TLS   for email sign-in
 #   APPLE_CLIENT_IDS    default com.obsink.ios
@@ -27,7 +26,6 @@ services:
     environment:
       DATABASE_URL: postgres://obsink:${POSTGRES_PASSWORD}@postgres:5432/obsink
       OBSINK_SERVER_KEY: ${OBSINK_SERVER_KEY}
-      OBSINK_API_KEY: ${OBSINK_API_KEY}
       SMTP_HOST: ${SMTP_HOST}
       SMTP_PORT: ${SMTP_PORT:-587}
       SMTP_USERNAME: ${SMTP_USERNAME}

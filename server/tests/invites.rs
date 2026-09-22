@@ -157,44 +157,40 @@ async fn invite_is_single_use_and_expired_or_bogus_codes_are_rejected() {
 }
 
 #[tokio::test]
-async fn operator_can_create_and_list_invites() {
+async fn server_shell_invites_have_no_creator_and_are_not_listed_for_users() {
     let Some(env) = TestEnv::try_new().await else {
         return;
     };
-    env.email_token("first@example.com", "a", None).await;
-    let code = create_invite(&env, common::API_KEY).await;
-    let list: serde_json::Value = env
-        .operator(Method::GET, "/auth/invites")
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(list["invites"][0]["code"], code);
+    let first = env.email_token("first@example.com", "a", None).await;
+    // `obsink-server invite` mints with no creator (bootstrap and operator use).
+    let mut conn = env.state.pool.acquire().await.unwrap();
+    let code = obsink_server::auth::invites::create(
+        &mut conn,
+        None,
+        obsink_server::db::now(),
+        obsink_server::auth::invites::INVITE_TTL_SECS,
+    )
+    .await
+    .unwrap()
+    .code;
+    drop(conn);
     env.email_token("second@example.com", "b", Some(&code))
         .await;
     let list: serde_json::Value = env
-        .operator(Method::GET, "/auth/invites")
+        .with_token(&first, Method::GET, "/auth/invites")
         .send()
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
-    assert_eq!(list["invites"][0]["status"], "used");
-    // Users do not see operator-issued invites.
-    env.clear_email_cooldown("first@example.com").await;
-    let first_again = env.email_token("first@example.com", "a2", None).await;
-    let mine: serde_json::Value = env
-        .with_token(&first_again, Method::GET, "/auth/invites")
-        .send()
-        .await
-        .unwrap()
-        .json()
+    assert!(list["invites"].as_array().unwrap().is_empty());
+    let status: Option<i64> = sqlx::query_scalar("SELECT used_at FROM invites WHERE code = $1")
+        .bind(&code)
+        .fetch_one(&env.state.pool)
         .await
         .unwrap();
-    assert!(mine["invites"].as_array().unwrap().is_empty());
+    assert!(status.is_some());
     env.finish().await;
 }
 

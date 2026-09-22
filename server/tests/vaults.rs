@@ -5,7 +5,7 @@ use reqwest::Method;
 
 #[tokio::test]
 async fn rejects_unauthorized_requests() {
-    let Some(env) = TestEnv::try_new().await else {
+    let Some(env) = TestEnv::try_with_owner().await else {
         return;
     };
     let response = env.req(Method::GET, "/vaults").send().await.unwrap();
@@ -23,24 +23,24 @@ async fn rejects_unauthorized_requests() {
     assert_eq!(wrong.status(), 401);
 
     // Unknown routes with a valid bearer are 404, and 405s are folded into 404.
-    let missing = env.operator(Method::GET, "/nope").send().await.unwrap();
+    let missing = env.owner(Method::GET, "/nope").send().await.unwrap();
     assert_eq!(missing.status(), 404);
     assert_eq!(
         missing.json::<serde_json::Value>().await.unwrap()["error"],
         "not_found"
     );
-    let wrong_method = env.operator(Method::PUT, "/vaults").send().await.unwrap();
+    let wrong_method = env.owner(Method::PUT, "/vaults").send().await.unwrap();
     assert_eq!(wrong_method.status(), 404);
     env.finish().await;
 }
 
 #[tokio::test]
 async fn creates_vaults_and_lists_them() {
-    let Some(env) = TestEnv::try_new().await else {
+    let Some(env) = TestEnv::try_with_owner().await else {
         return;
     };
     let response = env
-        .operator(Method::POST, "/vaults")
+        .owner(Method::POST, "/vaults")
         .json(&serde_json::json!({ "name": "  Notes  ", "max_file_size": 1024 }))
         .send()
         .await
@@ -53,7 +53,7 @@ async fn creates_vaults_and_lists_them() {
     assert_eq!(body["vault"]["max_file_size"], 1024);
 
     let listed = env
-        .api_client(common::API_KEY, "")
+        .api_client(env.owner_token(), "")
         .list_vaults()
         .await
         .unwrap();
@@ -63,7 +63,7 @@ async fn creates_vaults_and_lists_them() {
 
     // The per-vault cap cannot exceed the server-wide maximum.
     let big = env
-        .operator(Method::POST, "/vaults")
+        .owner(Method::POST, "/vaults")
         .json(&serde_json::json!({ "name": "big", "max_file_size": u64::MAX }))
         .send()
         .await
@@ -79,11 +79,11 @@ async fn creates_vaults_and_lists_them() {
 
 #[tokio::test]
 async fn malformed_json_returns_400() {
-    let Some(env) = TestEnv::try_new().await else {
+    let Some(env) = TestEnv::try_with_owner().await else {
         return;
     };
     let response = env
-        .operator(Method::POST, "/vaults")
+        .owner(Method::POST, "/vaults")
         .header("content-type", "application/json")
         .body("{not json")
         .send()
@@ -96,7 +96,7 @@ async fn malformed_json_returns_400() {
     );
 
     let blank = env
-        .operator(Method::POST, "/vaults")
+        .owner(Method::POST, "/vaults")
         .json(&serde_json::json!({ "name": "   " }))
         .send()
         .await
@@ -111,13 +111,13 @@ async fn malformed_json_returns_400() {
 
 #[tokio::test]
 async fn deletes_a_vault_and_all_its_blobs() {
-    let Some(env) = TestEnv::try_new().await else {
+    let Some(env) = TestEnv::try_with_owner().await else {
         return;
     };
-    let id = env.create_vault(common::API_KEY, "doomed").await;
-    let client = env.api_client(common::API_KEY, &id);
+    let id = env.create_vault(env.owner_token(), "doomed").await;
+    let client = env.api_client(env.owner_token(), &id);
     let put = env
-        .operator(Method::PUT, &format!("/vaults/{id}/files/tok"))
+        .owner(Method::PUT, &format!("/vaults/{id}/files/tok"))
         .header("X-Content-Hash", "h1")
         .body("bytes")
         .send()
@@ -138,13 +138,13 @@ async fn deletes_a_vault_and_all_its_blobs() {
     assert_eq!(env.table_count("files").await, 0);
 
     let again = env
-        .operator(Method::DELETE, &format!("/vaults/{id}"))
+        .owner(Method::DELETE, &format!("/vaults/{id}"))
         .send()
         .await
         .unwrap();
     assert_eq!(again.status(), 404);
     let bogus = env
-        .operator(Method::DELETE, "/vaults/../etc")
+        .owner(Method::DELETE, "/vaults/../etc")
         .send()
         .await
         .unwrap();

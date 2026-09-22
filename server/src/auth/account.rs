@@ -1,11 +1,16 @@
-//! Shared tail of every sign-in: find or create the account, then mint a
-//! session. Runs inside the caller's transaction so a refused invite leaves
-//! nothing behind.
+//! Shared tail of every sign-in: find or create the account, register the
+//! device, then mint its session. Runs inside the caller's transaction so a
+//! refused invite leaves nothing behind.
 
 use sqlx::PgConnection;
 
 use crate::{
-    auth::{invites, sessions, sessions::SessionResponse, users},
+    auth::{
+        devices::{self, DeviceIdentity},
+        invites, sessions,
+        sessions::SessionResponse,
+        users,
+    },
     error::ApiError,
     AppState,
 };
@@ -20,7 +25,7 @@ pub async fn sign_in(
     conn: &mut PgConnection,
     identity: Identity,
     invite_code: Option<&str>,
-    device_name: &str,
+    device: &DeviceIdentity,
     now: u64,
 ) -> Result<SessionResponse, ApiError> {
     let keys = &state.keys;
@@ -61,5 +66,6 @@ pub async fn sign_in(
             user
         }
     };
-    sessions::create(conn, keys, &user.id, user.email.clone(), device_name, now).await
+    devices::upsert(conn, keys, &user.id, device, now).await?;
+    sessions::create(conn, &user.id, user.email.clone(), &device.id, now).await
 }
