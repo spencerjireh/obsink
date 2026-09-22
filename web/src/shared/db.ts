@@ -99,7 +99,18 @@ export async function get<T>(store: Store, key: string): Promise<T | undefined> 
 }
 
 export async function put<T>(store: Store, key: string, value: T): Promise<void> {
-  await request((await tx(store, 'readwrite')).put(value, key))
+  try {
+    await request((await tx(store, 'readwrite')).put(value, key))
+  } catch (error) {
+    // The one storage failure a user can act on gets a sentence, not a DOMException name.
+    if ((error as DOMException)?.name === 'QuotaExceededError') {
+      throw {
+        kind: 'other',
+        message: 'The browser is out of storage for ObSink. Free some space and try again.',
+      }
+    }
+    throw error
+  }
 }
 
 export async function del(store: Store, key: string): Promise<void> {

@@ -157,9 +157,10 @@ Shared labels. Every platform uses exactly these strings:
 | tabs (desktop settings) | `Vaults`, `Account`, `Activity` |
 | primary actions | `Sync now`, `Apply resolutions` |
 | setup | `Add vault`, `Create vault`, `Connect vault`, `Load vaults` (iOS; desktop lists on entry), `Send sign-in code`, `Verify and sign in`, `Change email`, `Sign in` |
+| browser only | `Choose folder` / `Choose another folder` (the folder is picked, not typed), `Unlock` (the passphrase again after a reload: keys live only in memory), `Allow access` (the folder grant again: Chrome forgets it per session) |
 | add-vault steps | `Sign in`, `Choose vault`, `Folder`, `Passphrase`; navigation `Back`, `Next`, `Cancel`, `Done` |
 | windows | `Settings`, `Open settings`, `Open folder`, `Quit ObSink` |
-| vault state | `Up to date`, `n to upload`, `n to download`, `n to upload · n to download`, `n conflicts` (`1 conflict`), `Syncing…`, `Offline`, `Session expired`, `Error: <message>`, `On another server`, `Needs passphrase` |
+| vault state | `Up to date`, `n to upload`, `n to download`, `n to upload · n to download`, `n conflicts` (`1 conflict`), `Syncing…`, `Offline`, `Session expired`, `Error: <message>`, `On another server`, `Needs passphrase`, `Needs folder access` (browser) |
 | last synced | `Never synced`, `Just now`, `1 minute ago`, `n minutes ago`, `n hours ago`, `Yesterday`, `n days ago`, then the short date; `Last synced <relative>` on a vault page |
 | popover global line | the worst state across vaults: `Offline`, `n conflicts`, `Syncing…`, `Error`, `Changes pending · synced <relative>`, `Up to date · synced <relative>`; `No vaults yet.` |
 | activity lines | `Uploaded <path>`, `Downloaded <path>`, `Deleted here <path>`, `Deleted on server <path>`, `Conflict <path>`, `Failed <path>: <error>`, `Error: <error>`, `Synced · ↑n ↓n` |
@@ -170,10 +171,10 @@ Shared labels. Every platform uses exactly these strings:
 | per-vault usage | `412 MiB of 1 GiB`; `412 MiB` when the server sets no cap |
 | session | `Session expired. Sign in again.` with the action `Sign in` |
 | server without email | `This server has no email sign-in.` |
-| after actions | `Invite code created.`, `Invite code copied.`, `Device signed out.`, `Account deleted.`, `Added <vault>.`, `Removed <vault> from this device.`, `Deleted <vault> on the server.` |
+| after actions | `Invite code created.`, `Invite code copied.`, `Device signed out.`, `Account deleted.`, `Added <vault>.`, `Removed <vault> from this device.`, `Deleted <vault> on the server.`, `Unlocked <vault>.` (browser), `Signed out of <server>.` |
 | foreign vault | `Vault is on another server. Remove it from this device.` (error); the page explains it is configured for another server and offers only `Remove from this device` |
 | confirmation prompt | `Type <value> to confirm.` |
-| confirmation copy | delete account: `This deletes your account, every vault it owns on <server>, and every signed-in device.` then, desktop: `Vault folders on this device stay.`, iOS: `The copies on this device are removed too.`; delete vault: `This deletes <vault> and all of its files on <server>` then, desktop: `The folder on this device stays.`, iOS: `for every device.`; remove: `The vault stays on the server.` then, desktop: `The key is removed from the keychain, so connecting again needs the passphrase.`, iOS: `The copy on this device, its Files location, and the key are removed, so connecting again needs the passphrase.` |
+| confirmation copy | delete account: `This deletes your account, every vault it owns on <server>, and every signed-in device.` then, desktop: `Vault folders on this device stay.`, iOS: `The copies on this device are removed too.`; delete vault: `This deletes <vault> and all of its files on <server>` then, desktop: `The folder on this device stays.`, browser: `The folder on this computer stays.`, iOS: `for every device.`; remove: `The vault stays on the server.` then, desktop: `The key is removed from the keychain, so connecting again needs the passphrase.`, browser: `This browser forgets the folder, so connecting again needs the passphrase.`, iOS: `The copy on this device, its Files location, and the key are removed, so connecting again needs the passphrase.` |
 | modes | `Create`, `Connect` |
 | conflict sides | `This device`, `Other device` |
 | conflict choices | `Keep local`, `Keep remote`, `Keep both`, `Delete on server`, `Delete here` |

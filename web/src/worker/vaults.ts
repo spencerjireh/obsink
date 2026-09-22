@@ -6,7 +6,7 @@ import type {
   VaultStateInfo,
 } from '@obsink/ui'
 import { all, del, get, KV_ACTIVE_VAULT, listVaults, put, type StoredVault } from '../shared/db'
-import { other } from './errors'
+import { other, wrongPassphrase } from './errors'
 import { deriveKeys, forgetKeys, keysFor, rememberKeys } from './keys'
 import {
   diffManifests,
@@ -39,7 +39,7 @@ export function listRemoteVaults(): Promise<RemoteVault[]> {
 
 export async function vaultById(vaultId: string): Promise<StoredVault> {
   const vault = await get<StoredVault>('vaults', vaultId)
-  if (!vault) throw other('vault not configured in this browser')
+  if (!vault) throw other('This vault is not configured in this browser. Add it again.')
   return vault
 }
 
@@ -68,16 +68,20 @@ async function validatePassphrase(vault: StoredVault, keys: VaultKeys): Promise<
   if (live) {
     const [path] = live
     const blob = await bearerCall((bearer) => api.getFile(bearer, vault.id, keys.pathToken(path)))
-    keys.decrypt(blob)
+    try {
+      keys.decrypt(blob)
+    } catch {
+      throw wrongPassphrase()
+    }
   }
   await saveSyncState(vault.id, state)
 }
 
 export async function addVault(request: AddVaultRequest): Promise<LocalVault> {
   if (!request.local_path.trim()) throw other('Choose a folder for the vault.')
-  if (!request.passphrase) throw other('passphrase is required')
-  if (request.mode === 'create' && !request.vault_name.trim()) throw other('vault name is required')
-  if (request.mode === 'connect' && !request.vault_id.trim()) throw other('vault ID is required')
+  if (!request.passphrase) throw other('Enter a passphrase.')
+  if (request.mode === 'create' && !request.vault_name.trim()) throw other('Enter a vault name.')
+  if (request.mode === 'connect' && !request.vault_id.trim()) throw other('Enter a vault ID.')
 
   const handle = await get<FileSystemDirectoryHandle>('handles', request.local_path)
   if (!handle) throw other('Choose a folder for the vault.')
@@ -91,7 +95,7 @@ export async function addVault(request: AddVaultRequest): Promise<LocalVault> {
           const found = (await api.listVaults(bearer)).find(
             (vault) => vault.id === request.vault_id,
           )
-          if (!found) throw other(`vault ${request.vault_id} not found`)
+          if (!found) throw other(`Vault ${request.vault_id} was not found on the server.`)
           return found
         })
 
@@ -182,10 +186,6 @@ async function vaultState(vault: StoredVault): Promise<VaultStateInfo['state']> 
   } catch (error) {
     const failure = error as { kind?: string; message?: string }
     if ((error as DOMException)?.name === 'NotAllowedError') return { kind: 'needs_access' }
-    // No bearer at all reads as an expired session, as desktop's 401 does.
-    if (failure.message?.startsWith('not signed in')) {
-      return { kind: 'error', error_kind: 'unauthorized', message: 'unauthorized: sign in again' }
-    }
     return {
       kind: 'error',
       error_kind: isErrorKind(failure.kind) ? failure.kind : 'other',

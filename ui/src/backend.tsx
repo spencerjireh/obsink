@@ -38,6 +38,9 @@ export type BackendEvents = {
   'popover://opened': void
   'tray://sync-now': void
   'settings://navigate': SettingsTarget
+  // The platform's engine failed outside any call (the browser client's
+  // worker died or threw on its own); the page tells the user.
+  'client://error': { message: string }
 }
 export type BackendEvent = keyof BackendEvents
 
@@ -52,6 +55,9 @@ export type Platform = {
   canOpenFolder: boolean
   // Shown in the path field when the folder is typed rather than picked.
   folderPlaceholder: string
+  // The hint on the folder step, per mode ("Where the vault lives on this
+  // Mac" | "Which folder on this computer holds the vault").
+  folderPrompt: { create: string; connect: string }
 }
 
 export interface Backend {
@@ -71,6 +77,11 @@ export interface Backend {
   addVault(request: AddVaultRequest): Promise<LocalVault>
   // Present where folders are picked rather than typed (the browser).
   pickFolder?(): Promise<{ id: string; name: string }>
+  // Forget a picked folder that never became a vault (the add flow closed).
+  discardPickedFolder?(): Promise<void>
+  // Present where background work should pause while the app is hidden or
+  // offline (the browser's polling).
+  setVisibility?(hidden: boolean): Promise<void>
   // Present where a folder grant can lapse (the browser): ask for it again.
   requestFolderAccess?(vaultId: string): Promise<void>
   // Present where the key is not kept between launches (the browser): the

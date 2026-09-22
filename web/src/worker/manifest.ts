@@ -9,6 +9,7 @@ import {
   type VaultSyncState,
 } from '../shared/db'
 import type { WireFileEntry } from './api'
+import { wrongPassphrase } from './errors'
 import { readFile, scan, statOf, type ScannedFile } from './fs'
 import { api, bearerCall } from './session'
 import { wasm, type Core, type VaultKeys } from './wasm'
@@ -100,7 +101,12 @@ export function decodeManifest(wire: Record<string, WireFileEntry>, keys: VaultK
   const manifest: Manifest = {}
   for (const entry of Object.values(wire)) {
     if (!entry.encPath) continue
-    const path = keys.decryptPath(entry.encPath)
+    let path: string
+    try {
+      path = keys.decryptPath(entry.encPath)
+    } catch {
+      throw wrongPassphrase()
+    }
     manifest[path] = {
       hash: entry.hash,
       modified: entry.modified,

@@ -29,7 +29,7 @@ type Props = {
 // card that says where the folder is.
 export function AddVaultFlow({ account, message, notify, onError, onAdded, onClose }: Props) {
   const backend = useBackend()
-  const { deviceNoun, folderPlaceholder, canOpenFolder } = backend.platform
+  const { folderPlaceholder, folderPrompt, canOpenFolder } = backend.platform
   const [step, setStep] = useState<Step>(account.signedIn ? 'choose' : 'sign-in')
   const [mode, setMode] = useState<AddVaultMode>('connect')
   const [remoteVaults, setRemoteVaults] = useState<RemoteVault[] | null>(null)
@@ -41,6 +41,14 @@ export function AddVaultFlow({ account, message, notify, onError, onAdded, onClo
   const [passphrase, setPassphrase] = useState('')
   const [busy, setBusy] = useState(false)
   const [added, setAdded] = useState<LocalVault | null>(null)
+
+  // A folder picked here but never turned into a vault is forgotten when the
+  // flow closes (the backend ignores this once the vault exists).
+  useEffect(() => {
+    return () => {
+      void backend.discardPickedFolder?.()
+    }
+  }, [backend])
 
   // Signing in moves past the first step on its own.
   useEffect(() => {
@@ -109,6 +117,8 @@ export function AddVaultFlow({ account, message, notify, onError, onAdded, onClo
       setLocalPath(picked.id)
       setFolderName(picked.name)
     } catch (error) {
+      // Closing the picker is not an error.
+      if ((error as DOMException)?.name === 'AbortError') return
       onError(error)
     }
   }
@@ -295,9 +305,7 @@ export function AddVaultFlow({ account, message, notify, onError, onAdded, onClo
           <div className="section__heading">
             <h2 id="step-heading">Folder</h2>
             <span className="section__hint">
-              {mode === 'create'
-                ? `Where the vault lives on ${deviceNoun}`
-                : `Where to put the vault on ${deviceNoun}`}
+              {mode === 'create' ? folderPrompt.create : folderPrompt.connect}
             </span>
           </div>
           <div className="form-grid">
@@ -332,10 +340,10 @@ export function AddVaultFlow({ account, message, notify, onError, onAdded, onClo
               </label>
             )}
             <div className="choice-row form-grid__actions">
-              <button className="button button--ghost" onClick={back} type="button">
+              <button className="button button--ghost" disabled={busy} onClick={back} type="button">
                 Back
               </button>
-              <button className="button button--primary" disabled={!valid} type="submit">
+              <button className="button button--primary" disabled={busy || !valid} type="submit">
                 Next
               </button>
             </div>
