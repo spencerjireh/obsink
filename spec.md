@@ -29,7 +29,9 @@ TLS is terminated by the operator's reverse proxy (Coolify's Traefik in the refe
 | `core/` | Rust | Shared sync engine: encryption, hashing, manifest diffing, conflict detection, API client |
 | `server/` | Rust (axum) | Self-hosted API: accounts and invites, vault storage, manifest, conflict gating, version retention |
 | `cli/` | Rust | `obsink` reference client |
-| `desktop/` | Rust + Web (Tauri) | macOS menu-bar app. Thin UI shell calling into Rust core |
+| `ui/` | TypeScript (React) | The screens shared by the desktop app and the browser client, over the `Backend` interface |
+| `desktop/` | Rust + Web (Tauri) | macOS menu-bar app. Thin shell: the shared screens plus Tauri commands into Rust core |
+| `core-wasm/` + `web/` + `site/` | Rust (wasm-bindgen) + TypeScript | Browser client at `/app` (the shared screens over a worker that syncs a local folder through the File System Access API, with core's pure rules compiled to wasm), the landing page, and the Caddy container that serves both and proxies the API |
 | `mobile/` + `ios/` | Swift + Rust (via UniFFI) | iOS app + File Provider extension. SwiftUI interface, Rust core via generated bindings |
 
 ---
@@ -104,7 +106,7 @@ Every vault request carries `Authorization: Bearer <token>`. The server resolves
 | operator | the `OBSINK_API_KEY` environment value (compared in constant time) | `default` | the admin CLI, `scripts/verify-*`, harnesses |
 | user | an `os_…` session token minted by `/auth/*`, stored as SHA-256, 180-day absolute expiry | the user id | every app user |
 
-Clients offer one setup flow: enter the server URL, then sign in with an emailed 6-digit one-time code (all platforms) or Sign in with Apple (iOS). The operator bearer has no UI; it exists for scripts. Apple sign-in needs no per-server Apple configuration because the identity token's audience is the ObSink app's bundle id (`APPLE_CLIENT_IDS`, default `com.obsink.ios`).
+Clients offer one setup flow: sign in with an emailed 6-digit one-time code (all platforms) or Sign in with Apple (iOS); the server is baked into each build (the CLI also takes `--server-url`), never a field in the UI. The operator bearer has no UI; it exists for scripts. Apple sign-in needs no per-server Apple configuration because the identity token's audience is the ObSink app's bundle id (`APPLE_CLIENT_IDS`, default `com.obsink.ios`).
 
 **Invite-only signup.** The first account on a fresh server signs up without an invite. After that, creating a new account requires an unused, unexpired invite code; existing accounts sign in freely. A code stays spent after the account that redeemed it is deleted. Any signed-in user (and the operator) can mint codes: 8 characters from `ABCDEFGHJKLMNPQRSTUVWXYZ23456789`, single-use, valid 7 days. Redemption failures are rate-limited process-wide (20 per minute).
 
@@ -403,14 +405,14 @@ Stable UUIDs assigned on first encounter. **Never** use file paths as identifier
 
 ### 12.1 First Device (Creating a Vault)
 
-1. Enter the server URL, then sign in with an email code or Sign in with Apple (iOS). New accounts need an invite code unless the server has no users yet. The session token goes to the keychain, so this happens once per device.
+1. Sign in with an email code or Sign in with Apple (iOS). Each build talks to one server (baked in at build time; the CLI also takes `--server-url`), so there is no URL to enter. New accounts need an invite code unless the server has no users yet. The session token goes to the keychain, so this happens once per device.
 2. Choose: "Create new vault" or "Connect to existing vault"
 3. If creating: enter vault name, choose passphrase → app derives key, stores in keychain, creates vault on server, optionally imports existing local Obsidian vault folder
 4. If connecting: app lists vaults from server, user picks one, enters passphrase → key derived, stored in keychain, initial pull of all files
 
 ### 12.2 Adding a New Device
 
-1. Enter the same server URL and sign in to the same account
+1. Sign in to the same account (on the same server)
 2. App lists available vaults
 3. User selects vault(s) and enters passphrase for each
 4. Initial sync pulls all files
@@ -425,17 +427,24 @@ On connect, the app downloads a single file and attempts decryption. If it fails
 
 ```
 obsink/
-├── core/                     Rust shared library
+├── core/                     Rust shared library (the pure modules also build for wasm32)
 │   ├── Cargo.toml
 │   └── src/
-│       ├── lib.rs            public API surface
-│       ├── crypto.rs         AES-256-GCM, Argon2id key derivation
-│       ├── manifest.rs       manifest diffing, conflict detection
-│       ├── hasher.rs         SHA-256 file hashing
+│       ├── lib.rs            public API surface; cfg-gates the IO modules off wasm32
+│       ├── crypto.rs         Argon2id key derivation, HKDF sub-keys, AES-256-GCM, path tokens
+│       ├── manifest.rs       manifest diffing, conflict detection, checkpoint
+│       ├── hasher.rs         keyed content hashing (HMAC-SHA256) + the (mtime, size) hash cache
+│       ├── ignore.rs         built-in and per-vault ignore rules
+│       ├── sync_rules.rs     pure sync decisions: upload batching, effective conflict choice, copy names
+│       ├── pacing.rs         daemon pacing: poll intervals, exponential backoff
+│       ├── server_url.rs     URL normalization and the legacy host alias table
 │       ├── api_client.rs     HTTP client for the server (ETag cache, multipart batch)
 │       ├── auth.rs           sign-in, sessions, invites
-│       ├── sync_engine.rs    orchestrates full sync flow
+│       ├── keychain.rs       macOS Keychain (or a directory of files) for keys and bearers
+│       ├── sync_engine.rs    orchestrates the full sync cycle
+│       ├── daemon.rs         the driver: watcher + poll + backoff around the engine
 │       └── types.rs          shared types (SyncResult, Conflict, FileEntry, etc.)
+├── core-wasm/                wasm-bindgen bindings over the pure core for the browser client
 ├── server/                   self-hosted server (axum)
 │   ├── Cargo.toml            depends on ../core
 │   ├── Dockerfile            build context = repo root
@@ -449,24 +458,41 @@ obsink/
 │   │   ├── routes/           vaults, files, batch, me
 │   │   └── retention.rs      pruning task
 │   └── tests/                DATABASE_URL-gated integration tests
-├── mobile/                   UniFFI facade over core for iOS
-├── ios/                      Xcode project (XcodeGen): app, File Provider, tests
-├── desktop/                  Tauri desktop app
+├── ui/                       shared React screens + the Backend interface (npm workspace, TS source)
+│   └── src/
+│       ├── backend.tsx       Backend interface, BackendProvider, Platform nouns
+│       ├── settings/, popover/, components/, hooks/, lib/
+│       └── styles.css
+├── desktop/                  Tauri v2 menu-bar app
 │   ├── src-tauri/
 │   │   ├── Cargo.toml        depends on ../core
-│   │   └── src/
-│   │       └── main.rs       Tauri commands wrapping core
-│   └── src/                  React UI
-│       ├── App.tsx
-│       ├── main.tsx
-│       └── styles.css
-├── cli/                       Rust CLI tool for testing/debugging
-│   ├── Cargo.toml
+│   │   ├── tauri.conf.json   bundle, windows, CSP
+│   │   └── src/main.rs       Tauri commands wrapping core, tray, windows
 │   └── src/
-│       └── main.rs
-├── scripts/                  build-ios, release-ios, verify-* harnesses
-├── docker-compose.yml        local stack: server (built), Postgres, Mailpit
-├── docker-compose.coolify.yml production stack: server built from source, Postgres
+│       ├── backend.ts        the Backend over Tauri invoke/listen
+│       └── main.tsx          entry: PopoverApp or SettingsApp by window label
+├── web/                      browser client at /app + the website container
+│   ├── src/
+│   │   ├── main.tsx, App.tsx  entry, error boundary, visibility wiring
+│   │   ├── backend.ts        the Backend over a worker; folder picking on the page
+│   │   ├── shared/           IndexedDB layer, worker protocol
+│   │   └── worker/           fetch layer, account, vaults, keys, fs (File System Access), sync, driver, activity
+│   ├── Dockerfile            wasm-pack + npm build, Caddy
+│   └── Caddyfile             site at /, client at /app, API paths proxied to the server
+├── site/                     landing page (index.html, icon.svg, robots.txt) and install.sh
+├── cli/                      `obsink` CLI (reference client)
+│   ├── Cargo.toml
+│   └── src/main.rs
+├── mobile/                   UniFFI facade over core for iOS
+├── ios/                      Xcode project (XcodeGen): app, File Provider, tests
+├── design/                   icon.svg + tray.svg (rasters via scripts/gen-icons.sh)
+├── docs/                     self-hosting, architecture, platforms, troubleshooting
+├── scripts/                  build-ios, release-ios, testflight.py, ci-import-signing-cert, gen-icons,
+│                             verify-* harnesses, test-web-container, test-install-sh, check-commit-msg
+├── package.json              npm workspaces: ui, desktop, web (lint, format, typecheck, build, test)
+├── docker-compose.yml        local stack: server and web (built), Postgres, Mailpit
+├── docker-compose.coolify.yml production stack: server and web built from source, Postgres
+├── AGENTS.md, DESIGN.md      agent rules; UI rules (tokens, components, copy)
 ├── lefthook.yml              git hooks: rustfmt, prettier, commit message
 ├── deny.toml                 cargo-deny policy
 ├── rust-toolchain.toml       pinned Rust version
@@ -474,8 +500,8 @@ obsink/
     ├── pull_request_template.md
     ├── rulesets/main.json    branch ruleset for main (applied with gh api)
     └── workflows/
-        ├── ci.yml            commit check, fmt/clippy/tests, cargo-deny, server on Postgres, web (wasm + client + image), desktop lint+build, iOS simulator tests
-        └── release.yml       on v*.*.* tags: verify versions, build + publish the universal CLI tarball and the signed, notarized universal DMG
+        ├── ci.yml            commit check, fmt/clippy/tests, cargo-deny, server on Postgres, web (wasm + client + image + route checks), desktop lint+build+install.sh test, iOS simulator tests
+        └── release.yml       on v*.*.* tags (or a manual dry run): verify versions, build the universal CLI and the signed, notarized universal DMG, publish once
 ```
 
 ---

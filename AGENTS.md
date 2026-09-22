@@ -16,8 +16,8 @@ deployment in `docs/self-hosting.md`.
 
 ## Tech (pinned versions)
 
-- **Rust** — stable, edition 2021 (Cargo workspace: `core`, `cli`,
-  `desktop/src-tauri`, `mobile`). Core deps: `aes-gcm` 0.10, `argon2` 0.5,
+- **Rust** — stable, edition 2021 (Cargo workspace: `core`, `core-wasm`, `cli`,
+  `desktop/src-tauri`, `mobile`, `server`). Core deps: `aes-gcm` 0.10, `argon2` 0.5,
   `hkdf` 0.12, `hmac` 0.12, `sha2` 0.10, `reqwest` 0.12 (rustls-tls),
   `tokio` 1, `tracing` 0.1; `security-framework` 3 behind the `keychain`
   feature (CLI + desktop keychain access without a `security` argv).
@@ -31,6 +31,11 @@ deployment in `docs/self-hosting.md`.
   `tempfile`, `rsa` (forges Apple tokens in tests). Env vars are listed in
   `server/src/config.rs`; deployment in `docs/self-hosting.md`; API in spec §4.
 - **Desktop** — Tauri v2 (`@tauri-apps` 2.0), React 18.3, Vite 5.4, TypeScript 5.6.
+- **Web** — npm workspaces `ui` (the React screens and the `Backend` interface,
+  shared with desktop), `desktop` (the Tauri `Backend`) and `web` (the browser
+  client: a Web Worker over `core-wasm` (wasm-bindgen 0.2, wasm-pack 0.15),
+  `fetch` and the File System Access API, IndexedDB for state; Vite, vitest,
+  Playwright for the e2e harness).
 - **iOS** — Swift/SwiftUI + File Provider extension; Rust via **UniFFI 0.28**
   (`mobile/` crate). Project generated with XcodeGen (`ios/project.yml`).
 - **Infra** — `server/Dockerfile` (cargo-chef, distroless) and `web/Dockerfile`
@@ -64,8 +69,9 @@ obsink/
   mobile/                # UniFFI facade over core (staticlib/cdylib for iOS)
   ios/                   # Xcode project: ObSink app + FileProvider ext + Tests (XcodeGen)
   docker-compose.yml     # local stack; docker-compose.coolify.yml for production
-  scripts/               # build-ios, release-ios, gen-icons, verify-* harnesses, check-commit-msg
-  docs/                  # self-hosting, architecture, platforms, troubleshooting
+  scripts/               # build-ios, release-ios, testflight.py, ci-import-signing-cert, gen-icons,
+                         #   verify-* harnesses, test-web-container, test-install-sh, check-commit-msg
+  docs/                  # self-hosting, architecture, platforms, troubleshooting, p4-plan
   .github/               # ci.yml, release.yml, rulesets/main.json, PR template
   lefthook.yml           # git hooks: rustfmt, prettier, commit message
   deny.toml              # cargo-deny policy (advisories, licenses, bans, sources)
@@ -106,8 +112,12 @@ obsink/
    tests skip without `DATABASE_URL`; run them against Postgres before touching
    `server/`), `cargo clippy --workspace --all-targets -- -D warnings`,
    `cargo deny check`, and at the repo root `npm run lint && npm run format:check
-   && npm run typecheck -w ui && npm run build -w desktop`. CI enforces all of
-   them on every PR; run them before considering work done.
+   && npm run typecheck -w ui && npm run build -w desktop && npm run typecheck -w web
+   && npm run test -w web && npm run build -w web` (the web steps need
+   `wasm-pack build core-wasm --target web` first). CI enforces all of them on
+   every PR, plus the container route checks (`scripts/test-web-container.sh`)
+   and the install script test (`scripts/test-install-sh.sh`); run them before
+   considering work done.
 8. **No new dependencies without a one-line justification.** The core crypto
    stack (aes-gcm, argon2, hkdf, hmac, sha2) is fixed — do not swap it out.
 

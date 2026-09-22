@@ -78,3 +78,23 @@ Pruning runs in-process at startup and every `RETENTION_INTERVAL_SECS` (`_versio
 
 **After upgrading, an existing vault won't sync or paths look wrong**
 The manifest wire format is versioned (`PROTOCOL_VERSION`). A format change (e.g. the v2 HMAC-hash + encrypted-path migration) invalidates old manifests. Re-initialize the vault: delete it on the server (`DELETE /vaults/:id`, or from the app), then `init`/`connect` fresh.
+
+## Browser client
+
+**`/app` says the browser is not supported**
+Folder sync needs the File System Access API, which Chrome, Edge and other Chromium browsers provide over HTTPS only. Safari and Firefox do not; use the desktop app, the CLI or the iOS app. A self-hosted copy served over plain HTTP shows the same page with a note about HTTPS.
+
+**`Needs passphrase` after a reload**
+The derived key lives only in the worker's memory; nothing about the passphrase is stored in the browser. Type it into the Unlock field on the vault page. The bearer, the vault list and the sync bookkeeping survive the reload (IndexedDB), so nothing else is lost.
+
+**`Needs folder access`**
+Chrome grants access to a picked folder per session. Press `Allow access` on the vault page and accept the prompt; the folder itself is remembered. If the folder was moved or deleted, remove the vault and add it again.
+
+**Sync stops when the tab closes, and pauses while it is hidden or offline**
+There is no background process: the worker polls while the tab is open and visible, and resumes with a poll when the tab returns. Keep the tab open for a sync to run, or use the desktop app.
+
+**`The browser client stopped. Reload the page.`**
+The worker died (out of memory, or the page was restored from the back-forward cache). Reload; the vault and its bookkeeping are intact.
+
+**`The browser is out of storage for ObSink.`**
+IndexedDB hit its quota. Free space in the browser's site settings, or clear other sites' data; the vault's files are on disk and on the server, so the local bookkeeping rebuilds on the next sync.
