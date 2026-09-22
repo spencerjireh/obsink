@@ -28,9 +28,10 @@ const EMAIL = `web-e2e-${Date.now()}@example.test`
 const PASSPHRASE = 'e2e-passphrase'
 const VAULT = `e2e-${Date.now()}`
 
+// A thrown failure unwinds through the `finally` below, so the devices'
+// profiles are removed and the contexts closed even on a failed run.
 function fail(message) {
-  console.error(`FAIL: ${message}`)
-  process.exit(1)
+  throw new Error(`FAIL: ${message}`)
 }
 
 async function api(path, options = {}) {
@@ -141,10 +142,19 @@ async function syncNow(page) {
 // memory and Chrome cannot hand such a directory handle to a worker through
 // IndexedDB (the browser process exits), while a profile on disk can.
 async function device() {
+  let closing = false
   const profile = await mkdtemp(join(tmpdir(), 'obsink-e2e-'))
   const context = await chromium.launchPersistentContext(profile, {
     channel: 'chromium',
     headless: process.env.OBSINK_E2E_HEADED !== '1',
+  })
+  context.on('close', () => {
+    if (!closing) {
+      console.error(
+        'the browser closed on its own; with an ephemeral context Chrome exits when a worker ' +
+          'receives an OPFS handle through IndexedDB, so keep launchPersistentContext',
+      )
+    }
   })
   await context.addInitScript(shim)
   const page = context.pages()[0] ?? (await context.newPage())
@@ -154,7 +164,14 @@ async function device() {
   })
   await page.goto(WEB)
   await page.getByRole('tab', { name: 'Vaults' }).waitFor()
-  return { page, close: async () => { await context.close(); await rm(profile, { recursive: true, force: true }) } }
+  return {
+    page,
+    close: async () => {
+      closing = true
+      await context.close()
+      await rm(profile, { recursive: true, force: true })
+    },
+  }
 }
 
 const invite = await mintInvite()
@@ -216,13 +233,11 @@ try {
   // this moment (the delete is refused while one runs), so retry briefly.
   await a.getByRole('button', { name: 'Delete vault on server' }).first().click()
   await a.getByRole('textbox', { name: /to confirm/ }).fill(VAULT)
+  const outcome = a.getByText(new RegExp(`Deleted ${VAULT} on the server\\.|A sync is running on this vault`))
   for (let attempt = 0; attempt < 10; attempt++) {
     await a.getByRole('button', { name: 'Delete vault on server' }).last().click()
-    const outcome = await Promise.race([
-      a.getByText(`Deleted ${VAULT} on the server.`).waitFor().then(() => 'deleted'),
-      a.getByText('A sync is running on this vault').waitFor().then(() => 'busy'),
-    ])
-    if (outcome === 'deleted') break
+    await outcome.waitFor()
+    if ((await outcome.textContent())?.startsWith('Deleted')) break
     await a.waitForTimeout(2000)
   }
   await a.getByText(`Deleted ${VAULT} on the server.`).waitFor()
