@@ -33,6 +33,7 @@ export function Conflicts({
         {conflicts.length > 0 ? (
           <button
             className="button button--primary"
+            data-testid="applyResolutionsButton"
             disabled={busy}
             onClick={onResolve}
             type="button"
@@ -55,6 +56,8 @@ export function Conflicts({
               >
                 <button
                   className="conflict-card__select"
+                  data-testid="conflictRowTitle"
+                  data-path={conflict.path}
                   aria-pressed={selected}
                   onClick={() => onSelect(conflict.path)}
                   type="button"
@@ -87,6 +90,8 @@ export function Conflicts({
                   {availableChoices(conflict).map(({ choice, label }) => (
                     <button
                       key={choice}
+                      data-testid="winnerPicker"
+                      data-choice={choice}
                       className={choices[conflict.path] === choice ? 'is-selected' : ''}
                       aria-pressed={choices[conflict.path] === choice}
                       onClick={() => onChoose(conflict.path, choice)}

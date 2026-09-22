@@ -59,6 +59,7 @@ export function ConfirmForm({
             Type <code>{expected}</code> to confirm.
           </span>
           <input
+            data-testid="confirmationField"
             className="mono"
             autoFocus
             autoCapitalize="off"
@@ -70,10 +71,21 @@ export function ConfirmForm({
         </label>
       ) : null}
       <div className="choice-row">
-        <button className="button button--danger" disabled={!matches || busy} type="submit">
+        <button
+          className="button button--danger"
+          data-testid="confirmDestructiveButton"
+          disabled={!matches || busy}
+          type="submit"
+        >
           {confirmLabel}
         </button>
-        <button className="button button--ghost" disabled={busy} onClick={onCancel} type="button">
+        <button
+          className="button button--ghost"
+          data-testid="confirmCancelButton"
+          disabled={busy}
+          onClick={onCancel}
+          type="button"
+        >
           Cancel
         </button>
       </div>

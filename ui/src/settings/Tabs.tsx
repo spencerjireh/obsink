@@ -20,6 +20,8 @@ export function Tabs({
           key={entry.id}
           className="tab"
           role="tab"
+          data-testid="settingsTab"
+          data-tab={entry.id}
           aria-selected={tab === entry.id}
           onClick={() => onChange(entry.id)}
           type="button"

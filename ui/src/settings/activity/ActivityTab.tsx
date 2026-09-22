@@ -37,7 +37,12 @@ export function ActivityTab({
       ) : (
         <ol className="activity-list">
           {events.map((event, index) => (
-            <li key={`${event.at}-${index}`} className={`activity-row activity-row--${event.kind}`}>
+            <li
+              key={`${event.at}-${index}`}
+              className={`activity-row activity-row--${event.kind}`}
+              data-testid="activityRow"
+              data-kind={event.kind}
+            >
               <span className="activity-row__time">{formatRelative(event.at)}</span>
               {!vaultId ? (
                 <span className="activity-row__vault">{names.get(event.vault_id) ?? '?'}</span>

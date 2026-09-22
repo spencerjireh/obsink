@@ -34,6 +34,7 @@ export function VaultActions({ vault, busy, removeOnly = false, onRemove, onDele
         <button
           className="button button--ghost"
           disabled={busy || confirming !== null}
+          data-testid="removeVaultButton"
           onClick={() => setConfirming('remove')}
           type="button"
         >
@@ -43,6 +44,7 @@ export function VaultActions({ vault, busy, removeOnly = false, onRemove, onDele
           <button
             className="button button--danger"
             disabled={busy || confirming !== null}
+            data-testid="deleteVaultButton"
             onClick={() => setConfirming('delete')}
             type="button"
           >

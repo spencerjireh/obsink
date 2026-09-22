@@ -17,7 +17,7 @@ export function InviteList({ invites, busy, onCopy }: Props) {
       ) : (
         <ul className="row-list">
           {invites.map((invite) => (
-            <li className="row-item" key={invite.code}>
+            <li className="row-item" data-testid="inviteRow" key={invite.code}>
               <span className="row-item__main">
                 <code className="invite-code">{invite.code}</code>
                 <span className={`tag tag--${invite.status}`}>
