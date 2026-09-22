@@ -1,8 +1,27 @@
 name: Release
 
+# A pushed vX.Y.Z tag builds and publishes the release. A manual run builds
+# the same artifacts from the chosen branch as a dry run (they stay on the
+# workflow run) to prove signing and notarization before a tag, or, with
+# dry_run off and an existing tag, republishes that tag's release.
 on:
   push:
     tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: An existing tag to build (vX.Y.Z); empty builds the branch at its own version
+        required: false
+        default: ''
+      dry_run:
+        description: Keep the artifacts on the run instead of publishing a GitHub release
+        type: boolean
+        default: true
+
+# One run per tag: deleting and re-pushing a tag never races the first run.
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -17,31 +36,46 @@ jobs:
   verify-version:
     name: verify version
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Tag matches Cargo.toml, package.json, and tauri.conf.json
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - name: Every version in the checkout matches the tag
+        id: version
         run: |
-          tag="${GITHUB_REF_NAME#v}"
           cargo=$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version = "\(.*\)"$/\1/p;}' Cargo.toml)
-          pkg=$(jq -r .version desktop/package.json)
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          case "$tag" in v[0-9]*) ;; *) tag="v$cargo" ;; esac   # a dry run of a branch: its own version
+          version="${tag#v}"
+          desktop=$(jq -r .version desktop/package.json)
+          ui=$(jq -r .version ui/package.json)
+          web=$(jq -r .version web/package.json)
           tauri=$(jq -r .version desktop/src-tauri/tauri.conf.json)
-          echo "tag=$tag Cargo.toml=$cargo package.json=$pkg tauri.conf.json=$tauri"
-          if [ "$tag" != "$cargo" ] || [ "$tag" != "$pkg" ] || [ "$tag" != "$tauri" ]; then
-            echo "::error::version mismatch: tag v$tag, Cargo.toml $cargo, package.json $pkg, tauri.conf.json $tauri"
-            exit 1
-          fi
+          ios=$(sed -n 's/^ *MARKETING_VERSION: "\(.*\)"/\1/p' ios/project.yml)
+          echo "tag=$tag Cargo.toml=$cargo desktop=$desktop ui=$ui web=$web tauri.conf.json=$tauri ios/project.yml=$ios"
+          for found in "$cargo" "$desktop" "$ui" "$web" "$tauri" "$ios"; do
+            if [ "$found" != "$version" ]; then
+              echo "::error::version mismatch: tag $tag but Cargo.toml=$cargo desktop=$desktop ui=$ui web=$web tauri.conf.json=$tauri ios/project.yml=$ios"
+              exit 1
+            fi
+          done
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
   # The CLI as one universal Mach-O (Apple Silicon + Intel), Developer ID
-  # signed with the hardened runtime so Gatekeeper is content wherever the
-  # binary ends up (a tarball itself is never notarized).
+  # signed with the hardened runtime and notarized (the ticket is looked up
+  # online; a bare binary cannot carry a staple, a tarball cannot either).
   cli-macos-universal:
     name: CLI (universal-apple-darwin)
     needs: verify-version
-    runs-on: macos-latest
-    permissions:
-      contents: write
+    runs-on: macos-15
+    env:
+      RELEASE_TAG: ${{ needs.verify-version.outputs.tag }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
       - name: Install the pinned Rust toolchain plus both macOS targets
         run: |
           rustup toolchain install
@@ -55,40 +89,60 @@ jobs:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
         run: scripts/ci-import-signing-cert.sh
-      - name: Lipo, sign, smoke test, package
+      - name: Write the App Store Connect API key for notarization
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          [ -n "$APPLE_API_KEY_P8" ] || { echo "::error::APPLE_API_KEY_P8 is unset"; exit 1; }
+          printf '%s' "$APPLE_API_KEY_P8" > "$RUNNER_TEMP/AuthKey.p8"
+      - name: Lipo, sign, notarize, smoke test, package
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
         run: |
+          [ -n "$APPLE_SIGNING_IDENTITY" ] || { echo "::error::APPLE_SIGNING_IDENTITY is unset; the build would be ad-hoc signed"; exit 1; }
           mkdir -p dist
           lipo -create -output dist/obsink \
             target/aarch64-apple-darwin/release/obsink \
             target/x86_64-apple-darwin/release/obsink
-          lipo -info dist/obsink | grep -q "x86_64 arm64"
+          archs=$(lipo -archs dist/obsink | tr ' ' '\n' | sort | tr '\n' ' ')
+          [ "$archs" = "arm64 x86_64 " ] || { echo "::error::expected a universal binary, got: $archs"; exit 1; }
           codesign --force --sign "$APPLE_SIGNING_IDENTITY" --options runtime --timestamp dist/obsink
-          codesign --verify --verbose=2 dist/obsink
-          [ "$(dist/obsink --version)" = "obsink ${GITHUB_REF_NAME#v}" ]
-          name="obsink-${GITHUB_REF_NAME}-universal-apple-darwin"
+          codesign --verify --strict --verbose=2 dist/obsink
+          [ "$(dist/obsink --version)" = "obsink ${RELEASE_TAG#v}" ]
+          ditto -c -k dist/obsink "$RUNNER_TEMP/obsink-notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/obsink-notarize.zip" \
+            --key "$RUNNER_TEMP/AuthKey.p8" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" --wait
+          name="obsink-${RELEASE_TAG}-universal-apple-darwin"
           tar -C dist -czf "dist/${name}.tar.gz" obsink
+          rm dist/obsink
           (cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256" && cat "${name}.tar.gz.sha256")
-      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          generate_release_notes: true
-          fail_on_unmatched_files: true
-          files: |
-            dist/obsink-${{ github.ref_name }}-universal-apple-darwin.tar.gz
-            dist/obsink-${{ github.ref_name }}-universal-apple-darwin.tar.gz.sha256
+          name: cli
+          path: dist/
+          if-no-files-found: error
+      - name: Remove the signing keychain and the API key
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/AuthKey.p8" "$RUNNER_TEMP/obsink-notarize.zip"
 
-  # The desktop app as a universal DMG, signed and notarized by Tauri's
-  # bundler (it reads APPLE_CERTIFICATE*, APPLE_SIGNING_IDENTITY and the
-  # App Store Connect API key from the environment and staples the ticket).
+  # The desktop app as a universal DMG. Tauri's bundler signs and notarizes
+  # the app (it reads APPLE_CERTIFICATE*, APPLE_SIGNING_IDENTITY and the App
+  # Store Connect API key from the environment); the disk image itself is
+  # then notarized and stapled too, so Finder trusts the download as a whole.
   desktop-macos-universal:
     name: Desktop (universal DMG)
     needs: verify-version
-    runs-on: macos-latest
-    permissions:
-      contents: write
+    runs-on: macos-15
+    env:
+      RELEASE_TAG: ${{ needs.verify-version.outputs.tag }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
       - name: Install the pinned Rust toolchain plus both macOS targets
         run: |
           rustup toolchain install
@@ -103,7 +157,10 @@ jobs:
       - name: Write the App Store Connect API key for notarization
         env:
           APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: |
+          [ -n "$APPLE_API_KEY_P8" ] || { echo "::error::APPLE_API_KEY_P8 is unset"; exit 1; }
+          [ -n "$APPLE_SIGNING_IDENTITY" ] || { echo "::error::APPLE_SIGNING_IDENTITY is unset; Tauri would ad-hoc sign"; exit 1; }
           printf '%s' "$APPLE_API_KEY_P8" > "$RUNNER_TEMP/AuthKey.p8"
           echo "APPLE_API_KEY_PATH=$RUNNER_TEMP/AuthKey.p8" >> "$GITHUB_ENV"
       - name: Build, sign and notarize the universal app and DMG
@@ -114,19 +171,59 @@ jobs:
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
         run: npm run tauri -w desktop -- build --target universal-apple-darwin
-      - name: Verify the signature, rename, checksum
+      - name: Verify the app, notarize and staple the disk image, checksum
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
         run: |
-          app=$(ls -d target/universal-apple-darwin/release/bundle/macos/*.app | head -1)
-          codesign --verify --deep --strict --verbose=2 "$app"
+          set -- target/universal-apple-darwin/release/bundle/macos/*.app
+          app=$1
+          codesign --verify --strict --verbose=2 "$app"
           spctl --assess --type execute --verbose=2 "$app"
-          dmg=$(ls target/universal-apple-darwin/release/bundle/dmg/*.dmg | head -1)
+          xcrun stapler validate "$app"
+          set -- target/universal-apple-darwin/release/bundle/dmg/*.dmg
+          dmg=$1
           mkdir -p dist
-          cp "$dmg" "dist/ObSink-${GITHUB_REF_NAME}-universal.dmg"
-          (cd dist && shasum -a 256 "ObSink-${GITHUB_REF_NAME}-universal.dmg" > "ObSink-${GITHUB_REF_NAME}-universal.dmg.sha256" && cat "ObSink-${GITHUB_REF_NAME}-universal.dmg.sha256")
+          out="dist/ObSink-${RELEASE_TAG}-universal.dmg"
+          cp "$dmg" "$out"
+          xcrun notarytool submit "$out" \
+            --key "$RUNNER_TEMP/AuthKey.p8" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" --wait
+          xcrun stapler staple "$out"
+          xcrun stapler validate "$out"
+          spctl -a -t open --context context:primary-signature -vv "$out"
+          (cd dist && shasum -a 256 "$(basename "$out")" > "$(basename "$out").sha256" && cat "$(basename "$out").sha256")
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: desktop
+          path: dist/
+          if-no-files-found: error
+      - name: Remove the API key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/AuthKey.p8"
+
+  # One release from both artifacts, created once: two uploads racing for the
+  # same release regenerate the notes against each other.
+  publish:
+    name: publish
+    needs: [verify-version, cli-macos-universal, desktop-macos-universal]
+    if: github.event_name == 'push' || github.event.inputs.dry_run == 'false'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Assets on the run
+        run: ls -l dist && (cd dist && shasum -a 256 -c ./*.sha256)
       - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
+          tag_name: ${{ needs.verify-version.outputs.tag }}
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
-            dist/ObSink-${{ github.ref_name }}-universal.dmg
-            dist/ObSink-${{ github.ref_name }}-universal.dmg.sha256
+            dist/obsink-${{ needs.verify-version.outputs.tag }}-universal-apple-darwin.tar.gz
+            dist/obsink-${{ needs.verify-version.outputs.tag }}-universal-apple-darwin.tar.gz.sha256
+            dist/ObSink-${{ needs.verify-version.outputs.tag }}-universal.dmg
+            dist/ObSink-${{ needs.verify-version.outputs.tag }}-universal.dmg.sha256

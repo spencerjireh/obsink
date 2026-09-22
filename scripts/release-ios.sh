@@ -20,6 +20,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 IOS_DIR="$REPO_ROOT/ios"
 
+[ -f "$REPO_ROOT/.env" ] || { echo "no .env at the repo root; copy .env.example and fill in the ASC_* values"; exit 1; }
 set -a; . "$REPO_ROOT/.env"; set +a
 : "${DEVELOPMENT_TEAM:?set DEVELOPMENT_TEAM in .env}"
 : "${ASC_KEY_ID:?set ASC_KEY_ID in .env}"
@@ -40,6 +41,7 @@ else
 fi
 
 VERSION="$(sed -n 's/^ *MARKETING_VERSION: "\(.*\)"/\1/p' "$IOS_DIR/project.yml")"
+: "${VERSION:?could not read MARKETING_VERSION from ios/project.yml}"
 BUILD="$(git -C "$REPO_ROOT" rev-list --count HEAD)"
 UPLOAD=1
 while [ $# -gt 0 ]; do
@@ -63,8 +65,10 @@ mkdir -p "$IOS_DIR/build"
 ARCHIVE_LOG="$IOS_DIR/build/archive-$VERSION-$BUILD.log"
 EXPORT_LOG="$IOS_DIR/build/export-$VERSION-$BUILD.log"
 
-if [ ! -d "$IOS_DIR/Frameworks/ObSinkMobile.xcframework" ]; then
-    echo "==> No xcframework yet; running scripts/build-ios.sh"
+# A simulator-only build (CI, local testing) leaves an xcframework without the
+# device slice; the archive needs `ios-arm64`.
+if [ ! -d "$IOS_DIR/Frameworks/ObSinkMobile.xcframework/ios-arm64" ]; then
+    echo "==> No device xcframework yet; running scripts/build-ios.sh"
     "$SCRIPT_DIR/build-ios.sh"
 fi
 
@@ -82,7 +86,9 @@ grep -E "error|warning: .*(entitle|sign)|ARCHIVE" "$ARCHIVE_LOG" || true
 [ -d "$ARCHIVE" ] || { echo "archive failed"; exit 1; }
 
 # Inject the team ID; the checked-in ExportOptions.plist stays team-agnostic.
-OPTS="$(mktemp -t obsink-export).plist"
+OPTS_DIR="$(mktemp -d)"
+OPTS="$OPTS_DIR/ExportOptions.plist"
+trap 'rm -rf "$OPTS_DIR"' EXIT
 cp "$IOS_DIR/ExportOptions.plist" "$OPTS"
 plutil -replace teamID -string "$DEVELOPMENT_TEAM" "$OPTS"
 if [ "$UPLOAD" = 0 ]; then
@@ -96,13 +102,11 @@ if ! xcodebuild -exportArchive \
     -exportOptionsPlist "$OPTS" \
     -exportPath "$EXPORT_DIR" \
     "${AUTH[@]}" > "$EXPORT_LOG" 2>&1; then
-    rm -f "$OPTS"
     grep -E "error" "$EXPORT_LOG"
     echo "export/upload failed (full log: $EXPORT_LOG)"
     exit 1
 fi
 grep -E "error|EXPORT|Upload|upload" "$EXPORT_LOG" || true
-rm -f "$OPTS"
 
 if [ "$UPLOAD" = 1 ]; then
     echo "Uploaded ObSink $VERSION ($BUILD). App Store Connect processes it in ~5-15 min;"
