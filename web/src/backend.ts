@@ -122,6 +122,15 @@ export class WebBackend implements Backend {
   listActivity = (vaultId: string | null, limit: number) =>
     this.call<never>('listActivity', vaultId, limit)
   setVisibility = (hidden: boolean) => this.call<void>('setVisibility', hidden)
+  listFiles = (vaultId: string) => this.call<string[]>('listFiles', vaultId)
+  listVersions = (vaultId: string, path: string) => this.call<never>('listVersions', vaultId, path)
+  previewVersion = (vaultId: string, path: string, name: string) =>
+    this.call<never>('previewVersion', vaultId, path, name)
+  restoreVersion = (vaultId: string, path: string, name: string) =>
+    this.call<void>('restoreVersion', vaultId, path, name)
+  listTrash = (vaultId: string) => this.call<never>('listTrash', vaultId)
+  previewTrash = (vaultId: string, path: string) => this.call<never>('previewTrash', vaultId, path)
+  restoreTrash = (vaultId: string, path: string) => this.call<void>('restoreTrash', vaultId, path)
 
   // A directory picker is a user gesture on the page; the handle goes to
   // IndexedDB under a fresh id that `addVault` receives as `local_path`.

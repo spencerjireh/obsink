@@ -4,6 +4,7 @@ import type {
   ActivityEvent,
   AuthCapabilities,
   ConflictPreview,
+  FilePreview,
   InviteInfo,
   LocalVault,
   ProgressEnvelope,
@@ -12,7 +13,9 @@ import type {
   SetPassphraseOutcome,
   SettingsTarget,
   SyncResponse,
+  TrashEntry,
   VaultStateInfo,
+  VersionInfo,
 } from './types'
 
 // The one seam between the screens and a platform. The desktop app answers
@@ -113,6 +116,16 @@ export interface Backend {
   resolveConflict(vaultId: string, resolutions: Resolution[]): Promise<SyncResponse>
   getConflictPreview(vaultId: string, path: string): Promise<ConflictPreview>
   listActivity(vaultId: string | null, limit: number): Promise<ActivityEvent[]>
+  // Spec §8.2 and §9.3, the history section of a vault this device holds.
+  // Every path is vault-relative with `/` separators. A restore writes the
+  // file into the folder and returns; the next sync uploads it.
+  listFiles(vaultId: string): Promise<string[]>
+  listVersions(vaultId: string, path: string): Promise<VersionInfo[]>
+  previewVersion(vaultId: string, path: string, name: string): Promise<FilePreview>
+  restoreVersion(vaultId: string, path: string, name: string): Promise<void>
+  listTrash(vaultId: string): Promise<TrashEntry[]>
+  previewTrash(vaultId: string, path: string): Promise<FilePreview>
+  restoreTrash(vaultId: string, path: string): Promise<void>
   openVaultFolder(vaultId: string): Promise<void>
   openSettings(target?: Partial<SettingsTarget>): Promise<void>
   // Subscribe; the returned function unsubscribes.
