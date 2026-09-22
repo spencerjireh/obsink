@@ -19,6 +19,10 @@ export const tauriBackend: Backend = {
     keyStoreNoun: 'the keychain',
     canOpenFolder: true,
     folderPlaceholder: '/Users/you/Documents/Notes',
+    folderPrompt: {
+      create: 'Where the vault lives on this Mac',
+      connect: 'Where to put the vault on this Mac',
+    },
   },
   getServerUrl: () => call('get_server_url'),
   getAuthCapabilities: () => call('get_auth_capabilities'),

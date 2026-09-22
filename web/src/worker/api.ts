@@ -8,6 +8,10 @@ import { fromStatus, network } from './errors'
 const SMALL_TIMEOUT_MS = 30_000
 const BATCH_TIMEOUT_MS = 10 * 60_000
 const ATTEMPTS = 3
+// Only these are repeated after a request that got no answer: a POST the
+// server may already have applied (a batch, a new vault, a sign-in) is
+// reported instead of replayed.
+const IDEMPOTENT = new Set(['GET', 'HEAD', 'DELETE'])
 
 export type WireFileEntry = {
   hash: string
@@ -121,6 +125,7 @@ export class Api {
         const transient = error instanceof TypeError || (error as Error)?.name === 'AbortError'
         if (!transient) throw error
         lastError = error
+        if (!IDEMPOTENT.has(method)) break
         if (attempt + 1 < ATTEMPTS) await sleep(100 * 2 ** attempt)
       }
     }

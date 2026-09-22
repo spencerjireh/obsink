@@ -1,5 +1,8 @@
 import type { AccountState, AuthCapabilities, InviteInfo } from '@obsink/ui'
 import type { WireInvite } from './api'
+import { all, type StoredVault } from '../shared/db'
+import { stopDriver } from './driver'
+import { forgetKeys } from './keys'
 import {
   api,
   bearerCall,
@@ -109,6 +112,12 @@ export async function signOut(): Promise<void> {
     }
   }
   await forgetBearer()
+  // Nothing keeps polling, and no key stays in memory, for an account that
+  // is signed out; the vault entries stay so signing in again resumes.
+  for (const vault of await all<StoredVault>('vaults')) {
+    stopDriver(vault.id)
+    forgetKeys(vault.id)
+  }
 }
 
 export async function deleteAccount(): Promise<void> {

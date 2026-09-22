@@ -1,6 +1,6 @@
 import { bearerKey, del, get, put } from '../shared/db'
 import { Api } from './api'
-import { other } from './errors'
+import { fromStatus } from './errors'
 
 // The one server this page talks to: its own origin (the web container
 // proxies the API paths). Stored on vault entries like desktop stores the
@@ -15,7 +15,8 @@ export async function loadBearer(): Promise<string | null> {
 
 export async function requireBearer(): Promise<string> {
   const bearer = await loadBearer()
-  if (!bearer) throw other(`not signed in to ${serverUrl} — sign in first`)
+  // No bearer reads as an expired session, as desktop's 401 does.
+  if (!bearer) throw fromStatus(401, 'not signed in')
   return bearer
 }
 

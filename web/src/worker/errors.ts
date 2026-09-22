@@ -13,9 +13,14 @@ export function network(message: string): CommandError {
 
 export function fromStatus(status: number, message: string): CommandError {
   if (status === 401) {
-    return { kind: 'unauthorized', message: 'unauthorized: sign in again', status }
+    return { kind: 'unauthorized', message: 'Session expired. Sign in again.', status }
   }
   return { kind: 'server', message, status }
+}
+
+// The one message for a passphrase that does not decrypt (DESIGN.md §5).
+export function wrongPassphrase(): CommandError {
+  return other('Passphrase does not match this vault.')
 }
 
 export function isCommandError(error: unknown): error is CommandError {

@@ -48,6 +48,16 @@ type Driver = {
 
 const drivers = new Map<string, Driver>()
 
+// The page reports a hidden tab or an offline browser; polling pauses (no
+// wasted cycles, no error rows while offline) and resumes with a poll.
+let paused = false
+
+export function setPaused(value: boolean): void {
+  if (paused === value) return
+  paused = value
+  if (!paused) for (const driver of drivers.values()) schedule(driver, 0)
+}
+
 function driverFor(vaultId: string): Driver {
   let driver = drivers.get(vaultId)
   if (!driver) {
@@ -200,7 +210,7 @@ export function resolveConflict(vaultId: string, resolutions: Resolution[]): Pro
 // The polling loop: a cycle when the server or the folder changed, with
 // every conflict deferred so the rest keeps syncing.
 async function poll(driver: Driver): Promise<void> {
-  if (driver.running || Date.now() < driver.suppressedUntil || driver.pending) return
+  if (paused || driver.running || Date.now() < driver.suppressedUntil || driver.pending) return
   if (!keysFor(driver.vaultId)) return
   await serialized(driver, async () => {
     try {
@@ -235,10 +245,10 @@ async function poll(driver: Driver): Promise<void> {
   })
 }
 
-function schedule(driver: Driver): void {
+function schedule(driver: Driver, delay?: number): void {
   if (driver.timer) clearTimeout(driver.timer)
   const since = Date.now() - driver.lastActivity
-  const interval = since < ACTIVE_WINDOW_MS ? POLL_ACTIVE_MS : POLL_IDLE_MS
+  const interval = delay ?? (since < ACTIVE_WINDOW_MS ? POLL_ACTIVE_MS : POLL_IDLE_MS)
   driver.timer = setTimeout(async () => {
     driver.timer = null
     if (!drivers.has(driver.vaultId)) return

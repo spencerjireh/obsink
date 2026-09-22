@@ -1,5 +1,5 @@
 import type { Backend, BackendEvent, BackendEvents, CommandError, SettingsTarget } from '@obsink/ui'
-import { get, put, type StoredVault } from './shared/db'
+import { del, get, put, type StoredVault } from './shared/db'
 import { isResponse, type WorkerMessage, type WorkerRequest } from './shared/protocol'
 
 // The browser Backend. Everything that touches the server, the folder or the
@@ -13,6 +13,10 @@ export class WebBackend implements Backend {
     keyStoreNoun: 'this browser',
     canOpenFolder: false,
     folderPlaceholder: '',
+    folderPrompt: {
+      create: 'Which folder on this computer holds the vault',
+      connect: 'Which folder on this computer to put the vault in',
+    },
   }
 
   private worker: Worker
@@ -22,6 +26,11 @@ export class WebBackend implements Backend {
     { resolve: (value: unknown) => void; reject: (error: CommandError) => void }
   >()
   private handlers = new Map<BackendEvent, Set<(payload: unknown) => void>>()
+  // Set once the worker is gone: every later call fails at once instead of
+  // waiting for an answer that never comes.
+  private dead: CommandError | null = null
+  // A folder picked in the add flow but not yet a vault.
+  private pickedHandleId: string | null = null
 
   constructor() {
     this.worker = new Worker(new URL('./worker/index.ts', import.meta.url), { type: 'module' })
@@ -37,14 +46,19 @@ export class WebBackend implements Backend {
       }
       this.emit(data.event, data.payload)
     }
-    this.worker.onerror = (event) => {
-      const error: CommandError = { kind: 'other', message: event.message || 'worker failed' }
-      for (const waiter of this.pending.values()) waiter.reject(error)
-      this.pending.clear()
-    }
+    this.worker.onerror = (event) => this.die(event.message || 'The browser client stopped.')
+    this.worker.onmessageerror = () => this.die('The browser client sent an unreadable message.')
+  }
+
+  private die(reason: string) {
+    this.dead = { kind: 'other', message: `${reason} Reload the page.` }
+    for (const waiter of this.pending.values()) waiter.reject(this.dead)
+    this.pending.clear()
+    this.emit('client://error', { message: this.dead.message })
   }
 
   private call<T>(method: string, ...args: unknown[]): Promise<T> {
+    if (this.dead) return Promise.reject(this.dead)
     const id = this.nextId++
     const request: WorkerRequest = { id, method, args }
     return new Promise<T>((resolve, reject) => {
@@ -79,7 +93,12 @@ export class WebBackend implements Backend {
   signOut = () => this.call<void>('signOut')
   deleteAccount = () => this.call<void>('deleteAccount')
   listRemoteVaults = () => this.call<never>('listRemoteVaults')
-  addVault = (request: Parameters<Backend['addVault']>[0]) => this.call<never>('addVault', request)
+  addVault = async (request: Parameters<Backend['addVault']>[0]) => {
+    const vault = await this.call<never>('addVault', request)
+    // The picked folder is a vault's now; nothing to discard.
+    if (request.local_path === this.pickedHandleId) this.pickedHandleId = null
+    return vault
+  }
   removeVault = (vaultId: string) => this.call<void>('removeVault', vaultId)
   deleteRemoteVault = (vaultId: string) => this.call<void>('deleteRemoteVault', vaultId)
   getVaultStates = () => this.call<never>('getVaultStates')
@@ -92,14 +111,28 @@ export class WebBackend implements Backend {
     this.call<never>('listActivity', vaultId, limit)
   unlockVault = (vaultId: string, passphrase: string) =>
     this.call<void>('unlockVault', vaultId, passphrase)
+  setVisibility = (hidden: boolean) => this.call<void>('setVisibility', hidden)
 
   // A directory picker is a user gesture on the page; the handle goes to
   // IndexedDB under a fresh id that `addVault` receives as `local_path`.
   async pickFolder() {
     const handle = await window.showDirectoryPicker({ mode: 'readwrite' })
+    // Picking again replaces the earlier pick rather than leaking it.
+    await this.discardPickedFolder()
     const id = crypto.randomUUID()
     await put('handles', id, handle)
+    this.pickedHandleId = id
+    // Persistent storage keeps the handles and the sync bookkeeping from
+    // being evicted under storage pressure; the browser may ask the user.
+    void navigator.storage?.persist?.().catch(() => undefined)
     return { id, name: handle.name }
+  }
+
+  async discardPickedFolder() {
+    const id = this.pickedHandleId
+    if (!id) return
+    this.pickedHandleId = null
+    await del('handles', id)
   }
 
   // Chrome forgets the grant per session: ask again from a click.

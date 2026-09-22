@@ -1,8 +1,8 @@
 import type { WorkerRequest, WorkerResponse } from '../shared/protocol'
 import * as account from './account'
 import { listActivity } from './activity'
-import { stateChanged } from './bus'
-import { getConflictPreview, resolveConflict, syncVault } from './driver'
+import { emit, stateChanged } from './bus'
+import { getConflictPreview, resolveConflict, setPaused, syncVault } from './driver'
 import { asCommandError } from './errors'
 import { serverUrl } from './session'
 import * as vaults from './vaults'
@@ -32,6 +32,7 @@ const handlers: Record<string, (...args: any[]) => Promise<unknown> | unknown> =
   resolveConflict,
   getConflictPreview,
   listActivity,
+  setVisibility: (hidden: boolean) => setPaused(hidden),
 }
 
 // Methods that change what the screens show; the worker announces it the
@@ -62,3 +63,12 @@ self.onmessage = async (message: MessageEvent<WorkerRequest>) => {
     stateChanged(vaultId)
   }
 }
+
+// A throw outside a request handler (a timer, a poll) has no request to
+// answer; the page shows it instead of nothing.
+self.addEventListener('error', (event) => {
+  emit('client://error', { message: event.message || 'The browser client hit an error.' })
+})
+self.addEventListener('unhandledrejection', (event) => {
+  emit('client://error', { message: asCommandError(event.reason).message })
+})

@@ -3,7 +3,12 @@
 //! budget is exercised, not just the native one.
 #![cfg(target_arch = "wasm32")]
 
-use obsink_core_wasm::{diff_manifests_json as diff_manifests, Ignore, VaultKeys};
+use obsink_core_wasm::{
+    backoff_wait_ms, checkpoint_manifest_json, chunk_uploads_json, conflict_copy_path_js,
+    conflict_to_upload_json, default_ignore, diff_manifests_json as diff_manifests,
+    effective_choice_json, normalize_server_url_js, poll_interval_ms, protocol_version, Ignore,
+    VaultKeys,
+};
 use wasm_bindgen_test::wasm_bindgen_test;
 
 #[wasm_bindgen_test]
@@ -29,4 +34,58 @@ fn diffs_and_ignores() {
     // Error paths surface as `JsError`s (only constructible on wasm).
     assert!(VaultKeys::from_master(&[0u8; 31]).is_err());
     assert!(Ignore::new("not json").is_err());
+}
+
+// Every remaining export crosses the boundary with a well-formed value; the
+// rules themselves are tested natively in core.
+#[wasm_bindgen_test]
+fn the_rest_of_the_surface_crosses_the_boundary() {
+    assert!(protocol_version() >= 2);
+
+    let keys = VaultKeys::from_master(&[7u8; 32]).unwrap();
+    assert_eq!(keys.content_hmac(b"x").len(), 64);
+    assert!(!keys.hash_cache_key_id().is_empty());
+
+    let defaults: Vec<String> = serde_json::from_str(&default_ignore()).unwrap();
+    assert!(defaults.iter().any(|pattern| pattern.contains(".obsink")));
+
+    let base = r#"{"a.md":{"hash":"h0","modified":1,"size":1,"deleted":false,"encPath":""}}"#;
+    let local = r#"{"a.md":{"hash":"h1","modified":2,"size":1,"deleted":false,"encPath":""}}"#;
+    let remote = r#"{"a.md":{"hash":"h2","modified":3,"size":1,"deleted":false,"encPath":""}}"#;
+    let diff: serde_json::Value =
+        serde_json::from_str(&diff_manifests(base, local, remote).unwrap()).unwrap();
+    let conflict = serde_json::to_string(&diff["conflicts"][0]).unwrap();
+    assert!(conflict.contains(r#""path":"a.md""#));
+    let choice = effective_choice_json(r#""KeepBoth""#, &conflict).unwrap();
+    assert!(
+        choice.starts_with('"'),
+        "a JSON string choice, got {choice}"
+    );
+    let upload = conflict_to_upload_json(&conflict).unwrap();
+    assert!(upload.contains(r#""kind":"Upload""#), "{upload}");
+
+    let held = checkpoint_manifest_json(base, remote, r#"["a.md"]"#).unwrap();
+    assert!(
+        held.contains(r#""hash":"h0""#),
+        "held-back path keeps its base entry: {held}"
+    );
+
+    assert_eq!(chunk_uploads_json("[1,2,3]").unwrap(), "[[0,3]]");
+    assert_eq!(
+        conflict_copy_path_js("notes/today.md"),
+        "notes/today.conflict.md"
+    );
+
+    assert_eq!(backoff_wait_ms(5000.0, 300_000.0, 0), 5000.0);
+    assert_eq!(backoff_wait_ms(5000.0, 300_000.0, 20), 300_000.0);
+    assert_eq!(poll_interval_ms(5000.0, 60_000.0, 60_000.0, 0.0), 5000.0);
+    assert_eq!(
+        poll_interval_ms(5000.0, 60_000.0, 60_000.0, 120_000.0),
+        60_000.0
+    );
+
+    assert_eq!(
+        normalize_server_url_js("HTTPS://Example.com/"),
+        "https://example.com"
+    );
 }

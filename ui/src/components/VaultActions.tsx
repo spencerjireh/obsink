@@ -15,8 +15,15 @@ type Props = {
 // Mounted with `key={vault.id}` so an open confirmation never outlives the
 // vault it was asked about.
 export function VaultActions({ vault, busy, removeOnly = false, onRemove, onDeleteRemote }: Props) {
-  const { keyStoreNoun } = useBackend().platform
+  const { kind, keyStoreNoun } = useBackend().platform
   const [confirming, setConfirming] = useState<'remove' | 'delete' | null>(null)
+  // The browser never keeps a key; the desktop app has one in the keychain.
+  const removeConsequence =
+    kind === 'web'
+      ? 'The vault stays on the server. This browser forgets the folder, so connecting again needs the passphrase.'
+      : `The vault stays on the server. The key is removed from ${keyStoreNoun}, so connecting again needs the passphrase.`
+  const deleteConsequence =
+    kind === 'web' ? 'The folder on this computer stays.' : 'The folder on this device stays.'
 
   return (
     <section className="section" aria-labelledby="manage-heading">
@@ -46,7 +53,7 @@ export function VaultActions({ vault, busy, removeOnly = false, onRemove, onDele
       {confirming === 'remove' ? (
         <ConfirmForm
           title="Remove from this device"
-          description={`The vault stays on the server. The key is removed from ${keyStoreNoun}, so connecting again needs the passphrase.`}
+          description={removeConsequence}
           confirmLabel="Remove from this device"
           busy={busy}
           onConfirm={onRemove}
@@ -56,7 +63,7 @@ export function VaultActions({ vault, busy, removeOnly = false, onRemove, onDele
       {confirming === 'delete' ? (
         <ConfirmForm
           title="Delete vault on server"
-          description={`This deletes ${vault.name} and all of its files on ${vault.server_url}. The folder on this device stays.`}
+          description={`This deletes ${vault.name} and all of its files on ${vault.server_url}. ${deleteConsequence}`}
           expected={vault.name}
           confirmLabel="Delete vault on server"
           busy={busy}
