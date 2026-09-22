@@ -318,5 +318,22 @@ remote`, `keep both` in that order.
   `Remove from this device` confirmation button, the tab bar buttons
   `Home` / `Settings`, `Next`, `Got it`, the status prefixes `Synced ·`,
   `Added vault`, `1 conflict`, the empty state `No vault yet. Tap Add
-  vault.`, and the banner text `changed on another device`. Renaming any of them means updating the
+  vault.`, and the banner text `changed on another device`. The web and
+  desktop harnesses (`scripts/verify-web-e2e.mjs`,
+  `scripts/verify-desktop-smoke.mjs`) use the same names as `data-testid` on
+  the shared React components: `emailField`, `inviteField`, `codeField`,
+  `sendCodeButton`, `signInButton`, `settingsTab` (+ `data-tab`), `vaultCard`
+  (+ `data-vault-id`), `addVaultButton`, `addVaultModeButton` (+ `data-mode`),
+  `addVaultNameField`, `vaultPicker`, `addVaultNextButton`, `addVaultPathField`,
+  `addVaultPassphraseField`, `addVaultSubmitButton`, `addVaultDoneButton`,
+  `syncButton`, `vaultStateText`, `lastSyncedText`, `statusText` (every notice,
+  + `data-kind`), `staleBanner`, `conflictRowTitle` (+ `data-path`),
+  `winnerPicker` (+ `data-choice`: `KeepLocal` / `KeepRemote` / `KeepBoth`),
+  `applyResolutionsButton`, `removeVaultButton`, `deleteVaultButton`,
+  `confirmationField`, `confirmDestructiveButton`, `confirmCancelButton`,
+  `deleteAccountButton`, `deviceRow`, `deviceSignOutButton`, `inviteRow`,
+  `activityRow` (+ `data-kind`), and in the desktop popover
+  `popoverOpenSettingsButton`, `popoverGlobalText`, `popoverVaultRow`
+  (+ `data-vault-id`), `popoverSyncButton`, `popoverSettingsButton`,
+  `recentRow` (+ `data-kind`). Renaming any of them means updating the
   tests and the harness in the same change.
