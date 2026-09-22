@@ -217,18 +217,23 @@ P8 pivot are decommissioned; nothing in the repo references them.
 - **Hooks:** `brew install lefthook && lefthook install` once per clone.
 - **Version bump and release:** in one PR (`build: bump version to X.Y.Z (OBS-<n>)`),
   set `[workspace.package].version` in `Cargo.toml`, run
-  `npm version --no-git-tag-version X.Y.Z` in `desktop/`, and set `version` in
-  `desktop/src-tauri/tauri.conf.json`. After the rebase-merge:
-  `git fetch origin && git tag vX.Y.Z origin/main && git push origin vX.Y.Z`.
-  The Release workflow fails if the three versions differ from the tag, then
-  builds and publishes the universal (Apple Silicon + Intel) CLI tarball and the
-  Developer ID signed, notarized universal DMG with generated notes. It needs
-  the `APPLE_CERTIFICATE` (base64 .p12), `APPLE_CERTIFICATE_PASSWORD`,
-  `APPLE_SIGNING_IDENTITY`, `APPLE_API_KEY`, `APPLE_API_ISSUER` and
-  `APPLE_API_KEY_P8` repository secrets; every release build bakes
-  `https://obsink-api.spencerjireh.com`.
-  `ios/project.yml` `MARKETING_VERSION` is separate (TestFlight,
-  `scripts/release-ios.sh`) and not checked.
+  `npm version --no-git-tag-version X.Y.Z` in `desktop/`, `ui/` and `web/`, set
+  `version` in `desktop/src-tauri/tauri.conf.json`, and set `MARKETING_VERSION`
+  in `ios/project.yml` (TestFlight builds read it). After the rebase-merge:
+  `git fetch origin && git tag -a vX.Y.Z -m "ObSink X.Y.Z" origin/main && git push origin vX.Y.Z`.
+  The Release workflow fails if any of those six versions differs from the tag,
+  then builds the universal (Apple Silicon + Intel) CLI tarball and the
+  Developer ID signed universal DMG (the app and the disk image both notarized
+  and stapled, the CLI binary notarized), and one `publish` job creates the
+  GitHub release with generated notes from both artifacts. `workflow_dispatch`
+  runs the same pipeline as a dry run (artifacts on the run, no release) to
+  prove signing and notarization before a tag; `dry_run=false` with an
+  existing tag republishes it. It needs the `APPLE_CERTIFICATE` (base64 .p12),
+  `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_API_KEY`,
+  `APPLE_API_ISSUER` and `APPLE_API_KEY_P8` repository secrets; every release
+  build bakes `https://obsink-api.spencerjireh.com`. iOS ships separately with
+  `scripts/release-ios.sh` (which runs `build-ios.sh` when the device slice is
+  missing) and `scripts/testflight.py`.
 
 ## Current status and project management
 
