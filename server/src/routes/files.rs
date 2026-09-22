@@ -19,6 +19,7 @@ use crate::{
     blobs::{valid_path, valid_vault_id},
     db,
     error::ApiError,
+    routes::vaults::require_member,
     AppState,
 };
 
@@ -34,16 +35,12 @@ async fn lock_vault(
     vault_id: &str,
     user_id: &str,
 ) -> Result<LockedVault, ApiError> {
-    if !valid_vault_id(vault_id) {
-        return Err(ApiError::not_found("vault not found"));
-    }
-    let row =
-        sqlx::query("SELECT max_file_size FROM vaults WHERE id = $1 AND owner = $2 FOR UPDATE")
-            .bind(vault_id)
-            .bind(user_id)
-            .fetch_optional(conn)
-            .await?
-            .ok_or_else(|| ApiError::not_found("vault not found"))?;
+    require_member(conn, vault_id, user_id).await?;
+    let row = sqlx::query("SELECT max_file_size FROM vaults WHERE id = $1 FOR UPDATE")
+        .bind(vault_id)
+        .fetch_optional(conn)
+        .await?
+        .ok_or_else(|| ApiError::not_found("vault not found"))?;
     Ok(LockedVault {
         max_file_size: db::to_u64(row.get("max_file_size")),
     })
@@ -54,18 +51,7 @@ async fn require_vault(
     vault_id: &str,
     user_id: &str,
 ) -> Result<(), ApiError> {
-    if !valid_vault_id(vault_id) {
-        return Err(ApiError::not_found("vault not found"));
-    }
-    let exists: Option<(i32,)> =
-        sqlx::query_as("SELECT 1 FROM vaults WHERE id = $1 AND owner = $2")
-            .bind(vault_id)
-            .bind(user_id)
-            .fetch_optional(conn)
-            .await?;
-    exists
-        .map(|_| ())
-        .ok_or_else(|| ApiError::not_found("vault not found"))
+    require_member(conn, vault_id, user_id).await.map(|_| ())
 }
 
 fn entry_from_row(row: &sqlx::postgres::PgRow) -> FileEntry {
@@ -115,9 +101,10 @@ async fn upsert_entry(
     Ok(())
 }
 
-async fn bump_revision(conn: &mut PgConnection, vault_id: &str) -> Result<(), ApiError> {
-    sqlx::query("UPDATE vaults SET revision = revision + 1 WHERE id = $1")
+async fn bump_revision(conn: &mut PgConnection, vault_id: &str, now: u64) -> Result<(), ApiError> {
+    sqlx::query("UPDATE vaults SET revision = revision + 1, last_write = $2 WHERE id = $1")
         .bind(vault_id)
+        .bind(db::to_i64(now))
         .execute(conn)
         .await?;
     Ok(())
@@ -220,7 +207,7 @@ pub async fn apply_put(
             },
         )
         .await?;
-        bump_revision(&mut tx, params.vault_id).await?;
+        bump_revision(&mut tx, params.vault_id, now).await?;
         tx.commit().await?;
         Ok::<(), ApiError>(())
     }
@@ -280,7 +267,7 @@ pub async fn apply_delete(
     };
     let committed = async {
         upsert_entry(&mut tx, vault_id, path, &tombstone).await?;
-        bump_revision(&mut tx, vault_id).await?;
+        bump_revision(&mut tx, vault_id, now).await?;
         tx.commit().await?;
         Ok::<(), ApiError>(())
     }
@@ -325,12 +312,11 @@ pub async fn get_manifest(
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
         .execute(&mut *tx)
         .await?;
-    let revision: Option<(i64,)> =
-        sqlx::query_as("SELECT revision FROM vaults WHERE id = $1 AND owner = $2")
-            .bind(&vault_id)
-            .bind(&principal.user_id)
-            .fetch_optional(&mut *tx)
-            .await?;
+    require_member(&mut tx, &vault_id, &principal.user_id).await?;
+    let revision: Option<(i64,)> = sqlx::query_as("SELECT revision FROM vaults WHERE id = $1")
+        .bind(&vault_id)
+        .fetch_optional(&mut *tx)
+        .await?;
     let (revision,) = revision.ok_or_else(|| ApiError::not_found("vault not found"))?;
     let etag = format!("\"{revision}\"");
     let etag_value = HeaderValue::from_str(&etag).map_err(ApiError::internal)?;

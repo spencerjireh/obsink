@@ -71,7 +71,7 @@ pub use sync_rules::{
 };
 pub use types::{
     BatchOp, BatchOperationResult, BatchResponse, Conflict, ConflictResolution,
-    ConflictResolutionChoice, CreateVaultRequest, CreateVaultResponse, FileEntry, Manifest,
-    ServerConflict, SyncAction, SyncActionKind, SyncFailure, SyncPlan, SyncResult, VaultConfig,
-    VaultSummary,
+    ConflictResolutionChoice, CreateVaultRequest, CreateVaultResponse, FileEntry,
+    ListVaultsResponse, Manifest, ServerConflict, SyncAction, SyncActionKind, SyncFailure,
+    SyncPlan, SyncResult, VaultConfig, VaultDevice, VaultSummary,
 };

@@ -190,8 +190,9 @@ export class Api {
     return invites
   }
 
-  listVaults(bearer: string): Promise<VaultSummary[]> {
-    return this.json('GET', '/vaults', { bearer })
+  async listVaults(bearer: string): Promise<VaultSummary[]> {
+    const { vaults } = await this.json<{ vaults: VaultSummary[] }>('GET', '/vaults', { bearer })
+    return vaults
   }
 
   async createVault(bearer: string, name: string, maxFileSize: number): Promise<VaultSummary> {

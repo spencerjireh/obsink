@@ -8,7 +8,7 @@ use tracing::{debug, warn};
 use crate::crypto::{decrypt_path, encrypt_path, path_token, CryptoError, CryptoKeys};
 use crate::types::{
     BatchOp, BatchOperationResult, BatchResponse, CreateVaultRequest, CreateVaultResponse,
-    Manifest, ServerConflict, VaultConfig, VaultSummary,
+    ListVaultsResponse, Manifest, ServerConflict, VaultConfig, VaultSummary,
 };
 
 /// Whole-request budget for the small metadata calls (manifest, vault list,
@@ -119,7 +119,8 @@ impl ApiClient {
             .timeout(SMALL_REQUEST_TIMEOUT)
             .bearer_auth(&self.config.api_key);
 
-        parse_json(self.send_with_retry(request).await?).await
+        let response: ListVaultsResponse = parse_json(self.send_with_retry(request).await?).await?;
+        Ok(response.vaults)
     }
 
     pub async fn create_vault(

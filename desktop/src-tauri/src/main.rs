@@ -785,6 +785,8 @@ async fn add_vault_inner(request: AddVaultRequest) -> Result<LocalVaultSummary, 
                 client.create_vault(&CreateVaultRequest {
                     name: request.vault_name.clone(),
                     max_file_size: 50 * 1024 * 1024,
+                    // v2: the wrapped vault key arrives with OBS-140.
+                    wrapped_key: None,
                 }),
             )
             .await?;
