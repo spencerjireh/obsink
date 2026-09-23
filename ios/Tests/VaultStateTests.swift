@@ -19,9 +19,9 @@ final class VaultStateTests: XCTestCase {
         )
         XCTAssertEqual(VaultState.statusLine(state { $0.conflicts = 1; $0.staleDownloads = 3 }), "1 conflict")
         XCTAssertEqual(VaultState.statusLine(state { $0.conflicts = 2 }), "2 conflicts")
-        XCTAssertEqual(VaultState.statusLine(state { $0.hasStoredKey = false; $0.conflicts = 2 }), "Needs passphrase")
-        XCTAssertEqual(VaultState.statusLine(state { $0.isForeign = true; $0.hasStoredKey = false }), "On another server")
-        XCTAssertEqual(VaultState.statusLine(state { $0.phase = .error("boom"); $0.isForeign = true }), "Error: boom")
+        XCTAssertEqual(VaultState.statusLine(state { $0.hasStoredKey = false; $0.conflicts = 2 }), "Locked")
+        XCTAssertEqual(VaultState.statusLine(state { $0.deletedOnServer = true; $0.hasStoredKey = false }), "Deleted on the server")
+        XCTAssertEqual(VaultState.statusLine(state { $0.phase = .error("boom"); $0.deletedOnServer = true }), "Error: boom")
         XCTAssertEqual(VaultState.statusLine(state { $0.phase = .resolving; $0.phase = .syncing }), "Syncing…")
         XCTAssertEqual(VaultState.statusLine(state { $0.phase = .resolving }), "Resolving…")
     }
@@ -56,9 +56,52 @@ final class VaultStateTests: XCTestCase {
         XCTAssertEqual(s.conflicts, 1)
     }
 
-    func testForeignComparesCanonicalForms() {
-        XCTAssertFalse(VaultState.isForeign(entryURL: "https://X.example/", defaultURL: "https://x.example"))
-        XCTAssertTrue(VaultState.isForeign(entryURL: "https://y.example", defaultURL: "https://x.example"))
+    private func summary(_ id: String, _ name: String) -> MobileVaultSummary {
+        MobileVaultSummary(id: id, name: name, created: 1, maxFileSize: 1, revision: 2, lastWrite: 0, bytes: 0,
+                           wrappedKey: nil, devices: [])
+    }
+
+    // Spec §15.1: the vaults here first, then the account's others; the
+    // server's name wins for a vault that is on both sides.
+    func testRowsMergeTheServerListWithTheStoredEntries() {
+        let entries = [VaultEntry(vaultID: "here", name: "Here (stale)"), VaultEntry(vaultID: "gone", name: "Gone")]
+        let server = [summary("elsewhere", "Elsewhere"), summary("here", "Here")]
+        let rows = VaultRow.merge(entries: entries, server: server)
+        XCTAssertEqual(rows.map(\.id), ["here", "gone", "elsewhere"])
+        XCTAssertEqual(rows.map(\.name), ["Here", "Gone", "Elsewhere"])
+        XCTAssertEqual(rows.map(\.onDevice), [true, true, false])
+        XCTAssertNotNil(rows[0].summary)
+        XCTAssertNil(rows[1].summary, "the server no longer lists it")
+    }
+
+    func testRowsWithoutAServerAnswerAreTheStoredEntries() {
+        let rows = VaultRow.merge(entries: [VaultEntry(vaultID: "a", name: "A")], server: nil)
+        XCTAssertEqual(rows.map(\.id), ["a"])
+        XCTAssertTrue(rows[0].onDevice)
+    }
+
+    // A pre-v3 entry carried a server URL; it reads and drops it.
+    func testEntriesFromOlderBuildsDecode() throws {
+        let json = #"[{"serverURL":"https://old.example","vaultID":"vault_a","name":"A"},{"workerURL":"https://w","vaultID":"vault_b","name":"B"}]"#
+        let entries = try JSONDecoder().decode([VaultEntry].self, from: Data(json.utf8))
+        XCTAssertEqual(entries.map(\.vaultID), ["vault_a", "vault_b"])
+        let encoded = String(data: try JSONEncoder().encode(entries), encoding: .utf8)!
+        XCTAssertFalse(encoded.contains("serverURL"))
+    }
+
+    func testPlatformNouns() {
+        XCTAssertEqual(PlatformLabel.text("macos"), "Mac")
+        XCTAssertEqual(PlatformLabel.text("ios"), "iPhone")
+        XCTAssertEqual(PlatformLabel.text("browser"), "Browser")
+        XCTAssertEqual(PlatformLabel.text("cli"), "CLI")
+        XCTAssertEqual(PlatformLabel.text("unknown"), "Device")
+    }
+
+    func testPreviewTellsTextFromBinary() {
+        XCTAssertEqual(SyncModel.previewText(Data("# hi".utf8)), "# hi")
+        XCTAssertNil(SyncModel.previewText(Data([0xff, 0xfe, 0x00])))
+        XCTAssertNil(SyncModel.previewText(Data("a\0b".utf8)))
+        XCTAssertEqual(SyncModel.previewText(Data()), "")
     }
 }
 

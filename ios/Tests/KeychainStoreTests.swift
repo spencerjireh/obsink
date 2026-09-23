@@ -47,4 +47,38 @@ final class KeychainStoreTests: XCTestCase {
         XCTAssertTrue(KeychainStore.resave(account: account), "a missing item is fine")
     }
 
+    // Spec §6.3: the account key is kept with the server's `key_id`, the
+    // user id per server, and one device id per server (minted once).
+    func testAccountKeyUserIDAndDeviceIDRoundTrip() throws {
+        try skipIfKeychainUnavailable()
+        let user = "usr_\(UUID().uuidString)"
+        let key = Data(repeating: 0xCD, count: 32)
+        XCTAssertNil(KeychainStore.loadAccountKey(userID: user))
+        XCTAssertTrue(KeychainStore.saveAccountKey(key, keyID: "key_1", userID: user))
+        let stored = try XCTUnwrap(KeychainStore.loadAccountKey(userID: user))
+        XCTAssertEqual(stored.key, key)
+        XCTAssertEqual(stored.keyID, "key_1")
+        XCTAssertTrue(KeychainStore.deleteAccountKey(userID: user))
+        XCTAssertNil(KeychainStore.loadAccountKey(userID: user))
+
+        let server = "https://keychain-test-\(UUID().uuidString).example/"
+        XCTAssertNil(KeychainStore.loadUserID(serverURL: server))
+        XCTAssertTrue(KeychainStore.saveUserID(user, serverURL: server))
+        XCTAssertEqual(KeychainStore.loadUserID(serverURL: server), user)
+        KeychainStore.delete(account: KeychainStore.userAccount(for: server))
+
+        var mints = 0
+        let first = KeychainStore.loadOrCreateDeviceID(serverURL: server) { mints += 1; return "dev_test_\(mints)" }
+        let second = KeychainStore.loadOrCreateDeviceID(serverURL: server) { mints += 1; return "dev_test_\(mints)" }
+        XCTAssertEqual(first, "dev_test_1")
+        XCTAssertEqual(second, first, "the id is minted once")
+        KeychainStore.delete(account: KeychainStore.deviceAccount(for: server))
+    }
+
+    func testHexDecoding() {
+        XCTAssertEqual(Data(hexString: "00ff10"), Data([0x00, 0xff, 0x10]))
+        XCTAssertNil(Data(hexString: "abc"))
+        XCTAssertNil(Data(hexString: "zz"))
+        XCTAssertEqual(Data(hexString: ""), Data())
+    }
 }

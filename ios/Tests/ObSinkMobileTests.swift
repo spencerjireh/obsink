@@ -2,7 +2,7 @@ import XCTest
 @testable import ObSink
 
 /// Exercises the Rust core through the UniFFI bindings, running inside the iOS
-/// simulator. Proves the FFI bridge, Argon2 key derivation, and (when live env
+/// simulator. Proves the FFI bridge, the v3 key wrapping, and (when live env
 /// is provided) the full encrypted sync over the network all work on iOS.
 final class ObSinkMobileTests: XCTestCase {
     /// Minimal `ProgressListener` that discards events for tests.
@@ -10,20 +10,33 @@ final class ObSinkMobileTests: XCTestCase {
         func onProgress(event: MobileProgressEvent) {}
     }
 
-    func testDeriveKeyIsDeterministic32Bytes() throws {
-        let a = try deriveMasterKey(passphrase: "hunter2", vaultId: "vault_test")
-        let b = try deriveMasterKey(passphrase: "hunter2", vaultId: "vault_test")
-        XCTAssertEqual(a.count, 32)
-        XCTAssertEqual(a, b)
-        XCTAssertNotEqual(a, try deriveMasterKey(passphrase: "other", vaultId: "vault_test"))
+    func testThisBuildSpeaksWireFormatV3() {
+        XCTAssertEqual(mobileProtocolVersion(), 3)
+        XCTAssertTrue(newDeviceId().hasPrefix("dev_"))
+        XCTAssertEqual(newDeviceId().count, 36)
+    }
+
+    // Spec §6.1: a vault key wraps under the account key with the vault id
+    // as the AAD, so another vault's id (or another account) does not open it.
+    func testVaultKeysWrapUnderTheAccountKey() throws {
+        let account = newVaultKey()
+        let vault = newVaultKey()
+        XCTAssertEqual(account.count, 32)
+        XCTAssertNotEqual(account, vault)
+        let wrapped = try wrapVaultKeyFor(accountKey: account, vaultKey: vault, vaultId: "vault_a")
+        XCTAssertEqual(try unwrapVaultKey(accountKey: account, wrapped: wrapped, vaultId: "vault_a"), vault)
+        XCTAssertThrowsError(try unwrapVaultKey(accountKey: account, wrapped: wrapped, vaultId: "vault_b"))
+        XCTAssertThrowsError(try unwrapVaultKey(accountKey: newVaultKey(), wrapped: wrapped, vaultId: "vault_a"))
+        XCTAssertThrowsError(try wrapVaultKeyFor(accountKey: Data([1, 2, 3]), vaultKey: vault, vaultId: "vault_a"))
     }
 
     func testLiveSyncDownloadsSeededFile() throws {
         let env = ProcessInfo.processInfo.environment
         guard let url = env["OBSINK_TEST_SERVER_URL"],
-              let apiKey = env["OBSINK_TEST_API_KEY"],
+              let bearer = env["OBSINK_TEST_BEARER"],
               let vaultID = env["OBSINK_TEST_VAULT_ID"],
-              let passphrase = env["OBSINK_TEST_PASSPHRASE"]
+              let keyHex = env["OBSINK_TEST_VAULT_KEY"],
+              let key = Data(hexString: keyHex)
         else {
             throw XCTSkip("live server env not set")
         }
@@ -32,8 +45,7 @@ final class ObSinkMobileTests: XCTestCase {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
 
-        let config = MobileVaultConfig(serverUrl: url, apiKey: apiKey, vaultId: vaultID, localPath: dir.path)
-        let key = try deriveMasterKey(passphrase: passphrase, vaultId: vaultID)
+        let config = MobileVaultConfig(serverUrl: url, bearer: bearer, vaultId: vaultID, localPath: dir.path, deviceId: nil)
         let client = try VaultClient(config: config, key: key)
 
         let outcome = try client.sync(listener: NoopListener())

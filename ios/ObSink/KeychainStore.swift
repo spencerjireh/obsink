@@ -1,10 +1,12 @@
 import Foundation
 import Security
 
-/// Stores the derived vault encryption key in the iOS Keychain so the user
-/// doesn't re-enter the passphrase every launch (spec §6.3). Keys are scoped per
-/// vault (account = vault ID), service `obsink`. The File Provider extension does
-/// not need the key (it serves already-decrypted cache), so this stays app-side.
+/// The iOS Keychain as the app's secret store (spec §6.3), service `obsink`:
+/// each vault's key under `account = vaultID`, the server bearer under
+/// `bearer:<server url>`, the signed-in user id under `user:<server url>`,
+/// the account key (with the server's `key_id`) under `account:<user id>`,
+/// and this phone's device id under `device:<server url>`. The File Provider
+/// extension serves already-decrypted files and needs none of it.
 enum KeychainStore {
     private static let service = "obsink"
 
@@ -63,6 +65,10 @@ enum KeychainStore {
         return item as? Data
     }
 
+    private static func loadString(account: String) -> String? {
+        load(account: account).flatMap { String(data: $0, encoding: .utf8) }
+    }
+
     // MARK: Server bearer (session token)
 
     /// Keychain account for a server's bearer. Canonicalised so the same
@@ -112,12 +118,12 @@ enum KeychainStore {
     /// host is moved to the canonical entry the first time it is read.
     static func loadBearer(serverURL: String) -> String? {
         let canonical = canonicalServerURL(serverURL)
-        if let token = load(account: "bearer:" + canonical).flatMap({ String(data: $0, encoding: .utf8) }) {
+        if let token = loadString(account: "bearer:" + canonical) {
             return token
         }
         for legacy in legacyServerURLs(of: canonical) {
             let account = "bearer:" + legacy
-            guard let token = load(account: account).flatMap({ String(data: $0, encoding: .utf8) }) else { continue }
+            guard let token = loadString(account: account) else { continue }
             saveBearer(token, serverURL: canonical)
             delete(account: account)
             return token
@@ -130,6 +136,66 @@ enum KeychainStore {
         delete(account: bearerAccount(for: serverURL))
     }
 
+    // MARK: Signed-in user, account key, device id (spec §6.3)
+
+    static func userAccount(for serverURL: String) -> String {
+        "user:" + canonicalServerURL(serverURL)
+    }
+
+    @discardableResult
+    static func saveUserID(_ userID: String, serverURL: String) -> Bool {
+        save(Data(userID.utf8), account: userAccount(for: serverURL))
+    }
+
+    static func loadUserID(serverURL: String) -> String? {
+        loadString(account: userAccount(for: serverURL))
+    }
+
+    static func accountKeyAccount(for userID: String) -> String {
+        "account:" + userID
+    }
+
+    /// The unlocked account key with the server's `key_id`, so a later
+    /// `GET /auth/keys` can tell whether this entry is still the account's.
+    @discardableResult
+    static func saveAccountKey(_ key: Data, keyID: String, userID: String) -> Bool {
+        let value = key.map { String(format: "%02x", $0) }.joined() + ":" + keyID
+        return save(Data(value.utf8), account: accountKeyAccount(for: userID))
+    }
+
+    static func loadAccountKey(userID: String) -> (key: Data, keyID: String)? {
+        guard let value = loadString(account: accountKeyAccount(for: userID)),
+              let colon = value.firstIndex(of: ":") else { return nil }
+        let hex = value[..<colon]
+        let keyID = String(value[value.index(after: colon)...])
+        guard let key = Data(hexString: String(hex)), key.count == 32, !keyID.isEmpty else { return nil }
+        return (key, keyID)
+    }
+
+    @discardableResult
+    static func deleteAccountKey(userID: String) -> Bool {
+        delete(account: accountKeyAccount(for: userID))
+    }
+
+    static func deviceAccount(for serverURL: String) -> String {
+        "device:" + canonicalServerURL(serverURL)
+    }
+
+    /// This phone's device id for a server (spec §4.1): read from the
+    /// Keychain, minted on first use. `OBSINK_UITEST_DEVICE_ID` fixes it for
+    /// the simulator harness.
+    static func loadOrCreateDeviceID(serverURL: String, mint: () -> String) -> String {
+        if let fixed = ProcessInfo.processInfo.environment["OBSINK_UITEST_DEVICE_ID"], !fixed.isEmpty {
+            return fixed
+        }
+        if let stored = loadString(account: deviceAccount(for: serverURL)), !stored.isEmpty {
+            return stored
+        }
+        let id = mint()
+        save(Data(id.utf8), account: deviceAccount(for: serverURL))
+        return id
+    }
+
     @discardableResult
     static func delete(account: String) -> Bool {
         let query: [String: Any] = [
@@ -138,5 +204,22 @@ enum KeychainStore {
             kSecAttrAccount as String: account
         ]
         return SecItemDelete(query as CFDictionary) == errSecSuccess
+    }
+}
+
+extension Data {
+    /// Bytes from an even-length hex string; nil on any other input.
+    init?(hexString: String) {
+        let chars = Array(hexString)
+        guard chars.count % 2 == 0 else { return nil }
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(chars.count / 2)
+        var index = 0
+        while index < chars.count {
+            guard let byte = UInt8(String(chars[index...index + 1]), radix: 16) else { return nil }
+            bytes.append(byte)
+            index += 2
+        }
+        self.init(bytes)
     }
 }
