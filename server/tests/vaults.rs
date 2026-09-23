@@ -41,7 +41,7 @@ async fn creates_vaults_and_lists_them() {
     };
     let response = env
         .owner(Method::POST, "/vaults")
-        .json(&serde_json::json!({ "name": "  Notes  ", "max_file_size": 1024 }))
+        .json(&serde_json::json!({ "name": "  Notes  ", "max_file_size": 1024, "wrapped_key": TestEnv::wrapped_key() }))
         .send()
         .await
         .unwrap();
@@ -64,7 +64,7 @@ async fn creates_vaults_and_lists_them() {
     // The per-vault cap cannot exceed the server-wide maximum.
     let big = env
         .owner(Method::POST, "/vaults")
-        .json(&serde_json::json!({ "name": "big", "max_file_size": u64::MAX }))
+        .json(&serde_json::json!({ "name": "big", "max_file_size": u64::MAX, "wrapped_key": TestEnv::wrapped_key() }))
         .send()
         .await
         .unwrap();
@@ -97,7 +97,7 @@ async fn malformed_json_returns_400() {
 
     let blank = env
         .owner(Method::POST, "/vaults")
-        .json(&serde_json::json!({ "name": "   " }))
+        .json(&serde_json::json!({ "name": "   ", "wrapped_key": TestEnv::wrapped_key() }))
         .send()
         .await
         .unwrap();

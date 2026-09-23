@@ -20,13 +20,32 @@ async fn lists_vaults_with_wrapped_keys_devices_and_revisions() {
     let Some(env) = TestEnv::try_with_owner().await else {
         return;
     };
+    // `try_with_owner` set the owner's passphrase; the material is the
+    // server's, so unlock it the way a client would.
+    let blob = env
+        .auth_client()
+        .get_keys(env.owner_token())
+        .await
+        .unwrap()
+        .expect("owner has a passphrase");
     let owner = env.owner.clone().unwrap();
-    let (account_key, _) = env.set_passphrase(&owner, "correct horse battery").await;
+    let account_key = blob
+        .unlock("correct horse battery staple", &owner.user_id)
+        .unwrap();
     let vault_key = obsink_core::new_key();
 
-    // A wrapped key needs an account key: a vault created before the
-    // passphrase (the v2 path) is allowed but records none.
-    let bare = env.create_vault(env.owner_token(), "bare").await;
+    // Spec §4.3: every vault is created with its key wrapped for the account.
+    let bare = env
+        .owner(Method::POST, "/vaults")
+        .json(&serde_json::json!({ "name": "bare" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bare.status(), 400);
+    assert_eq!(
+        bare.json::<serde_json::Value>().await.unwrap()["error"],
+        "wrapped_key is required"
+    );
     let created = env
         .owner(Method::POST, "/vaults")
         .json(&serde_json::json!({ "name": "notes", "wrapped_key": "AAAA" }))
@@ -42,7 +61,7 @@ async fn lists_vaults_with_wrapped_keys_devices_and_revisions() {
     let wrapped = obsink_core::wrap_vault_key(&account_key, &vault_key, &minted).unwrap();
     let bad_id = env
         .owner(Method::POST, "/vaults")
-        .json(&serde_json::json!({ "id": "../etc", "name": "notes" }))
+        .json(&serde_json::json!({ "id": "../etc", "name": "notes", "wrapped_key": TestEnv::wrapped_key() }))
         .send()
         .await
         .unwrap();
@@ -59,7 +78,7 @@ async fn lists_vaults_with_wrapped_keys_devices_and_revisions() {
     assert_eq!(notes, minted, "the client-minted id is the vault's id");
     let taken = env
         .owner(Method::POST, "/vaults")
-        .json(&serde_json::json!({ "id": minted, "name": "again" }))
+        .json(&serde_json::json!({ "id": minted, "name": "again", "wrapped_key": TestEnv::wrapped_key() }))
         .send()
         .await
         .unwrap();
@@ -78,7 +97,7 @@ async fn lists_vaults_with_wrapped_keys_devices_and_revisions() {
     assert_eq!(put.status(), 200);
     let listed = list(&env, env.owner_token()).await;
     let vaults = listed["vaults"].as_array().unwrap();
-    assert_eq!(vaults.len(), 2);
+    assert_eq!(vaults.len(), 1);
     let entry = vaults.iter().find(|v| v["id"] == notes).unwrap();
     assert_eq!(entry["name"], "notes");
     assert_eq!(entry["revision"], 1);
@@ -89,8 +108,22 @@ async fn lists_vaults_with_wrapped_keys_devices_and_revisions() {
         obsink_core::encode_base64(&wrapped)
     );
     assert!(entry["devices"].as_array().unwrap().is_empty());
-    let bare_entry = vaults.iter().find(|v| v["id"] == bare).unwrap();
-    assert!(bare_entry["wrapped_key"].is_null());
+
+    // Without a passphrase there is nothing to wrap under: a fresh account
+    // cannot create a vault yet.
+    let code = env.mint_invite(env.owner_token()).await;
+    let fresh = env.sign_in("fresh@example.com", "f", Some(&code)).await;
+    let refused = env
+        .with_token(&fresh.token, Method::POST, "/vaults")
+        .json(&serde_json::json!({ "name": "early", "wrapped_key": TestEnv::wrapped_key() }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 400);
+    assert_eq!(
+        refused.json::<serde_json::Value>().await.unwrap()["error"],
+        "set a passphrase first"
+    );
 
     // The core client parses the new shape and recovers the key.
     let core_list = env
@@ -161,7 +194,7 @@ async fn lists_vaults_with_wrapped_keys_devices_and_revisions() {
         .as_array()
         .unwrap()
         .is_empty());
-    assert_eq!(env.table_count("vaults").await, 2);
+    assert_eq!(env.table_count("vaults").await, 1);
     env.finish().await;
 }
 

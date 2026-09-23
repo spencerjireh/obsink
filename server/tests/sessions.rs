@@ -8,7 +8,9 @@ async fn revokes_devices_and_deletes_the_account_with_its_vaults() {
     let Some(env) = TestEnv::try_new().await else {
         return;
     };
-    let phone = env.sign_in("acct@example.com", "phone", None).await;
+    let phone = env
+        .sign_in_unlocked("acct@example.com", "phone", None)
+        .await;
     env.clear_email_cooldown("acct@example.com").await;
     let laptop = env.sign_in("acct@example.com", "laptop", None).await;
     let vault = env.create_vault(&phone.token, "mine").await;
@@ -62,7 +64,7 @@ async fn revokes_devices_and_deletes_the_account_with_its_vaults() {
     assert_eq!(again.status(), 404);
     assert_eq!(env.table_count("devices").await, 1);
 
-    // Another account cannot revoke it either, by device or by session id.
+    // Another account cannot revoke it either.
     let code = env.mint_invite(&phone.token).await;
     let other = env.sign_in("other@example.com", "x", Some(&code)).await;
     assert_eq!(
@@ -71,25 +73,6 @@ async fn revokes_devices_and_deletes_the_account_with_its_vaults() {
             .await
             .unwrap()
             .status(),
-        404
-    );
-    let phone_session = sqlx::query_scalar::<_, String>(
-        "SELECT id FROM sessions WHERE user_id = $1 AND device_id = 'phone'",
-    )
-    .bind(&phone.user_id)
-    .fetch_one(&env.state.pool)
-    .await
-    .unwrap();
-    assert_eq!(
-        env.with_token(
-            &other.token,
-            Method::DELETE,
-            &format!("/auth/sessions/{phone_session}")
-        )
-        .send()
-        .await
-        .unwrap()
-        .status(),
         404
     );
 
@@ -132,7 +115,7 @@ async fn revokes_devices_and_deletes_the_account_with_its_vaults() {
 }
 
 #[tokio::test]
-async fn a_device_has_one_session_and_a_v2_sign_in_gets_a_legacy_device() {
+async fn a_device_has_one_session_and_a_sign_in_without_a_device_is_refused() {
     let Some(env) = TestEnv::try_new().await else {
         return;
     };
@@ -167,8 +150,8 @@ async fn a_device_has_one_session_and_a_v2_sign_in_gets_a_legacy_device() {
         "the other account's sign-in did not touch this one"
     );
 
-    // The v2 spelling (`device_name`, no `device`) still signs in, with a
-    // synthesized device per sign-in. Removed in OBS-143.
+    // A sign-in without the `device` object is a client from before wire
+    // format v3: refused with the update message, nothing written.
     env.clear_email_cooldown("one@example.com").await;
     let start: serde_json::Value = env
         .req(Method::POST, "/auth/email/start")
@@ -179,29 +162,19 @@ async fn a_device_has_one_session_and_a_v2_sign_in_gets_a_legacy_device() {
         .json()
         .await
         .unwrap();
-    let legacy = env
+    let old_client = env
         .req(Method::POST, "/auth/email/verify")
         .json(&serde_json::json!({ "email": "one@example.com", "code": start["code"], "device_name": "old phone" }))
         .send()
         .await
         .unwrap();
-    assert_eq!(legacy.status(), 200);
-    let legacy: serde_json::Value = legacy.json().await.unwrap();
-    let legacy_device = legacy["session"]["device_id"].as_str().unwrap();
-    assert!(legacy_device.starts_with("legacy_"));
-    let me: serde_json::Value = env
-        .with_token(legacy["token"].as_str().unwrap(), Method::GET, "/auth/me")
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let devices = me["devices"].as_array().unwrap();
-    assert_eq!(devices.len(), 2);
-    let old = devices.iter().find(|d| d["id"] == legacy_device).unwrap();
-    assert_eq!(old["name"], "old phone");
-    assert_eq!(old["platform"], "unknown");
+    assert_eq!(old_client.status(), 400);
+    assert_eq!(
+        old_client.json::<serde_json::Value>().await.unwrap()["error"],
+        "update ObSink to continue"
+    );
+    assert_eq!(env.table_count("devices").await, 2);
+    assert_eq!(env.table_count("sessions").await, 2);
 
     // A malformed device object is refused before anything is written.
     env.clear_email_cooldown("one@example.com").await;
@@ -229,7 +202,7 @@ async fn devices_can_be_renamed_and_carry_their_vaults() {
     let Some(env) = TestEnv::try_new().await else {
         return;
     };
-    let mac = env.sign_in("dev@example.com", "mac", None).await;
+    let mac = env.sign_in_unlocked("dev@example.com", "mac", None).await;
     let renamed = env
         .with_token(&mac.token, Method::PATCH, "/auth/devices/mac")
         .json(&serde_json::json!({ "name": "  Spencer's MacBook  " }))

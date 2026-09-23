@@ -19,8 +19,8 @@ use obsink_core::{
     rewrap_account_key, run_daemon, sync_manifest_path, unwrap_vault_key, wrap_vault_key,
     write_atomic, ApiClient, AuthClient, Conflict, ConflictResolution, ConflictResolutionChoice,
     CreateVaultRequest, DaemonEvent, DaemonOptions, Device, DevicePlatform, KeyBytes,
-    ProgressEvent, ProgressSink, SetKeysOutcome, SignInDevice, SyncActionKind, SyncFailure,
-    SyncPhase, SyncPlan, VaultConfig,
+    ProgressEvent, ProgressSink, SetKeysOutcome, SyncActionKind, SyncFailure, SyncPhase, SyncPlan,
+    VaultConfig,
 };
 use rpassword::prompt_password;
 use serde::{Deserialize, Serialize};
@@ -99,6 +99,12 @@ enum Commands {
         /// Needed to create a new account once the server has any user.
         #[arg(long)]
         invite_code: Option<String>,
+    },
+    /// Enter the account passphrase on a machine that holds a session but not
+    /// the account key (`OBSINK_PASSPHRASE` skips the prompt).
+    Unlock {
+        #[arg(long, env = "OBSINK_SERVER_URL")]
+        server_url: Option<String>,
     },
     /// Mint an invite code so someone else can create an account.
     Invite {
@@ -259,6 +265,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             revoke,
         } => run_devices(server_url, rename, revoke).await?,
         Commands::Passphrase { server_url } => run_passphrase(server_url).await?,
+        Commands::Unlock { server_url } => {
+            let url = resolve_server_url(server_url.as_deref())?;
+            let (token, user_id) = signed_in(&url).await?;
+            unlock_account(&AuthClient::new(&url), &token, &user_id).await?;
+        }
         Commands::Invite { server_url, list } => {
             let url = resolve_server_url(server_url.as_deref())?;
             let token = load_bearer(&url)
@@ -360,12 +371,7 @@ async fn run_login(
         platform: DevicePlatform::Cli,
     };
     let session = match auth
-        .email_verify(
-            &email,
-            code.trim(),
-            SignInDevice::Device(&device),
-            invite_code.as_deref(),
-        )
+        .email_verify(&email, code.trim(), &device, invite_code.as_deref())
         .await
     {
         Ok(session) => session,
@@ -476,7 +482,7 @@ fn read_new_passphrase() -> Result<String, Box<dyn std::error::Error>> {
 /// `obsink passphrase`: rewrap the account key under a new passphrase.
 async fn run_passphrase(server_url: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
     let url = resolve_server_url(server_url.as_deref())?;
-    let (token, user_id) = signed_in(&url)?;
+    let (token, user_id) = signed_in(&url).await?;
     let (key, _) = load_account_key(&user_id)
         .map_err(|_| "this machine holds no account key; run `obsink login`")?;
     let current = read_passphrase("Current passphrase: ")?;
@@ -500,18 +506,28 @@ async fn run_passphrase(server_url: Option<String>) -> Result<(), Box<dyn std::e
     Ok(())
 }
 
-/// The bearer and user id of the signed-in account for a server.
-fn signed_in(url: &str) -> Result<(String, String), Box<dyn std::error::Error>> {
+/// The bearer and user id of the signed-in account for a server. A session
+/// seeded without a sign-in (the harnesses' `OBSINK_BEARER`) has no user id
+/// recorded yet; it is asked from the server once and kept.
+async fn signed_in(url: &str) -> Result<(String, String), Box<dyn std::error::Error>> {
     let token =
         load_bearer(url).map_err(|_| format!("not signed in to {url}; run `obsink login`"))?;
-    let user_id = load_secret_opt(&user_account(url))?
-        .ok_or_else(|| format!("no account recorded for {url}; run `obsink login` again"))?;
-    Ok((token, user_id))
+    if let Some(user_id) = load_secret_opt(&user_account(url))? {
+        return Ok((token, user_id));
+    }
+    let me = AuthClient::new(url).me(&token).await?;
+    let user = me
+        .user
+        .ok_or_else(|| format!("no account behind the session for {url}; run `obsink login`"))?;
+    save_secret(&user_account(url), &user.id)?;
+    Ok((token, user.id))
 }
 
 /// The unlocked account key for a server, or a pointer at `obsink login`.
-fn account_key_for(url: &str) -> Result<(String, String, KeyBytes), Box<dyn std::error::Error>> {
-    let (token, user_id) = signed_in(url)?;
+async fn account_key_for(
+    url: &str,
+) -> Result<(String, String, KeyBytes), Box<dyn std::error::Error>> {
+    let (token, user_id) = signed_in(url).await?;
     let (key, _) = load_account_key(&user_id)
         .map_err(|_| "this machine holds no account key; run `obsink login`")?;
     Ok((token, user_id, key))
@@ -600,7 +616,7 @@ async fn run_init(
     directory: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let url = server.url()?;
-    let (bearer, _, account_key) = account_key_for(&url)?;
+    let (bearer, _, account_key) = account_key_for(&url).await?;
     let directory = resolve_vault_dir(&directory)?;
     let device_id = load_or_create_device_id(&url)?;
     let vault_key = new_key();
@@ -652,7 +668,7 @@ async fn run_download(
     directory: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let url = server.url()?;
-    let (bearer, _, account_key) = account_key_for(&url)?;
+    let (bearer, _, account_key) = account_key_for(&url).await?;
     let directory = resolve_vault_dir(&directory)?;
     let device_id = load_or_create_device_id(&url)?;
     let client = ApiClient::new(VaultConfig {
@@ -698,7 +714,7 @@ async fn run_devices(
     revoke: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let url = resolve_server_url(server_url.as_deref())?;
-    let (token, _) = signed_in(&url)?;
+    let (token, _) = signed_in(&url).await?;
     let auth = AuthClient::new(&url);
     if let Some(args) = rename {
         auth.rename_device(&token, &args[0], &args[1]).await?;

@@ -75,28 +75,6 @@ pub struct Device {
     pub platform: DevicePlatform,
 }
 
-/// How a sign-in identifies its device. `Legacy` is the v2 body (a name
-/// only; the server synthesizes a device) that the desktop and iOS clients
-/// send until OBS-140 / OBS-142; removed in OBS-143.
-#[derive(Debug, Clone, Copy)]
-pub enum SignInDevice<'a> {
-    Device(&'a Device),
-    Legacy(&'a str),
-}
-
-impl SignInDevice<'_> {
-    fn apply(self, body: &mut serde_json::Value) {
-        match self {
-            SignInDevice::Device(device) => {
-                body["device"] = serde_json::to_value(device).expect("device serialises");
-            }
-            SignInDevice::Legacy(name) => {
-                body["device_name"] = serde_json::Value::String(name.to_string());
-            }
-        }
-    }
-}
-
 /// The wrapped account key as the server holds it (`GET /auth/keys`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountKeyBlob {
@@ -134,9 +112,6 @@ pub enum SetKeysOutcome {
 pub struct AuthMethods {
     pub email: bool,
     pub apple: bool,
-    /// v2 servers advertised an operator bearer; a v3 server has none.
-    #[serde(default)]
-    pub api_key: bool,
 }
 
 /// `Debug` redacts `token` (the bearer).
@@ -294,15 +269,15 @@ impl AuthClient {
         &self,
         email: &str,
         code: &str,
-        device: SignInDevice<'_>,
+        device: &Device,
         invite_code: Option<&str>,
     ) -> Result<Session, AuthError> {
-        let mut body = serde_json::json!({
+        let body = serde_json::json!({
             "email": email,
             "code": code,
+            "device": device,
             "invite_code": invite_code,
         });
-        device.apply(&mut body);
         parse(
             self.client
                 .post(self.url("auth/email/verify"))
@@ -322,18 +297,18 @@ impl AuthClient {
     pub async fn apple_sign_in(
         &self,
         identity_token: &str,
-        device: SignInDevice<'_>,
+        device: &Device,
         email: Option<&str>,
         code: Option<&str>,
         invite_code: Option<&str>,
     ) -> Result<Session, AuthError> {
-        let mut body = serde_json::json!({
+        let body = serde_json::json!({
             "identity_token": identity_token,
+            "device": device,
             "email": email,
             "code": code,
             "invite_code": invite_code,
         });
-        device.apply(&mut body);
         parse(
             self.client
                 .post(self.url("auth/apple"))
@@ -573,9 +548,7 @@ mod tests {
         Method::DELETE, Method::GET, Method::PATCH, Method::POST, Method::PUT, MockServer,
     };
 
-    use super::{
-        AuthClient, AuthError, Capabilities, Device, DevicePlatform, SetKeysOutcome, SignInDevice,
-    };
+    use super::{AuthClient, AuthError, Capabilities, Device, DevicePlatform, SetKeysOutcome};
 
     fn cli_device() -> Device {
         Device {
@@ -656,12 +629,7 @@ mod tests {
         assert!(client.email_start("a@b.co").await.unwrap().sent);
         let device = cli_device();
         let session = client
-            .email_verify(
-                "a@b.co",
-                "123456",
-                SignInDevice::Device(&device),
-                Some("ABCD2345"),
-            )
+            .email_verify("a@b.co", "123456", &device, Some("ABCD2345"))
             .await
             .unwrap();
         assert_eq!(session.token, "os_abc");
@@ -694,7 +662,16 @@ mod tests {
             .await;
         let client = AuthClient::new(&server.base_url());
         let error = client
-            .email_verify("a@b.co", "000000", SignInDevice::Legacy("cli"), None)
+            .email_verify(
+                "a@b.co",
+                "000000",
+                &Device {
+                    id: "dev_1".into(),
+                    name: "cli".into(),
+                    platform: DevicePlatform::Cli,
+                },
+                None,
+            )
             .await
             .unwrap_err();
         match error {
@@ -745,10 +722,6 @@ mod tests {
         }))
         .unwrap();
         assert!(caps.check_protocol().is_ok());
-        assert!(
-            !caps.auth.api_key,
-            "v3 servers advertise no operator bearer"
-        );
         caps.protocol = 2;
         assert!(matches!(
             caps.check_protocol(),

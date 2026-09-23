@@ -40,7 +40,7 @@ async fn advertises_configured_sign_in_methods_without_auth() {
         })
     );
     let caps = env.auth_client().capabilities().await.unwrap();
-    assert!(!caps.auth.email && caps.auth.apple && !caps.auth.api_key);
+    assert!(!caps.auth.email && caps.auth.apple);
     env.finish().await;
 }
 
@@ -286,7 +286,7 @@ async fn sends_mail_through_the_mailer_and_hides_the_code_without_the_dev_flag()
 
     let ok = env
         .req(Method::POST, "/auth/email/verify")
-        .json(&serde_json::json!({ "email": "mail@example.com", "code": code }))
+        .json(&serde_json::json!({ "email": "mail@example.com", "code": code, "device": TestEnv::device("mail") }))
         .send()
         .await
         .unwrap();

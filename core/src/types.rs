@@ -127,7 +127,7 @@ pub struct VaultSummary {
     #[serde(default)]
     pub bytes: u64,
     /// The vault key wrapped for this account (base64), or `None` for a vault
-    /// created before the account had a passphrase (transitional).
+    /// created by a client from before wire format v3 (never on a v3 server).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wrapped_key: Option<String>,
     /// The devices that hold this vault.
@@ -162,8 +162,8 @@ pub struct CreateVaultRequest {
     pub name: String,
     #[serde(default = "default_max_file_size")]
     pub max_file_size: u64,
-    /// The new vault's key wrapped under the account key (base64). Optional
-    /// only while v2 clients exist (OBS-143 makes it required).
+    /// The new vault's key wrapped under the account key (base64); the server
+    /// requires it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wrapped_key: Option<String>,
 }

@@ -22,9 +22,8 @@ use obsink_core::{
     encode_base64, fetch_remote_manifest, load_local_state, new_key, new_vault_id,
     normalize_server_url, prepare_sync, rewrap_account_key, ApiClient, ApiError, AuthClient,
     AuthError, ConflictResolution, ConflictResolutionChoice, CreateVaultRequest, CryptoError,
-    Device, DevicePlatform, KeyBytes, ProgressEvent, ProgressSink, SetKeysOutcome, SignInDevice,
-    SyncActionKind, SyncEngineError, SyncFailure, SyncPhase, SyncPlan, VaultConfig, VaultSummary,
-    PROTOCOL_VERSION,
+    Device, DevicePlatform, KeyBytes, ProgressEvent, ProgressSink, SetKeysOutcome, SyncActionKind,
+    SyncEngineError, SyncFailure, SyncPhase, SyncPlan, VaultConfig, VaultSummary, PROTOCOL_VERSION,
 };
 
 /// Spec §6.1: the wrapped account key is the new exposure, so the passphrase
@@ -794,7 +793,7 @@ pub fn auth_email_verify(
     let session = block_on(AuthClient::new(&server_url).email_verify(
         &email,
         &code,
-        SignInDevice::Device(&device),
+        &device,
         clean_invite(invite_code.as_deref()),
     ))
     .map_err(|error| from_auth(error, CallKind::SignIn))?;
@@ -821,7 +820,7 @@ pub fn auth_apple(
     let session = block_on(
         AuthClient::new(&server_url).apple_sign_in(
             &identity_token,
-            SignInDevice::Device(&device),
+            &device,
             email.as_deref(),
             code.as_deref()
                 .map(str::trim)

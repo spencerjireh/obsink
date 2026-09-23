@@ -23,7 +23,7 @@ struct SettingsView: View {
                                 .font(.caption).foregroundStyle(.orange)
                             Button(model.hasServerKey ? "Unlock" : "Set passphrase") { showingSignIn = true }
                                 .disabled(model.busy)
-                                .accessibilityIdentifier(model.hasServerKey ? "unlockButton" : "setPassphraseButton")
+                                .accessibilityIdentifier(model.hasServerKey ? "unlockPromptButton" : "setPassphrasePromptButton")
                         }
                         if let usage = model.usageText {
                             Text(usage).font(.caption).foregroundStyle(.secondary)

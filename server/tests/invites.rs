@@ -55,6 +55,7 @@ async fn first_account_signs_up_without_invite_then_invites_are_required() {
         .json(&serde_json::json!({
             "email": "second@example.com",
             "code": latest_code(&env, "second@example.com").await,
+            "device": TestEnv::device("b"),
             "invite_code": code.to_lowercase(),
         }))
         .send()

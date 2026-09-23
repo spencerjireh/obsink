@@ -32,8 +32,8 @@ pub use api_client::{ApiClient, ApiError, ManifestFetch, TrashEntry, VersionInfo
 #[cfg(not(target_arch = "wasm32"))]
 pub use auth::{
     AccountKeyBlob, AuthClient, AuthError, AuthMethods, Capabilities, Device, DevicePlatform,
-    EmailStartResult, Invite, Me, MeDevice, MeUser, Session, SessionInfo, SetKeysOutcome,
-    SignInDevice, Usage, UserInfo, VaultUsage,
+    EmailStartResult, Invite, Me, MeDevice, MeUser, Session, SessionInfo, SetKeysOutcome, Usage,
+    UserInfo, VaultUsage,
 };
 pub use crypto::{
     account_verifier, content_hmac, create_account_key, decode_base64, decrypt, decrypt_path,

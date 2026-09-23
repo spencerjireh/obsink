@@ -110,10 +110,9 @@ pub struct StartResponse {
 pub struct VerifyBody {
     pub email: Option<String>,
     pub code: Option<String>,
-    /// The signing-in device (spec §4.1). A v2 client sends `device_name`
-    /// instead and gets a synthesized device until OBS-143.
+    /// The signing-in device (spec §4.1); required, so a client from before
+    /// wire format v3 is told to update rather than signed in.
     pub device: Option<DeviceBody>,
-    pub device_name: Option<String>,
     pub invite_code: Option<String>,
 }
 
@@ -310,16 +309,15 @@ pub async fn verify(
     let code = parse_code(body.code.as_deref())?;
     let now = db::now();
 
+    // A client from before wire format v3 is told to update before any code
+    // attempt is spent on it.
+    let device = devices::required(body.device)?;
     let mut tx = state.pool.begin().await?;
     if let CodeCheck::Rejected(error) = check_code(&state, &mut tx, &email, &code, now).await? {
         tx.commit().await?;
         return Err(error);
     }
 
-    let device = match body.device {
-        Some(device) => device.validate()?,
-        None => devices::legacy_device(body.device_name.as_deref()),
-    };
     let session = account::sign_in(
         &state,
         &mut tx,

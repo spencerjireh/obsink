@@ -126,21 +126,6 @@ pub async fn revoke_device(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `DELETE /auth/sessions/{session_id}`: the v2 spelling of revoking a
-/// device, resolved through the session. Removed in OBS-143.
-pub async fn revoke_session(
-    State(state): State<AppState>,
-    principal: Principal,
-    Path(session_id): Path<String>,
-) -> Result<StatusCode, ApiError> {
-    let mut conn = state.pool.acquire().await?;
-    let device_id = devices::device_of_session(&mut conn, &principal.user_id, &session_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("session not found"))?;
-    devices::delete(&mut conn, &principal.user_id, &device_id).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
 #[derive(Deserialize)]
 pub struct RenameDeviceBody {
     pub name: Option<String>,

@@ -291,7 +291,7 @@ async fn rejects_uploads_larger_than_the_configured_max_file_size() {
     };
     let response = env
         .owner(Method::POST, "/vaults")
-        .json(&serde_json::json!({ "name": "tiny", "max_file_size": 4 }))
+        .json(&serde_json::json!({ "name": "tiny", "max_file_size": 4, "wrapped_key": TestEnv::wrapped_key() }))
         .send()
         .await
         .unwrap();

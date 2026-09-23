@@ -32,8 +32,7 @@ pub struct CreateVaultBody {
     pub id: Option<String>,
     pub name: Option<String>,
     pub max_file_size: Option<u64>,
-    /// The vault key wrapped under the caller's account key (base64). Optional
-    /// only while v2 clients exist; OBS-143 makes it required.
+    /// The vault key wrapped under the caller's account key (base64); required.
     pub wrapped_key: Option<String>,
 }
 
@@ -197,7 +196,8 @@ pub async fn create(
     if name.is_empty() {
         return Err(ApiError::bad_request("vault name is required"));
     }
-    let wrapped_key = decode_wrapped_key(body.wrapped_key.as_deref())?;
+    let wrapped_key = decode_wrapped_key(body.wrapped_key.as_deref())?
+        .ok_or_else(|| ApiError::bad_request("wrapped_key is required"))?;
     let id = match body
         .id
         .as_deref()
@@ -225,9 +225,9 @@ pub async fn create(
         .bind(owner)
         .execute(&mut *tx)
         .await?;
-    // A wrapped key only makes sense under an account key. (Absent is the
-    // v2 client path, allowed until OBS-143.)
-    if wrapped_key.is_some() && !keys::has_key(&mut tx, owner).await? {
+    // The vault key is wrapped under the account key (spec §6.1): without a
+    // passphrase there is nothing it could be wrapped under.
+    if !keys::has_key(&mut tx, owner).await? {
         return Err(ApiError::bad_request("set a passphrase first"));
     }
     let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM vaults WHERE owner = $1")
@@ -280,7 +280,7 @@ pub async fn create(
                 revision: 0,
                 last_write: now,
                 bytes: 0,
-                wrapped_key: wrapped_key.map(|bytes| encode_base64(&bytes)),
+                wrapped_key: Some(encode_base64(&wrapped_key)),
                 devices: Vec::new(),
             },
         }),

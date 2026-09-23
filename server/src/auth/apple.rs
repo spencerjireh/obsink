@@ -221,10 +221,9 @@ pub const EMAIL_VERIFICATION_REQUIRED: &str =
 #[derive(Deserialize)]
 pub struct AppleBody {
     pub identity_token: Option<String>,
-    /// The signing-in device (spec §4.1). A v2 client sends `device_name`
-    /// instead and gets a synthesized device until OBS-143.
+    /// The signing-in device (spec §4.1); required, so a client from before
+    /// wire format v3 is told to update rather than signed in.
     pub device: Option<DeviceBody>,
-    pub device_name: Option<String>,
     /// Apple only includes the email in the first-ever token for an app; the
     /// client can forward the credential's email so linking still works. It
     /// is unverified, so it is only honoured together with a one-time `code`
@@ -253,10 +252,7 @@ pub async fn sign_in(
     }
     let now = db::now();
     let identity = state.apple.verify(token, now).await?;
-    let device = match body.device {
-        Some(device) => device.validate()?,
-        None => devices::legacy_device(body.device_name.as_deref()),
-    };
+    let device = devices::required(body.device)?;
     let hint = body
         .email
         .as_deref()

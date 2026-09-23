@@ -116,7 +116,7 @@ struct VaultsView: View {
                 .buttonStyle(.borderedProminent)
                 .tint(Color("Amber"))
                 .foregroundStyle(Color("Ink"))
-                .accessibilityIdentifier(model.hasServerKey ? "unlockButton" : "setPassphraseButton")
+                .accessibilityIdentifier(model.hasServerKey ? "unlockPromptButton" : "setPassphrasePromptButton")
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(16)

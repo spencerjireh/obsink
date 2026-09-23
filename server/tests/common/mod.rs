@@ -115,7 +115,7 @@ impl TestEnv {
 
     pub async fn try_with_owner_and(customize: impl FnOnce(&mut Config)) -> Option<TestEnv> {
         let mut env = Self::try_with(customize).await?;
-        let owner = env.sign_in(OWNER_EMAIL, OWNER_DEVICE, None).await;
+        let owner = env.sign_in_unlocked(OWNER_EMAIL, OWNER_DEVICE, None).await;
         env.owner = Some(owner);
         Some(env)
     }
@@ -234,6 +234,26 @@ impl TestEnv {
         }
     }
 
+    /// Sign in and set a passphrase, so the account can create vaults (a
+    /// wrapped key needs an account key).
+    pub async fn sign_in_unlocked(
+        &self,
+        email: &str,
+        device: &str,
+        invite_code: Option<&str>,
+    ) -> Account {
+        let account = self.sign_in(email, device, invite_code).await;
+        self.set_passphrase(&account, "correct horse battery staple")
+            .await;
+        account
+    }
+
+    /// A `wrapped_key` the server accepts for a contract check: 60 bytes
+    /// of base64. The server never unwraps it; only a client would.
+    pub fn wrapped_key() -> String {
+        obsink_core::encode_base64(&[7_u8; obsink_core::WRAPPED_KEY_LEN])
+    }
+
     /// Mint an invite as `token`.
     pub async fn mint_invite(&self, token: &str) -> String {
         let response = self
@@ -248,10 +268,10 @@ impl TestEnv {
             .to_string()
     }
 
-    /// A second account, invited by the owner.
+    /// A second account, invited by the owner, with its passphrase set.
     pub async fn invited(&self, email: &str, device: &str) -> Account {
         let code = self.mint_invite(self.owner_token()).await;
-        self.sign_in(email, device, Some(&code)).await
+        self.sign_in_unlocked(email, device, Some(&code)).await
     }
 
     /// Set the account passphrase through `PUT /auth/keys`; returns the
@@ -302,11 +322,11 @@ impl TestEnv {
         obsink_core::AuthClient::new(&self.base_url)
     }
 
-    /// Create a vault as `bearer`; returns its id.
+    /// Create a vault as `bearer` (an account with a passphrase); returns its id.
     pub async fn create_vault(&self, bearer: &str, name: &str) -> String {
         let response = self
             .with_token(bearer, reqwest::Method::POST, "/vaults")
-            .json(&serde_json::json!({ "name": name }))
+            .json(&serde_json::json!({ "name": name, "wrapped_key": Self::wrapped_key() }))
             .send()
             .await
             .unwrap();

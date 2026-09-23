@@ -76,7 +76,7 @@ impl AppleFixture {
 
 async fn apple(env: &TestEnv, token: &str, email: Option<&str>) -> reqwest::Response {
     env.req(Method::POST, "/auth/apple")
-        .json(&serde_json::json!({ "identity_token": token, "device_name": "iPhone", "email": email }))
+        .json(&serde_json::json!({ "identity_token": token, "device": TestEnv::device("iphone"), "email": email }))
         .send()
         .await
         .unwrap()
@@ -172,7 +172,7 @@ async fn accepts_a_valid_identity_token_and_links_by_email() {
     let wrong = if code == "000000" { "111111" } else { "000000" };
     let response = env
         .req(Method::POST, "/auth/apple")
-        .json(&serde_json::json!({ "identity_token": token, "email": "victim@example.com", "code": wrong }))
+        .json(&serde_json::json!({ "identity_token": token, "device": TestEnv::device("iphone"), "email": "victim@example.com", "code": wrong }))
         .send()
         .await
         .unwrap();
@@ -187,7 +187,7 @@ async fn accepts_a_valid_identity_token_and_links_by_email() {
 
     let response = env
         .req(Method::POST, "/auth/apple")
-        .json(&serde_json::json!({ "identity_token": token, "email": "Victim@Example.com", "code": code }))
+        .json(&serde_json::json!({ "identity_token": token, "device": TestEnv::device("iphone"), "email": "Victim@Example.com", "code": code }))
         .send()
         .await
         .unwrap();
@@ -198,7 +198,7 @@ async fn accepts_a_valid_identity_token_and_links_by_email() {
     // The code was consumed: a replay with the same code is refused.
     let response = env
         .req(Method::POST, "/auth/apple")
-        .json(&serde_json::json!({ "identity_token": token, "email": "victim@example.com", "code": code }))
+        .json(&serde_json::json!({ "identity_token": token, "device": TestEnv::device("iphone"), "email": "victim@example.com", "code": code }))
         .send()
         .await
         .unwrap();
@@ -223,7 +223,7 @@ async fn accepts_a_valid_identity_token_and_links_by_email() {
     let response = env
         .req(Method::POST, "/auth/apple")
         .json(&serde_json::json!({
-            "identity_token": token, "email": "new@example.com", "code": code, "invite_code": invite_code
+            "identity_token": token, "device": TestEnv::device("iphone"), "email": "new@example.com", "code": code, "invite_code": invite_code
         }))
         .send()
         .await

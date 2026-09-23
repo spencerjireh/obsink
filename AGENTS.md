@@ -195,11 +195,13 @@ RUST_LOG=obsink_core=debug cargo run -p obsink -- sync
   is an account. Testers sign up with an invite (`obsink invite`, or
   `obsink-server invite` on the server).
 - `OBSINK_PASSPHRASE`, `OBSINK_DEVICE_ID` — the harness account's passphrase and
-  a fixed device id, so `login`, `init` and `download` run non-interactively;
-  the two-device scripts set a different device id per side.
-- Until OBS-143 lands, the scripts still read the pre-v3 `OBSINK_API_KEY`
-  operator bearer; `.env.deploy.example` says which variables the checkout
-  expects.
+  a fixed device id, so `login`, `unlock`, `init` and `download` run
+  non-interactively; the two-device scripts set a different device id per side
+  (`OBSINK_HARNESS_EMAIL` lets the CLI harness sign device two in for real on
+  the compose stack, where the code comes back inline).
+- `OBSINK_INVITE_CODE` — an invite for the harnesses that create a fresh
+  account on an established server (the web e2e, the desktop smoke and live
+  tests, the simulator e2e); `.env.deploy.example` lists every variable.
 - `DEVELOPMENT_TEAM`, `ASC_KEY_ID`, `ASC_ISSUER_ID`, `ASC_KEY_PATH` — Apple
   signing and App Store Connect for `scripts/build-ios.sh` / `release-ios.sh`.
 - Clients store the bearer (`bearer:<server url>`), the device id
