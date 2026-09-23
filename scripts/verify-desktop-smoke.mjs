@@ -3,18 +3,18 @@
 // (desktop/src-tauri/src/automation.rs), against a running dev server:
 //
 //   OBSINK_PORT=18080 docker compose up -d --wait
-//   node scripts/verify-desktop-smoke.mjs
+//   OBSINK_INVITE_CODE=... node scripts/verify-desktop-smoke.mjs
 //
-// Env: OBSINK_SERVER_URL (default http://localhost:18080), OBSINK_API_KEY
-// (operator bearer, default dev-operator-key; mints the invite a new account
-// needs), OBSINK_SMOKE_KEEP=1 keeps the sandbox and the app running at the end,
+// Env: OBSINK_SERVER_URL (default http://localhost:18080), OBSINK_INVITE_CODE
+// (an invite from a signed-in account, `obsink invite`, when the stack already
+// has accounts), OBSINK_SMOKE_KEEP=1 keeps the sandbox and the app running at the end,
 // OBSINK_SMOKE_SHOTS=<dir> shows each window for a moment to capture
 // conflict.png and popover.png (off by default). A server that is not
 // localhost is refused unless OBSINK_SMOKE_ALLOW_REMOTE=1.
 //
 // It builds the debug binary with the frontend embedded, launches it with a
-// sandboxed HOME and the file-backed keyring, signs in and creates a vault
-// through the same commands the UI calls, then drives the real settings window
+// sandboxed HOME and the file-backed keyring, signs in, sets the passphrase
+// and creates a vault through the same commands the UI calls, then drives the real settings window
 // and popover by data-testid: sync, activity log, a conflict against the CLI
 // as the second device, Keep both, vault deletion. Every window stays hidden
 // (the web views run either way) and no mouse or keyboard input is ever
@@ -33,11 +33,10 @@ import { fileURLToPath } from 'node:url'
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..')
 const SERVER = process.env.OBSINK_SERVER_URL ?? 'http://localhost:18080'
-const API_KEY = process.env.OBSINK_API_KEY ?? 'dev-operator-key'
 const KEEP = process.env.OBSINK_SMOKE_KEEP === '1'
 const SHOTS = process.env.OBSINK_SMOKE_SHOTS
 const EMAIL = `desktop-smoke-${Date.now()}@example.test`
-const PASSPHRASE = 'smoke-passphrase'
+const PASSPHRASE = 'smoke-passphrase-2026'
 const VAULT = `smoke-${Date.now()}`
 const NOTE = 'notes/a.md'
 
@@ -67,14 +66,16 @@ async function api(path, options = {}) {
   return response.json()
 }
 
+// A fresh database needs no invite (the first account is free). Against a
+// stack that already has accounts, pass one minted by a signed-in account
+// (`obsink invite`) as OBSINK_INVITE_CODE.
 async function mintInvite() {
   const { invite_required } = await api('/', { headers: { Accept: 'application/json' } })
   if (!invite_required) return null
-  const { invite } = await api('/auth/invites', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${API_KEY}` },
-  })
-  return invite.code
+  const code = process.env.OBSINK_INVITE_CODE
+  if (!code)
+    fail('the server needs an invite for a new account; set OBSINK_INVITE_CODE (obsink invite)')
+  return code
 }
 
 // ---- seam -----------------------------------------------------------------
@@ -190,7 +191,7 @@ const navigate = (vaultId) =>
     'settings',
     `await window.__TAURI_INTERNALS__.invoke('plugin:event|emit', {
        event: 'settings://navigate',
-       payload: { tab: 'vaults', vault_id: ${JSON.stringify(vaultId)}, add_vault: false },
+       payload: { tab: 'vaults', vault_id: ${JSON.stringify(vaultId)}, add_vault: false, download: false },
      })`,
   )
 
@@ -268,10 +269,10 @@ app.stderr.on('data', (chunk) => (log += chunk))
 let exited = false
 app.on('exit', () => (exited = true))
 
-// The CLI plays device B on the same account: it gets the desktop session's
-// bearer from the file keyring (the web harness hands its second device the
-// first one's bearer the same way, which also dodges the email cooldown).
-const cli = (home, bearer, ...args) => {
+// The CLI plays device B on the same account: it shares the desktop's file
+// keyring (bearer, user id, account key) with its own config home, which
+// also dodges the email cooldown a second sign-in would hit.
+const cli = (home, ...args) => {
   const result = spawnSync(CLI, args, {
     cwd: sandbox,
     encoding: 'utf8',
@@ -279,9 +280,8 @@ const cli = (home, bearer, ...args) => {
     env: {
       ...process.env,
       OBSINK_HOME: home,
-      OBSINK_KEYRING_DIR: join(home, 'keyring'),
+      OBSINK_KEYRING_DIR: join(sandbox, 'keyring'),
       OBSINK_SERVER_URL: SERVER,
-      OBSINK_API_KEY: bearer,
     },
   })
   if (result.status !== 0)
@@ -317,20 +317,23 @@ try {
     typeof code === 'string' && code.length === 6,
     `dev server did not return the code inline: ${code}`,
   )
-  const account = await invoke('auth_email_verify', { email: EMAIL, code, inviteCode: invite })
-  expect(account?.email === EMAIL, `signed in as ${JSON.stringify(account)}`)
+  const signedIn = await invoke('auth_email_verify', { email: EMAIL, code, inviteCode: invite })
+  expect(
+    signedIn?.kind === 'locked' && signedIn.email === EMAIL && signedIn.has_key === false,
+    `signed in as ${JSON.stringify(signedIn)}`,
+  )
+  // Spec §12.1: a new account sets its passphrase; the account is then unlocked.
+  const set = await invoke('set_passphrase', { passphrase: PASSPHRASE })
+  expect(
+    set?.outcome === 'created' && set.account?.kind === 'account',
+    `set_passphrase returned ${JSON.stringify(set)}`,
+  )
   await writeFile(join(vaultA, NOTE), '# from A\n')
-  const added = await invoke('add_vault', {
-    request: {
-      mode: 'create',
-      local_path: vaultA,
-      vault_name: VAULT,
-      vault_id: '',
-      passphrase: PASSPHRASE,
-    },
+  const added = await invoke('create_vault', {
+    request: { local_path: vaultA, vault_name: VAULT },
   })
   const vaultId = added.id
-  expect(typeof vaultId === 'string' && vaultId, `add_vault returned ${JSON.stringify(added)}`)
+  expect(typeof vaultId === 'string' && vaultId, `create_vault returned ${JSON.stringify(added)}`)
   console.log(`setup: signed in as ${EMAIL}, vault ${vaultId}`)
 
   // Settings window: the vault page, Sync now, the activity log.
@@ -361,27 +364,14 @@ try {
   // lands first and its daemon waits out the 2 s batch window, so B's upload
   // wins the race and A's next cycle finds the conflict.
   const homeB = join(sandbox, 'cli')
-  const bearer = (
-    await readFile(join(sandbox, 'keyring', `bearer:${SERVER}`.replace(/[/:]/g, '_')), 'utf8')
-  ).trim()
-  cli(
-    homeB,
-    bearer,
-    'connect',
-    '--vault-id',
-    vaultId,
-    '--directory',
-    vaultB,
-    '--passphrase',
-    PASSPHRASE,
-  )
+  cli(homeB, 'download', '--vault-id', vaultId, '--directory', vaultB)
   expect(
     (await readFile(join(vaultB, NOTE), 'utf8')) === '# from A\n',
     'B did not receive the note',
   )
   await writeFile(join(vaultA, NOTE), '# from A, edited\n')
   await writeFile(join(vaultB, NOTE), '# from B, edited\n')
-  const syncB = cli(homeB, bearer, 'sync')
+  const syncB = cli(homeB, 'sync')
   expect(
     !/conflict/i.test(syncB),
     `B hit the conflict instead of A (A's daemon uploaded first):\n${syncB}`,
@@ -412,7 +402,7 @@ try {
     (await readFile(join(vaultA, 'notes/a.conflict.md'), 'utf8')) === '# from B, edited\n',
     "A has no a.conflict.md with B's version",
   )
-  cli(homeB, bearer, 'sync')
+  cli(homeB, 'sync')
   expect(existsSync(join(vaultB, 'notes/a.conflict.md')), 'B did not receive a.conflict.md')
   console.log('conflict: Keep both applied through the UI, both devices have both versions')
 
