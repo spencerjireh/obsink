@@ -3559,7 +3559,7 @@ dependencies = [
 
 [[package]]
 name = "obsink"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "dirs",
@@ -3576,7 +3576,7 @@ dependencies = [
 
 [[package]]
 name = "obsink-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -3603,7 +3603,7 @@ dependencies = [
 
 [[package]]
 name = "obsink-core-wasm"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "obsink-core",
  "serde_json",
@@ -3614,7 +3614,7 @@ dependencies = [
 
 [[package]]
 name = "obsink-desktop"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "dirs",
  "hex",
@@ -3629,7 +3629,7 @@ dependencies = [
 
 [[package]]
 name = "obsink-mobile"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "obsink-core",
  "serde",
@@ -3641,7 +3641,7 @@ dependencies = [
 
 [[package]]
 name = "obsink-server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aes-gcm",
  "axum",

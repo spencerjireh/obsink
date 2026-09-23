@@ -1,7 +1,7 @@
 {
   "name": "@obsink/ui",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
   "description": "The ObSink screens (popover, settings window, conflicts, account) over a Backend interface; consumed as TypeScript source by desktop/ and web/",
   "exports": {

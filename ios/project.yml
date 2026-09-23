@@ -9,7 +9,7 @@ settings:
   base:
     SWIFT_VERSION: "5.9"
     GENERATE_INFOPLIST_FILE: NO
-    MARKETING_VERSION: "0.2.0"
+    MARKETING_VERSION: "0.3.0"
     CURRENT_PROJECT_VERSION: "1"
     # Rust staticlib needs these system libs (reqwest proxy detection + resolver).
     OTHER_LDFLAGS:
