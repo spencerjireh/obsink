@@ -18,16 +18,8 @@ import {
   rememberAccountKey,
   unlockAccountKey,
 } from './keys'
-import {
-  api,
-  bearerCall,
-  deviceName,
-  forgetBearer,
-  loadBearer,
-  saveBearer,
-  serverUrl,
-} from './session'
-import { forgetVaultsForServer, unlockStoredVaults } from './vaults'
+import { api, bearerCall, forgetBearer, loadBearer, saveBearer, thisDevice } from './session'
+import { forgetAllVaults, unlockStoredVaults } from './vaults'
 import { wasm } from './wasm'
 
 // The account commands, one per desktop `#[tauri::command]`.
@@ -65,7 +57,7 @@ export async function authEmailVerify(
   inviteCode: string | null,
 ): Promise<AccountState> {
   const invite = inviteCode?.trim() || null
-  const session = await api.emailVerify(email.trim(), code.trim(), deviceName(), invite)
+  const session = await api.emailVerify(email.trim(), code.trim(), await thisDevice(), invite)
   await saveBearer(session.token)
   return getAccount()
 }
@@ -261,5 +253,5 @@ export async function deleteAccount(): Promise<void> {
   await bearerCall((bearer) => api.deleteAccount(bearer))
   await forgetBearer()
   forgetAccountKey()
-  await forgetVaultsForServer(serverUrl)
+  await forgetAllVaults()
 }

@@ -6,7 +6,6 @@ function vault(id: string, created: number): StoredVault {
   return {
     id,
     name: id,
-    server_url: 'http://localhost',
     handle_id: `h-${id}`,
     folder_name: id,
     ignore: [],

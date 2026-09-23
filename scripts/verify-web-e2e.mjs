@@ -46,7 +46,8 @@ async function mintInvite() {
   const { invite_required } = await api('/', { headers: { Accept: 'application/json' } })
   if (!invite_required) return null
   const code = process.env.OBSINK_INVITE_CODE
-  if (!code) fail('the server needs an invite for a new account; set OBSINK_INVITE_CODE (obsink invite)')
+  if (!code)
+    fail('the server needs an invite for a new account; set OBSINK_INVITE_CODE (obsink invite)')
   return code
 }
 
@@ -57,7 +58,6 @@ const shim = `
     return root.getDirectoryHandle('e2e-vault', { create: true })
   }
 `
-
 
 // The client's IndexedDB (`web/src/shared/db.ts`), from the page.
 const idbGet = ([store, key]) =>
@@ -70,14 +70,11 @@ const idbGet = ([store, key]) =>
       request.onerror = () => reject(request.error)
     }
   })
+// The page has opened (and versioned) the database by the time this runs,
+// so no version is passed: the client owns the schema.
 const idbPut = ([store, key, value]) =>
   new Promise((resolve, reject) => {
-    const open = indexedDB.open('obsink', 1)
-    open.onupgradeneeded = () => {
-      for (const name of ['kv', 'vaults', 'handles', 'state', 'activity']) {
-        if (!open.result.objectStoreNames.contains(name)) open.result.createObjectStore(name)
-      }
-    }
+    const open = indexedDB.open('obsink')
     open.onerror = () => reject(open.error)
     open.onsuccess = () => {
       const request = open.result.transaction(store, 'readwrite').objectStore(store).put(value, key)
@@ -212,7 +209,11 @@ try {
   // unlock with the passphrase, download the vault, get the note.
   const { page: b, close: closeB } = await device()
   devices.push(closeB)
-  await b.evaluate(idbPut, ['kv', `bearer:${new URL(WEB).origin}`, await a.evaluate(idbGet, ['kv', `bearer:${new URL(WEB).origin}`])])
+  await b.evaluate(idbPut, [
+    'kv',
+    `bearer:${new URL(WEB).origin}`,
+    await a.evaluate(idbGet, ['kv', `bearer:${new URL(WEB).origin}`]),
+  ])
   await b.reload()
   await unlock(b)
   await b.getByTestId('vaultStateText').filter({ hasText: 'Not on this device' }).first().waitFor()
@@ -233,7 +234,10 @@ try {
   await b.getByRole('button', { name: 'Apply resolutions' }).click()
   await b.getByText('Conflict resolutions applied.').waitFor({ timeout: 60_000 })
   const resolved = await readFiles(b)
-  if (resolved['a.md'] !== '# from B, edited\n' || resolved['a.conflict.md'] !== '# from A, edited\n') {
+  if (
+    resolved['a.md'] !== '# from B, edited\n' ||
+    resolved['a.conflict.md'] !== '# from A, edited\n'
+  ) {
     fail(`B resolution wrong: ${JSON.stringify(resolved)}`)
   }
   console.log('B: conflict resolved with Keep both')
@@ -250,7 +254,9 @@ try {
   // this moment (the delete is refused while one runs), so retry briefly.
   await a.getByRole('button', { name: 'Delete vault on server' }).first().click()
   await a.getByRole('textbox', { name: /to confirm/ }).fill(VAULT)
-  const outcome = a.getByText(new RegExp(`Deleted ${VAULT} on the server\\.|A sync is running on this vault`))
+  const outcome = a.getByText(
+    new RegExp(`Deleted ${VAULT} on the server\\.|A sync is running on this vault`),
+  )
   for (let attempt = 0; attempt < 10; attempt++) {
     await a.getByRole('button', { name: 'Delete vault on server' }).last().click()
     await outcome.waitFor()

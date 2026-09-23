@@ -94,6 +94,12 @@ self.onmessage = async (message: MessageEvent<WorkerRequest>) => {
   }
 }
 
+// Spec §15.5, the worker's side of the protocol gate: against a server that
+// speaks another wire format nothing polls (the page shows `Update ObSink`).
+void account.getProtocol().then((protocol) => {
+  if (protocol.server !== null && protocol.server !== protocol.client) setPaused(true)
+})
+
 // A throw outside a request handler (a timer, a poll) has no request to
 // answer; the page shows it instead of nothing.
 self.addEventListener('error', (event) => {

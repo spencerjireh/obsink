@@ -8,15 +8,7 @@ import type {
   VaultStateInfo,
 } from '@obsink/ui'
 import type { VaultSummary } from './api'
-import {
-  all,
-  del,
-  get,
-  KV_ACTIVE_VAULT,
-  listVaults as storedVaults,
-  put,
-  type StoredVault,
-} from '../shared/db'
+import { all, del, get, listVaults as storedVaults, put, type StoredVault } from '../shared/db'
 import { other } from './errors'
 import {
   forgetKeys,
@@ -27,7 +19,7 @@ import {
   unwrapVaultKeys,
 } from './keys'
 import { diffManifests, fetchRemoteManifest, loadLocalState, saveSyncState } from './manifest'
-import { api, bearerCall, serverUrl } from './session'
+import { api, bearerCall } from './session'
 import { forgetActivity, lastSynced } from './activity'
 import { inFlight, pendingConflicts, startDriver, stopDriver } from './driver'
 
@@ -142,14 +134,12 @@ async function adopt(
   const vault: StoredVault = {
     id: summary.id,
     name: summary.name,
-    server_url: serverUrl,
     handle_id: handleId,
     folder_name: folderName,
     ignore: [],
     created: Date.now(),
   }
   await put('vaults', vault.id, vault)
-  await put('kv', KV_ACTIVE_VAULT, vault.id)
   await bearerCall((bearer) => api.attachDevice(bearer, vault.id, null))
   await startDriver(vault.id)
   return localVault(vault)
@@ -164,7 +154,6 @@ export async function forgetVault(vaultId: string): Promise<void> {
   if (vault) await del('handles', vault.handle_id)
   await del('state', vaultId)
   await forgetActivity(vaultId)
-  if ((await get<string>('kv', KV_ACTIVE_VAULT)) === vaultId) await del('kv', KV_ACTIVE_VAULT)
 }
 
 export async function removeVault(vaultId: string): Promise<void> {
@@ -193,10 +182,9 @@ export async function renameVault(vaultId: string, name: string): Promise<void> 
   if (vault) await put('vaults', vaultId, { ...vault, name: trimmed })
 }
 
-export async function forgetVaultsForServer(server: string): Promise<void> {
-  for (const vault of await all<StoredVault>('vaults')) {
-    if (vault.server_url === server) await forgetVault(vault.id)
-  }
+// Every vault this browser holds (account deletion).
+export async function forgetAllVaults(): Promise<void> {
+  for (const vault of await all<StoredVault>('vaults')) await forgetVault(vault.id)
 }
 
 // The pending diff for one vault this browser holds, without transferring.
