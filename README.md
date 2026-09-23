@@ -11,9 +11,12 @@ desktop/CLI daemon. Obsidian opens the synced directory as a normal vault; no pl
 
 ## Design
 
-- **Client-side crypto.** Argon2id (64 MiB, t=3, p=1) over passphrase + vault ID → 32-byte master
-  key → four HKDF-SHA256 sub-keys for content encryption, content MAC, path tokens, and path
-  encryption. Contents are AES-256-GCM.
+- **Client-side crypto.** One account passphrase: Argon2id (64 MiB, t=3, p=1) over the passphrase
+  and a random salt unwraps a random 32-byte account key, which the server stores wrapped
+  (AES-256-GCM) next to a verifier it can check but not invert. Every vault has its own random
+  key, wrapped under a sub-key of the account key and stored per member; a vault key derives four
+  HKDF-SHA256 sub-keys for content encryption, content MAC, path tokens, and path encryption.
+  Contents are AES-256-GCM.
 - **Opaque server view.** Manifest entries are keyed by `HMAC(path_token_key, path)`, so filenames
   never leave the device. The reversible `encPath` (AES-GCM of the real path) lets a freshly
   connected device recover paths and re-key the manifest locally.
@@ -57,22 +60,26 @@ in [docs/architecture.md](docs/architecture.md).
 
 ## Server API
 
-Bearer-token auth on every vault route (a session token; every principal is an account, and the
+Bearer-token auth on every route past `GET /`: a session token, one per device of an account (the
 harness scripts sign in as one). Full contract in [spec.md §4](spec.md).
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/` | Sign-in methods offered; whether an invite is required |
-| `POST` | `/auth/email/start`, `/auth/email/verify`, `/auth/apple` | Sign in |
-| `GET` | `/auth/me` | Account, devices, storage usage |
+| `GET` | `/` | Sign-in methods offered, wire-format `protocol`, whether an invite is required |
+| `POST` | `/auth/email/start`, `/auth/email/verify`, `/auth/apple` | Sign in as a device (one session per device) |
+| `GET`, `PUT` | `/auth/keys` (+ `/rewrap`) | The wrapped account key: read, set once, change the passphrase |
+| `GET` | `/auth/me` | Account, devices (with their vaults), storage usage |
+| `PATCH`, `DELETE` | `/auth/devices/:id` | Rename or sign out a device |
 | `POST` | `/auth/invites` | Mint an invite code |
-| `GET` | `/vaults` | List vault summaries |
-| `POST` | `/vaults` | Create a vault |
+| `GET`, `POST` | `/vaults` | The account's vaults (wrapped keys, devices, revision); create one |
+| `PATCH`, `DELETE` | `/vaults/:id` | Rename; delete on the server |
+| `PUT`, `DELETE` | `/vaults/:id/devices/self` | This device holds the vault (with its synced revision); it no longer does |
 | `GET` | `/vaults/:id/manifest` | Fetch the token-keyed manifest (`ETag` / `If-None-Match`) |
 | `GET` | `/vaults/:id/files/:token` | Download a blob |
 | `PUT` | `/vaults/:id/files/:token` | Upload (requires `X-Parent-Hash`) |
 | `DELETE` | `/vaults/:id/files/:token` | Delete (requires `X-Parent-Hash`) |
 | `POST` | `/vaults/:id/batch` | Batched operations as `multipart/form-data` |
+| `GET` | `/vaults/:id/history/:token`, `/versions/:name/:token`, `/trash`, `/trash/:token` | Archived versions and recently deleted files |
 
 Blobs live under `blobs/live/<vaultId>/…`, with history under `blobs/_versions/<vaultId>/…/<unix>`
 and `blobs/_trash/<vaultId>/…/<unix>` on the server's data volume.
@@ -123,33 +130,36 @@ Run a server first — locally with `docker compose up -d`, or on your own host 
 [docs/self-hosting.md](docs/self-hosting.md). Then sign in and create a vault:
 
 ```bash
-# First account on a fresh server needs no invite; later ones do (`obsink invite`)
+# First account on a fresh server needs no invite; later ones do (`obsink invite`).
+# The first sign-in sets the account passphrase (at least 12 characters).
 cargo run -p obsink -- login --server-url https://obsink.example.com --email you@example.com
 
-# Create a remote vault and perform the initial sync
+# Create a vault and perform the initial sync
 cargo run -p obsink -- init \
   --server-url https://obsink.example.com \
   --vault-name my-notes \
-  --directory ~/Obsidian/my-notes \
-  --passphrase "correct horse battery staple"
+  --directory ~/Obsidian/my-notes
 
 # Subsequent syncs read ~/.obsink/config.toml
 cargo run -p obsink -- sync
 ```
 
-Attach another device to the same vault:
+Put the same vault on another device (sign in there with the same passphrase; the vault key comes
+from the account):
 
 ```bash
 cargo run -p obsink -- login --server-url https://obsink.example.com --email you@example.com
-cargo run -p obsink -- connect \
+cargo run -p obsink -- vaults --server-url https://obsink.example.com
+cargo run -p obsink -- download \
   --server-url https://obsink.example.com \
   --vault-id vault_xxxxxxxx \
-  --directory ~/Obsidian/my-notes \
-  --passphrase "correct horse battery staple"
+  --directory ~/Obsidian/my-notes
 ```
 
-Other subcommands: `vaults` (list remote vaults), `status` (pending changes for a directory),
-`whoami` (account, devices, usage), `invite` (mint a code for someone else), `logout`.
+Other subcommands: `vaults` (every vault of the account and its state here), `devices` (rename or
+sign out a device), `passphrase` (change it), `rename`, `history` / `trash` / `restore` (archived
+versions and recently deleted files), `status`, `watch` (keep a folder in sync), `whoami`,
+`invite` (mint a code for someone else), `unlock`, `logout`.
 
 The desktop app and the iOS app wrap the same core — see [docs/platforms.md](docs/platforms.md).
 
