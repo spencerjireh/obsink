@@ -377,6 +377,7 @@ export async function completeSync(
         ),
       ) as Manifest
       await saveSyncState(cycle.vault.id, state)
+      await reportCheckpoint(cycle.vault.id, state)
     } catch (error) {
       checkpoint_error = message(error)
     }
@@ -388,6 +389,25 @@ export async function completeSync(
     conflicts: [...resolved.deferred, ...uploaded.late],
     failures,
     ...(checkpoint_error ? { checkpoint_error } : {}),
+  }
+}
+
+// The manifest revision is the ETag (`"<n>"`), as core reads it.
+export function revisionOf(etag: string | null | undefined): number | null {
+  if (!etag) return null
+  const parsed = Number.parseInt(etag.trim().replace(/^"|"$/g, ''), 10)
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+// Spec §4.3: tell the server which revision this device now holds. Best
+// effort: a failure is logged and never fails the checkpoint.
+async function reportCheckpoint(vaultId: string, state: VaultSyncState): Promise<void> {
+  const revision = revisionOf(state.remote_cache?.etag)
+  if (revision === null) return
+  try {
+    await bearerCall((bearer) => api.attachDevice(bearer, vaultId, revision))
+  } catch (error) {
+    console.warn(`checkpoint report for ${vaultId} failed: ${message(error)}`)
   }
 }
 

@@ -1,11 +1,15 @@
-// IndexedDB is the browser's `~/.obsink`: vault entries and the bearer (as
-// app.json + the keychain do on desktop), the picked directory handles, and
-// per-vault sync bookkeeping (the base manifest, the remote-manifest cache
-// and the hash cache, which desktop keeps under `.obsink/` in the folder)
-// plus the activity log. Nothing here holds a passphrase or a derived key.
+// IndexedDB is the browser's `~/.obsink`: vault entries, the bearer and the
+// device id (as app.json + the keychain do on desktop), the picked directory
+// handles, and per-vault sync bookkeeping (the base manifest, the
+// remote-manifest cache and the hash cache, which desktop keeps under
+// `.obsink/` in the folder) plus the activity log. Nothing here holds a
+// passphrase or a key: the account key and the vault keys live in the
+// worker's memory for the tab's lifetime (spec §6.3).
 
 export const DB_NAME = 'obsink'
-const DB_VERSION = 1
+// v2 (wire format v3): vault entries lose `server_url` and the `active_vault`
+// key goes (every page talks to its own origin; the list has no active vault).
+export const DB_VERSION = 2
 
 export type Store = 'kv' | 'vaults' | 'handles' | 'state' | 'activity'
 const STORES: Store[] = ['kv', 'vaults', 'handles', 'state', 'activity']
@@ -15,7 +19,6 @@ const STORES: Store[] = ['kv', 'vaults', 'handles', 'state', 'activity']
 export type StoredVault = {
   id: string
   name: string
-  server_url: string
   handle_id: string
   folder_name: string
   ignore: string[]
@@ -54,15 +57,32 @@ function request<T>(req: IDBRequest<T>): Promise<T> {
 function openAt(version: number | undefined): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const req = version === undefined ? indexedDB.open(DB_NAME) : indexedDB.open(DB_NAME, version)
-    req.onupgradeneeded = () => {
+    req.onupgradeneeded = (event) => {
       const db = req.result
       for (const store of STORES) {
         if (!db.objectStoreNames.contains(store)) db.createObjectStore(store)
       }
+      if (event.oldVersion > 0 && event.oldVersion < 2) migrateToV2(req.transaction)
     }
     req.onsuccess = () => resolve(req.result)
     req.onerror = () => reject(req.error ?? new Error('could not open IndexedDB'))
   })
+}
+
+// The v1 -> v2 rewrite, inside the upgrade transaction: every vault entry
+// without its `server_url`, and no `active_vault` key.
+function migrateToV2(transaction: IDBTransaction | null): void {
+  if (!transaction) return
+  const vaults = transaction.objectStore('vaults')
+  vaults.openCursor().onsuccess = (event) => {
+    const cursor = (event.target as IDBRequest<IDBCursorWithValue | null>).result
+    if (!cursor) return
+    const rest = { ...(cursor.value as StoredVault & { server_url?: string }) }
+    delete rest.server_url
+    cursor.update(rest)
+    cursor.continue()
+  }
+  transaction.objectStore('kv').delete('active_vault')
 }
 
 export function openDb(): Promise<IDBDatabase> {
@@ -132,7 +152,10 @@ export async function listVaults(): Promise<StoredVault[]> {
   return vaults.sort((a, b) => a.created - b.created)
 }
 
-export const KV_ACTIVE_VAULT = 'active_vault'
+// This browser profile's device id (spec §4.1), generated once. A cleared
+// profile (site data removed, a new browser) is a new device: the old one
+// stays on the Devices tab until it is signed out there.
+export const KV_DEVICE_ID = 'device_id'
 
 export function bearerKey(serverUrl: string): string {
   return `bearer:${serverUrl}`

@@ -34,6 +34,9 @@ export type Session = {
   user: { id: string; email: string | null }
 }
 
+// What a sign-in sends for this device.
+export type WireDeviceBody = { id: string; name: string; platform: string }
+
 export type WireDevice = {
   id: string
   name: string
@@ -195,16 +198,15 @@ export class Api {
     return this.json('POST', '/auth/email/start', { json: { email } })
   }
 
-  // v2 device identity (a name only) until OBS-141 gives the browser a
-  // stable device id.
+  // Spec §4.1: the device signs in, and one session per device.
   emailVerify(
     email: string,
     code: string,
-    deviceName: string,
+    device: WireDeviceBody,
     inviteCode: string | null,
   ): Promise<Session> {
     return this.json('POST', '/auth/email/verify', {
-      json: { email, code, device_name: deviceName, invite_code: inviteCode },
+      json: { email, code, device, invite_code: inviteCode },
     })
   }
 
