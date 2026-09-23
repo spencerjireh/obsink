@@ -63,7 +63,7 @@ async fn issues_a_session_for_a_valid_code_and_rejects_a_wrong_one() {
 
     let wrong = env
         .req(Method::POST, "/auth/email/verify")
-        .json(&serde_json::json!({ "email": "person@example.com", "code": "000000" }))
+        .json(&serde_json::json!({ "email": "person@example.com", "code": "000000", "device": TestEnv::device("phone-1") }))
         .send()
         .await
         .unwrap();
@@ -93,7 +93,7 @@ async fn issues_a_session_for_a_valid_code_and_rejects_a_wrong_one() {
     // Single use.
     let reuse = env
         .req(Method::POST, "/auth/email/verify")
-        .json(&serde_json::json!({ "email": "person@example.com", "code": code }))
+        .json(&serde_json::json!({ "email": "person@example.com", "code": code, "device": TestEnv::device("phone-1") }))
         .send()
         .await
         .unwrap();
@@ -207,7 +207,7 @@ async fn locks_the_code_after_five_wrong_attempts() {
     for _ in 0..5 {
         let wrong = env
             .req(Method::POST, "/auth/email/verify")
-            .json(&serde_json::json!({ "email": "lock@example.com", "code": "000000" }))
+            .json(&serde_json::json!({ "email": "lock@example.com", "code": "000000", "device": TestEnv::device("lock-1") }))
             .send()
             .await
             .unwrap();
@@ -215,7 +215,7 @@ async fn locks_the_code_after_five_wrong_attempts() {
     }
     let locked = env
         .req(Method::POST, "/auth/email/verify")
-        .json(&serde_json::json!({ "email": "lock@example.com", "code": code }))
+        .json(&serde_json::json!({ "email": "lock@example.com", "code": code, "device": TestEnv::device("lock-1") }))
         .send()
         .await
         .unwrap();
