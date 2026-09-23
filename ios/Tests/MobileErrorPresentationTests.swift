@@ -30,6 +30,13 @@ final class MobileErrorPresentationTests: XCTestCase {
         XCTAssertFalse(MobileError.Server(status: 403, message: "email verification required").isInviteRequired)
     }
 
+    func testAProtocolMismatchHasTheUpdateCopy() {
+        let error = MobileError.ProtocolMismatch(server: 4, client: 3)
+        XCTAssertEqual(error.displayMessage, "This app is too old for the server. Download the current version.")
+        XCTAssertTrue(error.isProtocolMismatch)
+        XCTAssertFalse(error.isUnauthorized)
+    }
+
     func testFoundationErrorsKeepTheirDescription() {
         let error = NSError(domain: "obsink", code: 1, userInfo: [NSLocalizedDescriptionKey: "Enter a passphrase."])
         XCTAssertEqual(error.obsinkMessage, "Enter a passphrase.")

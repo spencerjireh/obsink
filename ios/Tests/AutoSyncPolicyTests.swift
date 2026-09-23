@@ -53,10 +53,10 @@ final class AutoSyncPolicyTests: XCTestCase {
         errored.phase = .error("boom")
         XCTAssertFalse(AutoSyncPolicy.shouldSync(errored, now: now), "an errored vault waits for the user")
 
-        var foreign = ready()
-        foreign.pendingLocal = 1
-        foreign.isForeign = true
-        XCTAssertFalse(AutoSyncPolicy.shouldSync(foreign, now: now))
+        var deleted = ready()
+        deleted.pendingLocal = 1
+        deleted.deletedOnServer = true
+        XCTAssertFalse(AutoSyncPolicy.shouldSync(deleted, now: now))
 
         var keyless = ready()
         keyless.pendingLocal = 1

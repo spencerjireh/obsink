@@ -21,11 +21,19 @@ extension MobileError {
             return "The stored key is damaged. Remove the vault and connect again."
         case .NoPendingSync:
             return "Nothing to resolve. Sync first."
+        case .ProtocolMismatch:
+            return "This app is too old for the server. Download the current version."
         }
     }
 
     var isUnauthorized: Bool {
         if case .Unauthorized = self { return true }
+        return false
+    }
+
+    /// Spec §15.5: the server speaks another wire format.
+    var isProtocolMismatch: Bool {
+        if case .ProtocolMismatch = self { return true }
         return false
     }
 

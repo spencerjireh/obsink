@@ -3,8 +3,13 @@
 //! This crate is a thin, FFI-friendly facade over `obsink-core`. The core API is
 //! async; here we expose a small *synchronous* surface that blocks on an internal
 //! Tokio runtime, which is far simpler to consume from Swift than async FFI. A
-//! `VaultClient` object holds the derived key and the pending sync plan between
+//! `VaultClient` object holds the vault key and the pending sync plan between
 //! the `prepare` and `complete` phases, mirroring the desktop flow.
+//!
+//! Wire format v3 (spec §4, §6, §12): the account signs in as a device, sets
+//! or enters one passphrase that unlocks the account key, and every vault key
+//! is random, wrapped under that account key. The host keeps the keys in its
+//! keychain and passes them in as bytes.
 
 use std::{
     fs,
@@ -13,12 +18,18 @@ use std::{
 };
 
 use obsink_core::{
-    complete_sync, decrypt, derive_key, derive_keys, diff_local_and_remote, fetch_remote_manifest,
-    load_local_state, normalize_server_url, prepare_sync, ApiClient, ApiError, AuthClient,
+    complete_sync, create_account_key, decode_base64, decrypt, derive_keys, diff_local_and_remote,
+    encode_base64, fetch_remote_manifest, load_local_state, new_key, new_vault_id,
+    normalize_server_url, prepare_sync, rewrap_account_key, ApiClient, ApiError, AuthClient,
     AuthError, ConflictResolution, ConflictResolutionChoice, CreateVaultRequest, CryptoError,
-    KeyBytes, ProgressEvent, ProgressSink, SignInDevice, SyncActionKind, SyncEngineError,
-    SyncFailure, SyncPhase, SyncPlan, VaultConfig, VaultSummary,
+    Device, DevicePlatform, KeyBytes, ProgressEvent, ProgressSink, SetKeysOutcome, SignInDevice,
+    SyncActionKind, SyncEngineError, SyncFailure, SyncPhase, SyncPlan, VaultConfig, VaultSummary,
+    PROTOCOL_VERSION,
 };
+
+/// Spec §6.1: the wrapped account key is the new exposure, so the passphrase
+/// has a floor (the same one the desktop and the shared UI enforce).
+const MIN_PASSPHRASE_CHARS: usize = 12;
 
 uniffi::setup_scaffolding!();
 
@@ -44,6 +55,10 @@ pub enum MobileError {
     /// Any other non-2xx, with the server's `error` text.
     #[error("server returned {status}: {message}")]
     Server { status: u16, message: String },
+    /// The server speaks another wire format (spec §15.5): the host shows
+    /// `Update ObSink` and nothing else runs.
+    #[error("this ObSink is too old for the server (protocol {server}, client {client})")]
+    ProtocolMismatch { server: u32, client: u32 },
 }
 
 impl MobileError {
@@ -79,8 +94,9 @@ fn from_auth(error: AuthError, kind: CallKind) -> MobileError {
             message: error.to_string(),
         },
         AuthError::Server { status, message } => map_status(status.as_u16(), message, kind),
-        // Surfaced as its own screen by OBS-142; until then a plain message.
-        error @ AuthError::ProtocolMismatch { .. } => MobileError::sync(error),
+        AuthError::ProtocolMismatch { server, client } => {
+            MobileError::ProtocolMismatch { server, client }
+        }
     }
 }
 
@@ -122,23 +138,26 @@ fn parse_error_body(body: &str) -> String {
         .unwrap_or_else(|_| body.to_string())
 }
 
-/// Connection details for one vault, supplied by the host app. `Debug`
-/// redacts `api_key`.
+/// Connection details for one vault, supplied by the host app. `device_id`
+/// is this phone's stable id (spec §4.1); with it set, every checkpoint
+/// reports its revision to the server. `Debug` redacts `bearer`.
 #[derive(Clone, uniffi::Record)]
 pub struct MobileVaultConfig {
     pub server_url: String,
-    pub api_key: String,
+    pub bearer: String,
     pub vault_id: String,
     pub local_path: String,
+    pub device_id: Option<String>,
 }
 
 impl std::fmt::Debug for MobileVaultConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MobileVaultConfig")
             .field("server_url", &self.server_url)
-            .field("api_key", &"..")
+            .field("bearer", &"..")
             .field("vault_id", &self.vault_id)
             .field("local_path", &self.local_path)
+            .field("device_id", &self.device_id)
             .finish()
     }
 }
@@ -147,10 +166,10 @@ impl From<MobileVaultConfig> for VaultConfig {
     fn from(value: MobileVaultConfig) -> Self {
         VaultConfig {
             server_url: value.server_url,
-            bearer: value.api_key,
+            bearer: value.bearer,
             vault_id: value.vault_id,
             local_path: value.local_path,
-            device_id: None,
+            device_id: value.device_id,
             ignore: Vec::new(),
         }
     }
@@ -261,13 +280,32 @@ pub struct SyncOutcome {
     pub checkpoint_error: Option<String>,
 }
 
-/// A vault the host can list/create/connect to (OBS-28).
+/// A device that holds a vault, as `GET /vaults` reports it (spec §15.2).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MobileVaultDevice {
+    pub id: String,
+    pub name: String,
+    pub platform: String,
+    pub last_synced: Option<u64>,
+    pub last_revision: Option<u64>,
+}
+
+/// One vault of the account as `GET /vaults` lists it (spec §4.3): the
+/// server's revision and bytes, this account's wrapped key, the devices
+/// that hold it.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct MobileVaultSummary {
     pub id: String,
     pub name: String,
     pub created: u64,
     pub max_file_size: u64,
+    pub revision: u64,
+    pub last_write: u64,
+    pub bytes: u64,
+    /// The vault key wrapped for this account (base64); `None` for a vault
+    /// created before the account had a passphrase.
+    pub wrapped_key: Option<String>,
+    pub devices: Vec<MobileVaultDevice>,
 }
 
 impl From<VaultSummary> for MobileVaultSummary {
@@ -277,8 +315,50 @@ impl From<VaultSummary> for MobileVaultSummary {
             name: v.name,
             created: v.created,
             max_file_size: v.max_file_size,
+            revision: v.revision,
+            last_write: v.last_write,
+            bytes: v.bytes,
+            wrapped_key: v.wrapped_key,
+            devices: v
+                .devices
+                .into_iter()
+                .map(|device| MobileVaultDevice {
+                    id: device.id,
+                    name: device.name,
+                    platform: device.platform,
+                    last_synced: device.last_synced,
+                    last_revision: device.last_revision,
+                })
+                .collect(),
         }
     }
+}
+
+/// A vault this device created: its listing and the raw vault key for the
+/// host's keychain.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MobileCreatedVault {
+    pub vault: MobileVaultSummary,
+    pub key: Vec<u8>,
+}
+
+/// One archived version of a file (spec §8.2).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MobileVersion {
+    /// What `fetch_version` takes (`<unix>[-n]`).
+    pub name: String,
+    pub ts: u64,
+    /// The sealed size on the server, a few bytes over the file.
+    pub size: u64,
+}
+
+/// One tombstone with its real path (spec §9.3).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MobileTrashEntry {
+    pub path: String,
+    pub hash: String,
+    pub size: u64,
+    pub deleted_at: u64,
 }
 
 /// Local-vs-remote diff counts without transferring anything — the data source
@@ -300,53 +380,136 @@ pub struct MobileConflictPreview {
     pub remote_deleted: bool,
 }
 
-/// A server-only config (no vault id / local path) for list/create calls.
-fn server_only(server_url: String, api_key: String) -> VaultConfig {
+/// A server-only config (no vault id / local path) for account-level calls.
+fn server_only(server_url: String, bearer: String, device_id: Option<String>) -> VaultConfig {
     VaultConfig {
         server_url,
-        bearer: api_key,
+        bearer,
         vault_id: String::new(),
         local_path: String::new(),
-        device_id: None,
+        device_id,
         ignore: Vec::new(),
     }
 }
 
-/// Derive the 32-byte master key from a passphrase and vault ID (the salt).
+/// The wire format this build speaks (spec §15.5).
 #[uniffi::export]
-pub fn derive_master_key(passphrase: String, vault_id: String) -> Result<Vec<u8>, MobileError> {
-    Ok(derive_key(&passphrase, vault_id.as_bytes())?.to_vec())
+pub fn mobile_protocol_version() -> u32 {
+    PROTOCOL_VERSION
 }
 
-/// List vaults reachable at a server (OBS-28).
+/// A fresh device id for this phone (`dev_<32 hex>`), minted once and kept
+/// in the keychain by the host (spec §4.1).
+#[uniffi::export]
+pub fn new_device_id() -> String {
+    format!("dev_{}", hex(&new_key()[..16]))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// A fresh random vault key (32 bytes).
+#[uniffi::export]
+pub fn new_vault_key() -> Vec<u8> {
+    new_key().to_vec()
+}
+
+/// Wrap a vault key for an account (base64), the `wrapped_key` of a create.
+#[uniffi::export]
+pub fn wrap_vault_key_for(
+    account_key: Vec<u8>,
+    vault_key: Vec<u8>,
+    vault_id: String,
+) -> Result<String, MobileError> {
+    let wrapped =
+        obsink_core::wrap_vault_key(&key_bytes(account_key)?, &key_bytes(vault_key)?, &vault_id)?;
+    Ok(encode_base64(&wrapped))
+}
+
+/// Recover a vault key from the member blob `list_vaults` returned (a
+/// Download, spec §12.3).
+#[uniffi::export]
+pub fn unwrap_vault_key(
+    account_key: Vec<u8>,
+    wrapped: String,
+    vault_id: String,
+) -> Result<Vec<u8>, MobileError> {
+    let blob = decode_base64(&wrapped)?;
+    let key = obsink_core::unwrap_vault_key(&key_bytes(account_key)?, &blob, &vault_id)
+        .map_err(|_| MobileError::sync("the vault key does not open with this account key"))?;
+    Ok(key.to_vec())
+}
+
+/// Every vault of the account (spec §15.1), with this account's wrapped keys.
 #[uniffi::export]
 pub fn list_vaults(
     server_url: String,
-    api_key: String,
+    bearer: String,
 ) -> Result<Vec<MobileVaultSummary>, MobileError> {
-    let vaults = block_on(ApiClient::new(server_only(server_url, api_key)).list_vaults())
+    let vaults = block_on(ApiClient::new(server_only(server_url, bearer, None)).list_vaults())
         .map_err(from_api)?;
     Ok(vaults.into_iter().map(MobileVaultSummary::from).collect())
 }
 
-/// Create a new vault at a server; returns its id + metadata (OBS-28).
+/// Spec §12.2: a fresh vault key wrapped under the account key, the vault on
+/// the server under a client-minted id, this device attached. The host keeps
+/// the returned key.
 #[uniffi::export]
 pub fn create_vault(
     server_url: String,
-    api_key: String,
+    bearer: String,
+    device_id: String,
     name: String,
-) -> Result<MobileVaultSummary, MobileError> {
+    account_key: Vec<u8>,
+) -> Result<MobileCreatedVault, MobileError> {
+    let account_key = key_bytes(account_key)?;
+    let vault_key = new_key();
+    // The wrap's AAD is the vault id, so the id is minted here (spec §4.3).
+    let vault_id = new_vault_id();
+    let wrapped = obsink_core::wrap_vault_key(&account_key, &vault_key, &vault_id)?;
+    let client = ApiClient::new(VaultConfig {
+        server_url,
+        bearer,
+        vault_id: vault_id.clone(),
+        local_path: String::new(),
+        device_id: Some(device_id),
+        ignore: Vec::new(),
+    });
     let request = CreateVaultRequest {
+        id: Some(vault_id),
         name,
         max_file_size: 50 * 1024 * 1024,
-        // v2: the wrapped vault key arrives with OBS-142.
-        id: None,
-        wrapped_key: None,
+        wrapped_key: Some(encode_base64(&wrapped)),
     };
-    let response =
-        block_on(ApiClient::new(server_only(server_url, api_key)).create_vault(&request))
-            .map_err(from_api)?;
-    Ok(response.vault.into())
+    let response = block_on(client.create_vault(&request)).map_err(from_api)?;
+    block_on(client.attach_device(None)).map_err(from_api)?;
+    Ok(MobileCreatedVault {
+        vault: response.vault.into(),
+        key: vault_key.to_vec(),
+    })
+}
+
+/// This device holds the vault now (a Download); the checkpoint reports come
+/// from `VaultClient` afterwards.
+#[uniffi::export]
+pub fn attach_device(config: MobileVaultConfig) -> Result<(), MobileError> {
+    let config: VaultConfig = config.into();
+    block_on(ApiClient::new(config).attach_device(None)).map_err(from_api)
+}
+
+/// This device no longer holds the vault (Remove from this device).
+#[uniffi::export]
+pub fn detach_device(config: MobileVaultConfig) -> Result<(), MobileError> {
+    let config: VaultConfig = config.into();
+    block_on(ApiClient::new(config).detach_device()).map_err(from_api)
+}
+
+/// Spec §4.3 `PATCH /vaults/:id`.
+#[uniffi::export]
+pub fn rename_vault(config: MobileVaultConfig, name: String) -> Result<(), MobileError> {
+    let config: VaultConfig = config.into();
+    block_on(ApiClient::new(config).rename_vault(&name)).map_err(from_api)
 }
 
 fn key_bytes(key: Vec<u8>) -> Result<KeyBytes, MobileError> {
@@ -357,27 +520,73 @@ fn key_bytes(key: Vec<u8>) -> Result<KeyBytes, MobileError> {
         })
 }
 
-/// Check a derived key against a vault before storing it: fetch the manifest
-/// and decrypt the first live blob. `Ok(true)` when it decrypts (or the vault
-/// has no live files yet, which proves nothing either way), `Ok(false)` when
-/// the key does not match, `Err` for network or auth failures. Mirrors the
-/// CLI's `validate_passphrase` (OBS-93).
+// --- History (spec §8.2, §9.3) ------------------------------------------------
+
+/// The archived versions of one file, newest first.
 #[uniffi::export]
-pub fn validate_vault_key(config: MobileVaultConfig, key: Vec<u8>) -> Result<bool, MobileError> {
-    let key = key_bytes(key)?;
-    let keys = derive_keys(&key);
+pub fn list_versions(
+    config: MobileVaultConfig,
+    key: Vec<u8>,
+    path: String,
+) -> Result<Vec<MobileVersion>, MobileError> {
+    let keys = derive_keys(&key_bytes(key)?);
     let config: VaultConfig = config.into();
-    let client = ApiClient::new(config.clone());
-    let manifest = block_on(client.get_manifest(&keys)).map_err(from_api)?;
-    let Some(path) = manifest
-        .iter()
-        .find(|(_, entry)| !entry.deleted)
-        .map(|(path, _)| path.clone())
-    else {
-        return Ok(true);
-    };
-    let blob = block_on(client.get_file(&path, &keys)).map_err(from_api)?;
-    Ok(decrypt(&keys.content_enc, &blob).is_ok())
+    let versions =
+        block_on(ApiClient::new(config).list_versions(&path, &keys)).map_err(from_api)?;
+    Ok(versions
+        .into_iter()
+        .map(|version| MobileVersion {
+            name: version.name,
+            ts: version.ts,
+            size: version.size,
+        })
+        .collect())
+}
+
+/// One archived version, decrypted. The host writes it into the vault (a
+/// restore) or shows it (a preview).
+#[uniffi::export]
+pub fn fetch_version(
+    config: MobileVaultConfig,
+    key: Vec<u8>,
+    path: String,
+    name: String,
+) -> Result<Vec<u8>, MobileError> {
+    let keys = derive_keys(&key_bytes(key)?);
+    let config: VaultConfig = config.into();
+    block_on(ApiClient::new(config).get_version(&path, &name, &keys)).map_err(from_api)
+}
+
+/// The vault's recently deleted files with their real paths.
+#[uniffi::export]
+pub fn list_trash(
+    config: MobileVaultConfig,
+    key: Vec<u8>,
+) -> Result<Vec<MobileTrashEntry>, MobileError> {
+    let keys = derive_keys(&key_bytes(key)?);
+    let config: VaultConfig = config.into();
+    let entries = block_on(ApiClient::new(config).list_trash(&keys)).map_err(from_api)?;
+    Ok(entries
+        .into_iter()
+        .map(|entry| MobileTrashEntry {
+            path: entry.path,
+            hash: entry.hash,
+            size: entry.size,
+            deleted_at: entry.deleted_at,
+        })
+        .collect())
+}
+
+/// The newest trash blob of one path, decrypted.
+#[uniffi::export]
+pub fn fetch_trash(
+    config: MobileVaultConfig,
+    key: Vec<u8>,
+    path: String,
+) -> Result<Vec<u8>, MobileError> {
+    let keys = derive_keys(&key_bytes(key)?);
+    let config: VaultConfig = config.into();
+    block_on(ApiClient::new(config).get_trash(&path, &keys)).map_err(from_api)
 }
 
 // --- Accounts ---------------------------------------------------------------
@@ -388,13 +597,88 @@ pub fn canonical_server_url(url: String) -> String {
     normalize_server_url(&url)
 }
 
-/// Which sign-in methods a server offers (`GET /`).
+/// Which sign-in methods a server offers (`GET /`), and the wire format it
+/// speaks (`0` from a server too old to say).
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct MobileCapabilities {
     pub email: bool,
     pub apple: bool,
     /// New accounts need an invite code once the server has any user.
     pub invite_required: bool,
+    pub protocol: u32,
+}
+
+/// This phone as the server knows it (spec §4.1): the id the host keeps for
+/// good, a display name, and `ios`.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MobileDeviceIdentity {
+    pub id: String,
+    pub name: String,
+}
+
+impl MobileDeviceIdentity {
+    fn core(&self) -> Device {
+        Device {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            platform: DevicePlatform::Ios,
+        }
+    }
+}
+
+/// The wrapped account key as the server holds it (`GET /auth/keys`).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MobileAccountKeyBlob {
+    pub key_id: String,
+    pub wrapped: String,
+    pub salt: String,
+}
+
+/// What a first `set passphrase` did (spec §12.1).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum MobileKeysOutcome {
+    /// This device set the passphrase; `key` is the account key.
+    Created,
+    /// Another device set it first and the passphrase given opened its key.
+    Exists,
+    /// Another device set it first with a different passphrase: the host
+    /// turns the form into Unlock.
+    Mismatch,
+}
+
+#[derive(Clone, uniffi::Record)]
+pub struct MobileSetKeysResult {
+    pub outcome: MobileKeysOutcome,
+    /// The account key (empty on `Mismatch`).
+    pub key: Vec<u8>,
+    pub key_id: String,
+}
+
+impl std::fmt::Debug for MobileSetKeysResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MobileSetKeysResult")
+            .field("outcome", &self.outcome)
+            .field("key", &"..")
+            .field("key_id", &self.key_id)
+            .finish()
+    }
+}
+
+/// An unlocked account key with the server's `key_id`, so the host can tell
+/// later whether its stored key is still the account's.
+#[derive(Clone, uniffi::Record)]
+pub struct MobileUnlockedKey {
+    pub key: Vec<u8>,
+    pub key_id: String,
+}
+
+impl std::fmt::Debug for MobileUnlockedKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MobileUnlockedKey")
+            .field("key", &"..")
+            .field("key_id", &self.key_id)
+            .finish()
+    }
 }
 
 /// A signed-in session: `token` is the bearer to store in the Keychain.
@@ -464,12 +748,16 @@ impl From<obsink_core::Invite> for MobileInvite {
     }
 }
 
+/// A device of the account (`GET /auth/me`, spec §4.1).
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct MobileDevice {
-    pub session_id: String,
-    pub device_name: String,
+    pub id: String,
+    pub name: String,
+    pub platform: String,
     pub created: u64,
+    pub last_seen: u64,
     pub current: bool,
+    pub vault_ids: Vec<String>,
 }
 
 #[uniffi::export]
@@ -480,6 +768,7 @@ pub fn auth_capabilities(server_url: String) -> Result<MobileCapabilities, Mobil
         email: caps.auth.email,
         apple: caps.auth.apple,
         invite_required: caps.invite_required,
+        protocol: caps.protocol,
     })
 }
 
@@ -492,19 +781,20 @@ pub fn auth_email_start(server_url: String, email: String) -> Result<Option<Stri
     Ok(result.code)
 }
 
+/// Spec §4.1: sign in as this device; one session per device.
 #[uniffi::export]
 pub fn auth_email_verify(
     server_url: String,
     email: String,
     code: String,
-    device_name: String,
+    device: MobileDeviceIdentity,
     invite_code: Option<String>,
 ) -> Result<MobileSession, MobileError> {
-    // v2 device identity until OBS-142 (a stable device id per phone).
+    let device = device.core();
     let session = block_on(AuthClient::new(&server_url).email_verify(
         &email,
         &code,
-        SignInDevice::Legacy(&device_name),
+        SignInDevice::Device(&device),
         clean_invite(invite_code.as_deref()),
     ))
     .map_err(|error| from_auth(error, CallKind::SignIn))?;
@@ -522,15 +812,16 @@ fn clean_invite(code: Option<&str>) -> Option<&str> {
 pub fn auth_apple(
     server_url: String,
     identity_token: String,
-    device_name: String,
+    device: MobileDeviceIdentity,
     email: Option<String>,
     code: Option<String>,
     invite_code: Option<String>,
 ) -> Result<MobileSession, MobileError> {
+    let device = device.core();
     let session = block_on(
         AuthClient::new(&server_url).apple_sign_in(
             &identity_token,
-            SignInDevice::Legacy(&device_name),
+            SignInDevice::Device(&device),
             email.as_deref(),
             code.as_deref()
                 .map(str::trim)
@@ -546,21 +837,23 @@ pub fn auth_apple(
 pub fn auth_me(server_url: String, token: String) -> Result<MobileAccount, MobileError> {
     let me = block_on(AuthClient::new(&server_url).me(&token))
         .map_err(|error| from_auth(error, CallKind::Bearer))?;
-    let user = me.user.ok_or_else(|| {
-        MobileError::sync("this credential is the operator API key, not an account")
-    })?;
+    let user = me
+        .user
+        .ok_or_else(|| MobileError::sync("this session has no account behind it"))?;
     Ok(MobileAccount {
         user_id: user.id,
         email: user.email,
-        // The Swift side still says "session"; OBS-142 renames the record.
         devices: me
             .devices
             .into_iter()
             .map(|device| MobileDevice {
-                session_id: device.id,
-                device_name: device.name,
+                id: device.id,
+                name: device.name,
+                platform: device.platform,
                 created: device.created,
+                last_seen: device.last_seen,
                 current: device.current,
+                vault_ids: device.vault_ids,
             })
             .collect(),
         usage: me.usage.map(|usage| MobileUsage {
@@ -577,6 +870,112 @@ pub fn auth_me(server_url: String, token: String) -> Result<MobileAccount, Mobil
                 .collect(),
         }),
     })
+}
+
+/// The wrapped account key, or `None` before the first set (spec §12.1).
+#[uniffi::export]
+pub fn auth_get_keys(
+    server_url: String,
+    token: String,
+) -> Result<Option<MobileAccountKeyBlob>, MobileError> {
+    let blob = block_on(AuthClient::new(&server_url).get_keys(&token))
+        .map_err(|error| from_auth(error, CallKind::Bearer))?;
+    Ok(blob.map(|blob| MobileAccountKeyBlob {
+        key_id: blob.key_id,
+        wrapped: blob.wrapped,
+        salt: blob.salt,
+    }))
+}
+
+/// Spec §12.1: set the passphrase for the first time (create-only). On a
+/// lost race the winner's key is opened with the same passphrase; when that
+/// fails the outcome is `Mismatch` and the host asks for the passphrase.
+#[uniffi::export]
+pub fn auth_set_passphrase(
+    server_url: String,
+    token: String,
+    user_id: String,
+    passphrase: String,
+) -> Result<MobileSetKeysResult, MobileError> {
+    if passphrase.chars().count() < MIN_PASSPHRASE_CHARS {
+        return Err(MobileError::sync(format!(
+            "At least {MIN_PASSPHRASE_CHARS} characters."
+        )));
+    }
+    let (key, material) = create_account_key(&passphrase, &user_id)?;
+    let outcome = block_on(AuthClient::new(&server_url).set_keys(&token, &material))
+        .map_err(|error| from_auth(error, CallKind::Bearer))?;
+    Ok(match outcome {
+        SetKeysOutcome::Created { key_id } => MobileSetKeysResult {
+            outcome: MobileKeysOutcome::Created,
+            key: key.to_vec(),
+            key_id,
+        },
+        SetKeysOutcome::Exists(blob) => match blob.unlock(&passphrase, &user_id) {
+            Ok(key) => MobileSetKeysResult {
+                outcome: MobileKeysOutcome::Exists,
+                key: key.to_vec(),
+                key_id: blob.key_id,
+            },
+            Err(_) => MobileSetKeysResult {
+                outcome: MobileKeysOutcome::Mismatch,
+                key: Vec::new(),
+                key_id: blob.key_id,
+            },
+        },
+    })
+}
+
+/// Enter the passphrase on a device that does not hold the account key.
+#[uniffi::export]
+pub fn auth_unlock(
+    server_url: String,
+    token: String,
+    user_id: String,
+    passphrase: String,
+) -> Result<MobileUnlockedKey, MobileError> {
+    let blob = block_on(AuthClient::new(&server_url).get_keys(&token))
+        .map_err(|error| from_auth(error, CallKind::Bearer))?
+        .ok_or_else(|| MobileError::sync("Set a passphrase first."))?;
+    let key = blob
+        .unlock(&passphrase, &user_id)
+        .map_err(|_| MobileError::sync("Passphrase does not match this account."))?;
+    Ok(MobileUnlockedKey {
+        key: key.to_vec(),
+        key_id: blob.key_id,
+    })
+}
+
+/// DESIGN.md §5 `Change passphrase`: the current passphrase must open the
+/// stored blob; the account key stays, rewrapped under the new one.
+#[uniffi::export]
+pub fn auth_change_passphrase(
+    server_url: String,
+    token: String,
+    user_id: String,
+    account_key: Vec<u8>,
+    current: String,
+    next: String,
+) -> Result<(), MobileError> {
+    if next.chars().count() < MIN_PASSPHRASE_CHARS {
+        return Err(MobileError::sync(format!(
+            "At least {MIN_PASSPHRASE_CHARS} characters."
+        )));
+    }
+    let account_key = key_bytes(account_key)?;
+    let auth = AuthClient::new(&server_url);
+    let blob = block_on(auth.get_keys(&token))
+        .map_err(|error| from_auth(error, CallKind::Bearer))?
+        .ok_or_else(|| MobileError::sync("Set a passphrase first."))?;
+    let opened = blob
+        .unlock(&current, &user_id)
+        .map_err(|_| MobileError::sync("Passphrase does not match this account."))?;
+    if opened != account_key {
+        return Err(MobileError::sync("Passphrase does not match this account."));
+    }
+    let material = rewrap_account_key(&account_key, &next, &user_id)?;
+    block_on(auth.rewrap_keys(&token, &material))
+        .map_err(|error| from_auth(error, CallKind::Bearer))
 }
 
 /// Mint an invite code so someone else can create an account.
@@ -605,14 +1004,27 @@ pub fn auth_logout(server_url: String, token: String) -> Result<(), MobileError>
         .map_err(|error| from_auth(error, CallKind::Bearer))
 }
 
-/// Sign out another device of the same account (`DELETE /auth/sessions/:id`).
+/// Sign another device of the account out for good (`DELETE
+/// /auth/devices/:id`); its folders and keys stay where they are.
 #[uniffi::export]
-pub fn auth_revoke_session(
+pub fn auth_revoke_device(
     server_url: String,
     token: String,
-    session_id: String,
+    device_id: String,
 ) -> Result<(), MobileError> {
-    block_on(AuthClient::new(&server_url).revoke_device(&token, &session_id))
+    block_on(AuthClient::new(&server_url).revoke_device(&token, &device_id))
+        .map_err(|error| from_auth(error, CallKind::Bearer))
+}
+
+/// `PATCH /auth/devices/:id`.
+#[uniffi::export]
+pub fn auth_rename_device(
+    server_url: String,
+    token: String,
+    device_id: String,
+    name: String,
+) -> Result<(), MobileError> {
+    block_on(AuthClient::new(&server_url).rename_device(&token, &device_id, &name))
         .map_err(|error| from_auth(error, CallKind::Bearer))
 }
 
@@ -623,16 +1035,16 @@ pub fn auth_delete_account(server_url: String, token: String) -> Result<(), Mobi
         .map_err(|error| from_auth(error, CallKind::Bearer))
 }
 
-/// Delete a vault (and its server-side blobs) the bearer owns.
+/// Delete a vault (and its server-side blobs) the account owns.
 #[uniffi::export]
 pub fn delete_vault(
     server_url: String,
-    api_key: String,
+    bearer: String,
     vault_id: String,
 ) -> Result<(), MobileError> {
     let config = VaultConfig {
         server_url,
-        bearer: api_key,
+        bearer,
         vault_id,
         local_path: String::new(),
         device_id: None,
@@ -731,8 +1143,9 @@ fn to_mobile_failures(failures: &[SyncFailure]) -> Vec<MobileSyncFailure> {
         .collect()
 }
 
-/// Stateful sync client for one vault. Holds the derived key and the pending
-/// plan between `prepare` and `complete`.
+/// Stateful sync client for one vault. Holds the vault key and the pending
+/// plan between `prepare` and `complete`; with `config.device_id` set, every
+/// checkpoint reports its revision to the server (best effort, in core).
 #[derive(uniffi::Object)]
 pub struct VaultClient {
     config: VaultConfig,
@@ -742,7 +1155,8 @@ pub struct VaultClient {
 
 #[uniffi::export]
 impl VaultClient {
-    /// Build a client from config and a 32-byte master key (see `derive_master_key`).
+    /// Build a client from config and the 32-byte vault key (from `create_vault`
+    /// or `unwrap_vault_key`).
     #[uniffi::constructor]
     pub fn new(
         config: MobileVaultConfig,
@@ -952,9 +1366,10 @@ mod tests {
     fn records_redact_secrets_in_debug() {
         let config = MobileVaultConfig {
             server_url: "https://s.test".into(),
-            api_key: "secret-bearer-xyz".into(),
+            bearer: "secret-bearer-xyz".into(),
             vault_id: "vault_1".into(),
             local_path: "/tmp/v".into(),
+            device_id: Some("dev_1".into()),
         };
         let session = MobileSession {
             token: "bearer-secret".into(),
@@ -1012,6 +1427,44 @@ mod tests {
         assert!(matches!(
             from_sync(SyncEngineError::MissingResolution("a.md".into())),
             MobileError::Sync { message } if message.contains("a.md")
+        ));
+    }
+
+    #[test]
+    fn vault_keys_wrap_under_the_account_key() {
+        let account = new_vault_key();
+        let vault = new_vault_key();
+        assert_eq!(account.len(), 32);
+        let wrapped = wrap_vault_key_for(account.clone(), vault.clone(), "vault_a".into()).unwrap();
+        assert_eq!(
+            unwrap_vault_key(account.clone(), wrapped.clone(), "vault_a".into()).unwrap(),
+            vault
+        );
+        // The AAD is the vault id: another vault's id does not open it.
+        assert!(unwrap_vault_key(account.clone(), wrapped.clone(), "vault_b".into()).is_err());
+        assert!(unwrap_vault_key(new_vault_key(), wrapped, "vault_a".into()).is_err());
+        assert!(matches!(
+            wrap_vault_key_for(vec![1, 2, 3], vault, "vault_a".into()),
+            Err(MobileError::InvalidKey { length: 3 })
+        ));
+        assert_eq!(mobile_protocol_version(), 3);
+        assert!(new_device_id().starts_with("dev_"));
+    }
+
+    #[test]
+    fn a_protocol_mismatch_has_its_own_variant() {
+        assert!(matches!(
+            from_auth(
+                AuthError::ProtocolMismatch {
+                    server: 4,
+                    client: 3
+                },
+                CallKind::SignIn
+            ),
+            MobileError::ProtocolMismatch {
+                server: 4,
+                client: 3
+            }
         ));
     }
 
