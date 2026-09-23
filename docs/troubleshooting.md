@@ -17,18 +17,21 @@ The session was revoked (Sign out on another device, account deleted) or expired
 The server already has accounts, so a new one needs an invite. Ask any existing user for `obsink invite` (or the operator for `obsink-server invite`) and pass it with `--invite-code` / the Invite code field. `invite code is invalid, used, or expired` means the code was spent or is older than 7 days.
 
 **`404 vault not found`**
-The vault belongs to a different account (each principal sees only its own vaults), was deleted, or you are pointed at the wrong server URL. List vaults: `obsink vaults --server-url <url>`.
+The vault belongs to a different account (each account sees only its own vaults), was deleted, or you are pointed at the wrong server URL. List vaults: `obsink vaults --server-url <url>`.
 
 **`503 email sign-in is not configured on this server`**
 The operator has not set `SMTP_*`. Use Sign in with Apple on iOS, or ask the operator to configure SMTP (see [self-hosting.md](self-hosting.md)).
 
 ## Decryption / passphrase
 
-**Files download but contents look like garbage, or `crypto error: decryption failed`**
-The passphrase (and thus the derived key) doesn't match the one used to upload. The passphrase + vault ID are the only inputs to key derivation — a different passphrase produces a different key and AES-GCM authentication fails. Re-connect with the correct passphrase.
+**`passphrase does not match this account` at Unlock**
+The server checks a verifier derived from the account key before it hands anything over, so a wrong passphrase is refused here and never reaches a vault. Every device of the account uses the same passphrase; `obsink passphrase` (or Settings > Change passphrase) changes it for all of them, since the key underneath stays the same.
 
-**A freshly connected device shows no files even though the vault has data**
-`get_manifest` skips entries whose `encPath` it can't decrypt (wrong key). If *all* entries are skipped, the key is wrong for this vault. Verify the passphrase; check that you connected to the intended vault ID.
+**Files download but contents look like garbage, or `crypto error: decryption failed`**
+The vault key saved on this device is not the one the account holds for that vault (the vault was deleted and created again under the same folder, or the key was saved by a build from before wire format v3). Remove the vault from this device and `Download` it again: the key is unwrapped from the account's copy.
+
+**A freshly downloaded device shows no files even though the vault has data**
+`get_manifest` skips entries whose `encPath` it can't decrypt (wrong key). If *all* entries are skipped, the key is wrong for this vault: same fix as above.
 
 **`security` keychain errors on the CLI (macOS)**
 Key storage uses the login Keychain. If you've overridden `HOME` (e.g. in a script), the Keychain can't be found — use `OBSINK_HOME` to relocate config instead of `HOME`, which leaves Keychain resolution intact.
@@ -76,16 +79,19 @@ Pruning runs in-process at startup and every `RETENTION_INTERVAL_SECS` (`_versio
 
 ## Wire-format mismatch
 
+**`Update ObSink to continue` (apps) or `400 update ObSink to continue` (CLI)**
+The wire format is versioned (`PROTOCOL_VERSION`; `GET /` reports the server's). A client older than the server is refused before any sign-in code is spent. Install the current release (`curl -fsSL https://obsink.spencerjireh.com/install.sh | sh` for the CLI, the DMG for the desktop app, TestFlight for iOS).
+
 **After upgrading, an existing vault won't sync or paths look wrong**
-The manifest wire format is versioned (`PROTOCOL_VERSION`). A format change (e.g. the v2 HMAC-hash + encrypted-path migration) invalidates old manifests. Re-initialize the vault: delete it on the server (`DELETE /vaults/:id`, or from the app), then `init`/`connect` fresh.
+A format change invalidates old manifests; v3 replaced the whole schema, so a server upgraded across it starts empty (see [self-hosting.md](self-hosting.md) §7). Create the vault again with `init` and download it on the other devices.
 
 ## Browser client
 
 **`/app` says the browser is not supported**
 Folder sync needs the File System Access API, which Chrome, Edge and other Chromium browsers provide over HTTPS only. Safari and Firefox do not; use the desktop app, the CLI or the iOS app. A self-hosted copy served over plain HTTP shows the same page with a note about HTTPS.
 
-**`Needs passphrase` after a reload**
-The derived key lives only in the worker's memory; nothing about the passphrase is stored in the browser. Type it into the Unlock field on the vault page. The bearer, the vault list and the sync bookkeeping survive the reload (IndexedDB), so nothing else is lost.
+**`Locked` after a reload**
+The account key lives only in the worker's memory; nothing about the passphrase is stored in the browser. Enter the account passphrase in `Unlock`. The bearer, the device id, the vault list and the sync bookkeeping survive the reload (IndexedDB), so nothing else is lost.
 
 **`Needs folder access`**
 Chrome grants access to a picked folder per session. Press `Allow access` on the vault page and accept the prompt; the folder itself is remembered. If the folder was moved or deleted, remove the vault and add it again.
