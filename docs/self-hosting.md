@@ -39,7 +39,6 @@ Every setting is an environment variable. Defaults are in `server/src/config.rs`
 | `DATABASE_URL` | required | Postgres connection string |
 | `OBSINK_DATA_DIR` | `/data` | Blob volume; also holds `server.key` when the key is not set |
 | `OBSINK_SERVER_KEY` | generated | 32-byte base64 envelope key (`obsink-server keygen`). **Back it up**: metadata is unreadable without it |
-| `OBSINK_API_KEY` | unset | Operator bearer for the admin CLI and `scripts/verify-*`. Unset disables it |
 | `SMTP_HOST`, `SMTP_PORT` (587), `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM`, `SMTP_TLS` (`starttls`\|`tls`\|`none`) | unset | Email one-time codes. Unset = email sign-in disabled |
 | `APPLE_CLIENT_IDS` | `com.obsink.ios` | Accepted audiences for Sign in with Apple; empty disables it |
 | `AUTH_DEV_RETURN_CODE` | unset | `1` returns the email code in the API response. **Never in production** |
@@ -66,7 +65,6 @@ audience is the ObSink app's bundle id, which the server verifies against Apple'
    - `OBSINK_SERVER_KEY` — run `cargo run -p obsink-server -- keygen` in a checkout (or
      `docker compose run --rm --no-deps server keygen` once the local stack image is built) and
      paste the output. Store it somewhere safe.
-   - `OBSINK_API_KEY` — `openssl rand -hex 32`.
    - `POSTGRES_PASSWORD` — `openssl rand -hex 24`.
    - `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM`, `SMTP_TLS` — from your
      mail provider.
@@ -106,15 +104,18 @@ Friends enter the code in the "Invite code" field when they sign in for the firs
 
 ## 5. Verify
 
-With `.env.deploy` holding `OBSINK_SERVER_URL` and `OBSINK_API_KEY` (see `.env.deploy.example`):
+There is no operator principal: the harnesses sign in as an account. Sign a
+harness account up once (`obsink login`, with an invite when the server already
+has accounts) and put its session token and passphrase into `.env.deploy` as
+`OBSINK_BEARER` and `OBSINK_PASSPHRASE` (see `.env.deploy.example`), then:
 
 ```bash
 set -a; . ./.env.deploy; set +a
-scripts/verify-server-deploy.sh        # contract: vaults, manifest ETag, conflict 409, batch, invites
-scripts/verify-cli-deployed-sync.sh    # two CLI "devices" sync and resolve a conflict
+scripts/verify-server-deploy.sh        # contract: protocol, keys, devices, vault list, manifest ETag, conflict 409, batch, history, invites
+scripts/verify-cli-deployed-sync.sh    # two CLI "devices" of that account create, download, sync, resolve a conflict, restore
 ```
 
-Both create and delete their own vaults under the operator principal.
+Both create and delete their own vaults under the harness account.
 
 ## 6. Without SMTP
 

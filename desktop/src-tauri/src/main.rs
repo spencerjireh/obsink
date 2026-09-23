@@ -27,8 +27,7 @@ use obsink_core::{
     write_atomic, ApiClient, ApiError, AuthClient, AuthError, Conflict, ConflictResolution,
     CreateVaultRequest, DaemonCallError, DaemonEvent, DaemonHandle, DaemonOptions, Device,
     DevicePlatform, KeyBytes, ManifestDiff, ProgressEvent, ProgressSink, SetKeysOutcome,
-    SignInDevice, SyncEngineError, SyncPlan, SyncResult, VaultConfig, VaultSummary,
-    PROTOCOL_VERSION,
+    SyncEngineError, SyncPlan, SyncResult, VaultConfig, VaultSummary, PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
 
@@ -558,12 +557,7 @@ async fn auth_email_verify_inner(
         .filter(|code| !code.is_empty());
     let device = this_device(&server_url)?;
     let session = AuthClient::new(&server_url)
-        .email_verify(
-            email.trim(),
-            code.trim(),
-            SignInDevice::Device(&device),
-            invite,
-        )
+        .email_verify(email.trim(), code.trim(), &device, invite)
         .await?;
     save_secret(&bearer_account(&server_url), &session.token)?;
     save_secret(&user_account(&server_url), &session.user.id)?;

@@ -186,6 +186,16 @@ final class SyncModel: ObservableObject {
             for key in defaults.dictionaryRepresentation().keys where key.hasPrefix(Self.lastSyncedPrefix) {
                 defaults.removeObject(forKey: key)
             }
+            // The simulator's Keychain survives a reinstall: start signed out.
+            let url = ServerConfig.defaultURL
+            if let user = KeychainStore.loadUserID(serverURL: url) {
+                KeychainStore.deleteAccountKey(userID: user)
+            }
+            KeychainStore.deleteBearer(serverURL: url)
+            KeychainStore.delete(account: KeychainStore.userAccount(for: url))
+            for entry in Self.loadEntries(from: UserDefaults(suiteName: Self.appGroup) ?? .standard) {
+                KeychainStore.delete(account: entry.vaultID)
+            }
         }
         self.guidanceDismissed = defaults.bool(forKey: Self.guidanceDismissedKey)
         self.resetFileProviderDomain = resetForUITest

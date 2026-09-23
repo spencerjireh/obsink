@@ -27,6 +27,7 @@ obsink vaults                                     # every vault, with its state 
 obsink init     --vault-name <name> --directory <path>
 obsink download --vault-id <id>     --directory <path>   # alias: connect
 obsink rename --name <name>
+obsink unlock                     # enter the passphrase on a machine that holds a session but not the key
 obsink logout
 
 obsink sync                       # full sync cycle; prompts to resolve conflicts
@@ -38,7 +39,7 @@ obsink restore <path> [--version <name>]   # back into the folder; `sync` upload
 ```
 
 - `--server-url` also reads `OBSINK_SERVER_URL`; after the first command it defaults to the URL in the saved config, and before any config exists to the public server `https://obsink-api.spencerjireh.com` (a self-hosted build bakes its own by setting `OBSINK_SERVER_URL` at compile time, as the desktop app does). There is no operator bearer: scripts sign in as an account too.
-- `OBSINK_PASSPHRASE` supplies the passphrase for `login` and `passphrase` (scripts); `OBSINK_DEVICE_ID` fixes the device id (the two-device harnesses give each side its own).
+- `OBSINK_PASSPHRASE` supplies the passphrase for `login`, `unlock` and `passphrase` (scripts); `OBSINK_DEVICE_ID` fixes the device id (the two-device harnesses give each side its own). A session seeded into the keyring without a sign-in (the harnesses' `OBSINK_BEARER`) has no user id recorded; `unlock` asks the server once and keeps it.
 - Config lives at `~/.obsink/config.toml` (server URL, vault ID, local path — **no secrets**). Set `OBSINK_HOME` to relocate it (used for per-device isolation in tests). Configs written before the server pivot (`worker_url`) still load.
 - The macOS Keychain (service `obsink`) holds the vault key (account = vault ID), the server bearer (`bearer:<server url>`), the signed-in user id (`user:<server url>`), the account key (`account:<user id>`) and the device id (`device:<server url>`, shared with the desktop app so one Mac is one device). `OBSINK_KEYRING_DIR=<dir>` swaps it for a directory of files (CI, harnesses).
 - Each vault directory keeps `.obsink/manifest.json` (last completed sync), `.obsink/remote-manifest.json` (last server manifest + ETag, so an unchanged manifest costs a `304`) and `.obsink/hash-cache.json` (the `(mtime, size) → hash` memo).
@@ -148,7 +149,7 @@ xcodebuild test -project ios/ObSink.xcodeproj -scheme ObSink -sdk iphonesimulato
 The Mac↔iOS scenarios are automated end to end on a simulator against a running server (start one with `docker compose up -d`):
 
 ```bash
-# Uses .env.deploy (OBSINK_SERVER_URL, OBSINK_API_KEY, DEVELOPMENT_TEAM) and a throwaway vault.
+# Uses .env.deploy (OBSINK_SERVER_URL, OBSINK_INVITE_CODE, DEVELOPMENT_TEAM) and a throwaway account and vault.
 OBSINK_SIM_NAME=obsink-e2e ./scripts/verify-ios-sim-e2e.sh
 ```
 

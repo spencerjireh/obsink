@@ -70,11 +70,17 @@ const idbGet = ([store, key]) =>
       request.onerror = () => reject(request.error)
     }
   })
-// The page has opened (and versioned) the database by the time this runs,
-// so no version is passed: the client owns the schema.
+// No version is pinned (the client owns the schema and upgrades it); the
+// stores are created only when this open is the first one, so a page whose
+// worker has not opened the database yet still gets a usable store.
 const idbPut = ([store, key, value]) =>
   new Promise((resolve, reject) => {
     const open = indexedDB.open('obsink')
+    open.onupgradeneeded = () => {
+      for (const name of ['kv', 'vaults', 'handles', 'state', 'activity']) {
+        if (!open.result.objectStoreNames.contains(name)) open.result.createObjectStore(name)
+      }
+    }
     open.onerror = () => reject(open.error)
     open.onsuccess = () => {
       const request = open.result.transaction(store, 'readwrite').objectStore(store).put(value, key)

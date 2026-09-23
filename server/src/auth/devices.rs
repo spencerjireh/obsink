@@ -10,10 +10,8 @@ use crate::{crypto::ServerKeys, db, error::ApiError};
 const MAX_DEVICE_NAME: usize = 80;
 const MAX_DEVICE_ID: usize = 64;
 
-/// The platforms a client may report. `unknown` is transitional: a sign-in
-/// that carries no `device` object (a v2 client) gets a synthesized device
-/// until OBS-143 makes the object required.
-pub const PLATFORMS: &[&str] = &["macos", "ios", "browser", "cli", "unknown"];
+/// The platforms a client may report (spec §4.1).
+pub const PLATFORMS: &[&str] = &["macos", "ios", "browser", "cli"];
 
 /// The `device` object of a sign-in body.
 #[derive(Debug, Clone, Deserialize)]
@@ -29,6 +27,14 @@ pub struct DeviceIdentity {
     pub id: String,
     pub name: String,
     pub platform: String,
+}
+
+/// The `device` object a sign-in must carry; its absence is a client from
+/// before wire format v3 (spec §4.1).
+pub fn required(device: Option<DeviceBody>) -> Result<DeviceIdentity, ApiError> {
+    device
+        .ok_or_else(|| ApiError::bad_request("update ObSink to continue"))?
+        .validate()
 }
 
 impl DeviceBody {
@@ -55,16 +61,6 @@ impl DeviceBody {
             name: clean_device_name(self.name.as_deref()),
             platform,
         })
-    }
-}
-
-/// The device a v2 client gets: one fresh row per sign-in, so the old
-/// "every sign-in is a session" behaviour survives until the client moves.
-pub fn legacy_device(device_name: Option<&str>) -> DeviceIdentity {
-    DeviceIdentity {
-        id: crate::crypto::new_id("legacy"),
-        name: clean_device_name(device_name),
-        platform: "unknown".to_string(),
     }
 }
 
@@ -205,22 +201,6 @@ pub async fn delete(
     Ok(())
 }
 
-/// The device a session belongs to (the `/auth/sessions/{id}` alias kept for
-/// v2 clients until OBS-143).
-pub async fn device_of_session(
-    conn: &mut PgConnection,
-    user_id: &str,
-    session_id: &str,
-) -> Result<Option<String>, ApiError> {
-    let row: Option<(String,)> =
-        sqlx::query_as("SELECT device_id FROM sessions WHERE id = $1 AND user_id = $2")
-            .bind(session_id)
-            .bind(user_id)
-            .fetch_optional(conn)
-            .await?;
-    Ok(row.map(|(device_id,)| device_id))
-}
-
 /// Bump `last_seen` (sign-in and the checkpoint report, never per request).
 pub async fn touch(
     conn: &mut PgConnection,
@@ -275,10 +255,12 @@ mod tests {
         .validate()
         .unwrap();
         assert_eq!(unnamed.name, "device");
-
-        let legacy = legacy_device(Some("old phone"));
-        assert!(legacy.id.starts_with("legacy_"));
-        assert_eq!(legacy.platform, "unknown");
-        assert_eq!(legacy.name, "old phone");
+        assert!(DeviceBody {
+            id: Some("x".into()),
+            name: None,
+            platform: Some("unknown".into()),
+        }
+        .validate()
+        .is_err());
     }
 }

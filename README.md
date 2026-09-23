@@ -57,8 +57,8 @@ in [docs/architecture.md](docs/architecture.md).
 
 ## Server API
 
-Bearer-token auth on every vault route (a session token, or the operator `OBSINK_API_KEY` for
-scripts). Full contract in [spec.md §4](spec.md).
+Bearer-token auth on every vault route (a session token; every principal is an account, and the
+harness scripts sign in as one). Full contract in [spec.md §4](spec.md).
 
 | Method | Path | Purpose |
 |---|---|---|

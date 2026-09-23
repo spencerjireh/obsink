@@ -103,6 +103,8 @@ struct DevicesView: View {
             .font(.caption)
         }
         .padding(.vertical, 4)
+        // A container: the tag and the buttons stay reachable by their ids.
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("deviceRow")
     }
 

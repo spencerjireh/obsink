@@ -97,7 +97,6 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/keys", get(auth::keys::get).put(auth::keys::set))
         .route("/auth/keys/rewrap", put(auth::keys::rewrap))
         .route("/auth/session", delete(me::sign_out))
-        .route("/auth/sessions/{session_id}", delete(me::revoke_session))
         .route(
             "/auth/devices/{device_id}",
             patch(me::rename_device).delete(me::revoke_device),

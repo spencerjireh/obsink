@@ -81,12 +81,15 @@ async fn enforces_the_per_account_vault_limit_and_per_vault_byte_budget() {
     else {
         return;
     };
-    let user = env.sign_in("quota@example.com", "q", None).await.token;
+    let user = env
+        .sign_in_unlocked("quota@example.com", "q", None)
+        .await
+        .token;
     let first = env.create_vault(&user, "one").await;
     env.create_vault(&user, "two").await;
     let third = env
         .with_token(&user, Method::POST, "/vaults")
-        .json(&serde_json::json!({ "name": "three" }))
+        .json(&serde_json::json!({ "name": "three", "wrapped_key": TestEnv::wrapped_key() }))
         .send()
         .await
         .unwrap();

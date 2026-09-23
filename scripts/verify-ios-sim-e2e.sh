@@ -1,20 +1,25 @@
 #!/usr/bin/env bash
 #
-# Simulator E2E for the Mac↔iOS checklist (OBS-29–34).
+# Simulator E2E for the Mac↔iOS checklist (OBS-29–34) on wire format v3.
 #
 # "Device A" is the CLI (the reference client) driven from this script against
 # a running server; "device B" is the ObSink app + File Provider on an iOS
 # simulator, driven through the XCUITest phases in ios/UITests/SyncE2ETests.swift.
-# On-disk state on the iOS side is verified straight through the app-group
-# container (`simctl get_app_container … groups`), which the host can read.
+# Both are devices of one account: A signs it up (setting the passphrase) and
+# creates the vault; B signs in through the UI, unlocks with the passphrase
+# and downloads the vault, then the later phases run with A's session and the
+# account key seeded so each one is independent. On-disk state on the iOS
+# side is verified straight through the app-group container
+# (`simctl get_app_container … groups`), which the host can read.
 #
-# Requires: .env.deploy at the repo root (OBSINK_SERVER_URL, OBSINK_API_KEY,
-# DEVELOPMENT_TEAM), a server reachable at OBSINK_SERVER_URL started with the
-# same OBSINK_API_KEY (e.g. `docker compose up -d`), a built xcframework +
-# generated project (scripts/build-ios.sh), and Xcode.
+# Requires: .env.deploy at the repo root (OBSINK_SERVER_URL, DEVELOPMENT_TEAM,
+# and OBSINK_INVITE_CODE when the server already has accounts), a server
+# reachable at OBSINK_SERVER_URL started with AUTH_DEV_RETURN_CODE=1 (the
+# local compose stack; the app fills the emailed code in by itself), a built
+# xcframework + generated project (scripts/build-ios.sh), and Xcode.
 #
 # Usage: scripts/verify-ios-sim-e2e.sh [work-dir]
-# The work dir (default: mktemp) holds device A's vault + config and all logs.
+# The work dir (default: mktemp) holds device A's vault, config, keyring and all logs.
 
 set -euo pipefail
 
@@ -31,17 +36,26 @@ APP_BUNDLE_ID="com.obsink.ios"
 
 mkdir -p "$WORK"
 exec > >(tee "$WORK/run.log") 2>&1
-set -a; . "$REPO_ROOT/.env.deploy"; set +a
+# Explicit variables win over .env.deploy (which usually names production).
+EXPLICIT_SERVER_URL="${OBSINK_SERVER_URL:-}"
+EXPLICIT_INVITE_CODE="${OBSINK_INVITE_CODE:-}"
+if [ -f "$REPO_ROOT/.env.deploy" ]; then
+    set -a; . "$REPO_ROOT/.env.deploy"; set +a
+fi
 export DEVELOPMENT_TEAM="${DEVELOPMENT_TEAM:-}"
+OBSINK_INVITE_CODE="${EXPLICIT_INVITE_CODE:-${OBSINK_INVITE_CODE:-}}"
 # Baked into the app by xcodegen below; the UI tests also pass it at launch
 # (OBSINK_UITEST_SERVER_URL), so the phases do not depend on the baked value.
-export OBSINK_SERVER_URL="${OBSINK_SERVER_URL:-}"
+export OBSINK_SERVER_URL="${EXPLICIT_SERVER_URL:-${OBSINK_SERVER_URL:-http://localhost:18080}}"
+SERVER_URL="${OBSINK_SERVER_URL%/}"
 
 VAULT_NAME="e2e-sim-$(date +%s)"
-PASSPHRASE="$(openssl rand -hex 16)"
+EMAIL="ios-e2e-$(date +%s)@example.test"
+PASSPHRASE="e2e-$(openssl rand -hex 8)"
 A_HOME="$WORK/deviceA"
 A_VAULT="$A_HOME/vault"
-mkdir -p "$A_VAULT"
+A_KEYRING="$A_HOME/keyring"
+mkdir -p "$A_VAULT" "$A_KEYRING"
 
 PASS_COUNT=0
 FAIL_COUNT=0
@@ -49,8 +63,17 @@ step() { printf '\n==> %s\n' "$*"; }
 pass() { printf 'PASS: %s\n' "$*"; PASS_COUNT=$((PASS_COUNT+1)); }
 fail() { printf 'FAIL: %s\n' "$*"; FAIL_COUNT=$((FAIL_COUNT+1)); }
 
+# Device A: its own config home, file keyring, device id and the passphrase.
 cli() {
-    OBSINK_HOME="$A_HOME" cargo run -q -p obsink -- "$@"
+    OBSINK_HOME="$A_HOME" OBSINK_KEYRING_DIR="$A_KEYRING" OBSINK_DEVICE_ID="e2e-cli" \
+        OBSINK_PASSPHRASE="$PASSPHRASE" OBSINK_SERVER_URL="$SERVER_URL" \
+        "$REPO_ROOT/target/debug/obsink" "$@"
+}
+
+# The file keyring names entries after the keychain account with `/` and `:`
+# flattened (core `keychain::keyring_file`).
+keyring_entry() {
+    cat "$A_KEYRING/$(printf '%s' "$1" | tr '/:' '__')"
 }
 
 # Run one XCUITest phase; extra env for the app goes via TEST_RUNNER_*.
@@ -60,11 +83,17 @@ run_test() {
     RUN_N=$((RUN_N+1))
     local log="$WORK/xcuitest-$(printf '%02d' "$RUN_N")-$test_name.log"
     if env "$@" \
-        TEST_RUNNER_OBSINK_TEST_SERVER_URL="$OBSINK_SERVER_URL" \
-        TEST_RUNNER_OBSINK_TEST_API_KEY="$OBSINK_API_KEY" \
+        TEST_RUNNER_OBSINK_TEST_SERVER_URL="$SERVER_URL" \
+        TEST_RUNNER_OBSINK_TEST_EMAIL="$EMAIL" \
+        TEST_RUNNER_OBSINK_TEST_PASSPHRASE="$PASSPHRASE" \
+        TEST_RUNNER_OBSINK_TEST_BEARER="$BEARER" \
+        TEST_RUNNER_OBSINK_TEST_USER_ID="$USER_ID" \
+        TEST_RUNNER_OBSINK_TEST_ACCOUNT_KEY="$ACCOUNT_KEY" \
+        TEST_RUNNER_OBSINK_TEST_ACCOUNT_KEY_ID="$ACCOUNT_KEY_ID" \
+        TEST_RUNNER_OBSINK_TEST_SEED_ACCOUNT="$SEED_ACCOUNT" \
         TEST_RUNNER_OBSINK_TEST_VAULT_ID="$VAULT_ID" \
         TEST_RUNNER_OBSINK_TEST_VAULT_NAME="$VAULT_NAME" \
-        TEST_RUNNER_OBSINK_TEST_PASSPHRASE="$PASSPHRASE" \
+        TEST_RUNNER_OBSINK_TEST_VAULT_KEY="$VAULT_KEY" \
         xcodebuild test-without-building \
             -xctestrun "$XCTESTRUN" \
             -destination "platform=iOS Simulator,name=$SIM_NAME" \
@@ -88,7 +117,8 @@ step "Booting simulator '$SIM_NAME'"
 xcrun simctl boot "$SIM_NAME" 2>/dev/null || true
 xcrun simctl bootstatus "$SIM_NAME" -b >/dev/null
 
-step "Building app + UI tests for testing (signed, team=${DEVELOPMENT_TEAM:-none})"
+step "Building the CLI, the app and the UI tests for testing (signed, team=${DEVELOPMENT_TEAM:-none})"
+( cd "$REPO_ROOT" && cargo build -q -p obsink )
 ( cd "$REPO_ROOT/ios" && xcodegen generate >/dev/null )
 xcodebuild build-for-testing \
     -project "$REPO_ROOT/ios/ObSink.xcodeproj" -scheme ObSink \
@@ -101,34 +131,74 @@ step "Fresh app install"
 xcrun simctl uninstall "$SIM_NAME" "$APP_BUNDLE_ID" 2>/dev/null || true
 xcrun simctl install "$SIM_NAME" "$DERIVED/Build/Products/Debug-iphonesimulator/ObSink.app"
 
-step "Device A: init vault '$VAULT_NAME' with starter files"
+step "Device A: sign up '$EMAIL' (sets the passphrase), init vault '$VAULT_NAME' with starter files"
+INVITE_ARGS=()
+[ -n "${OBSINK_INVITE_CODE:-}" ] && INVITE_ARGS=(--invite-code "$OBSINK_INVITE_CODE")
+cli login --email "$EMAIL" --device-name "CLI (device A)" "${INVITE_ARGS[@]}" >"$WORK/cli-login.log" 2>&1 \
+    || { cat "$WORK/cli-login.log"; exit 1; }
+LOGIN_AT="$(date +%s)"
 echo "# Hello from Mac" > "$A_VAULT/hello.md"
 mkdir -p "$A_VAULT/notes"
 echo "note one" > "$A_VAULT/notes/note1.md"
-cli init --server-url "$OBSINK_SERVER_URL" --api-key "$OBSINK_API_KEY" \
-    --vault-name "$VAULT_NAME" --directory "$A_VAULT" --passphrase "$PASSPHRASE" \
-    >"$WORK/cli-init.log" 2>&1
+cli init --vault-name "$VAULT_NAME" --directory "$A_VAULT" >"$WORK/cli-init.log" 2>&1 \
+    || { cat "$WORK/cli-init.log"; exit 1; }
 VAULT_ID="$(sed -n 's/^vault_id = "\(.*\)"/\1/p' "$A_HOME/.obsink/config.toml")"
 [ -n "$VAULT_ID" ] || { echo "no vault id"; exit 1; }
 echo "vault: $VAULT_ID"
 
-# ---------- OBS-28/OBS-29 setup: connect through the Add Vault UI ----------
-step "OBS-29 (1/2): connect vault through the app UI"
-if run_test testConnectVaultFlow; then pass "Add Vault → Connect flow"; else fail "Add Vault → Connect flow"; fi
+# What device B's seeded phases need, straight from A's keyring (spec §6.3).
+BEARER="$(keyring_entry "bearer:$SERVER_URL")"
+USER_ID="$(keyring_entry "user:$SERVER_URL")"
+ACCOUNT_ENTRY="$(keyring_entry "account:$USER_ID")"
+ACCOUNT_KEY="${ACCOUNT_ENTRY%%:*}"
+ACCOUNT_KEY_ID="${ACCOUNT_ENTRY#*:}"
+VAULT_KEY="$(keyring_entry "$VAULT_ID")"
+[ ${#ACCOUNT_KEY} -eq 64 ] && [ ${#VAULT_KEY} -eq 64 ] || { echo "keyring entries not found"; exit 1; }
 
-step "OBS-29 (2/2): sync pulls Mac-created notes to iOS"
-if run_test testSyncNow; then
+# The phases after the sign-in one reuse the phone's own session; when that
+# phase fails, device A's session is seeded so the rest still runs.
+SEED_ACCOUNT=0
+
+# The vault is deleted at the end whatever happens.
+cleanup() {
+    if [ -n "${VAULT_ID:-}" ]; then
+        curl -s -o /dev/null -w "cleanup: DELETE vault $VAULT_ID -> %{http_code}\n" -X DELETE \
+            "$SERVER_URL/vaults/$VAULT_ID" -H "Authorization: Bearer $BEARER" || true
+    fi
+}
+trap cleanup EXIT
+
+# ---------- Spec §12.1 / §12.3: sign in, unlock and download through the app UI ----------
+step "Spec §12: device B signs in, unlocks with the passphrase and downloads the vault"
+# The server refuses a second code for one address within 60 s of device A's.
+WAIT=$((LOGIN_AT + 61 - $(date +%s)))
+[ "$WAIT" -gt 0 ] && { echo "waiting ${WAIT}s for the email cooldown"; sleep "$WAIT"; }
+if run_test testSignInUnlockAndDownload; then
     B_VAULT="$(app_vault_dir)/Vault/$VAULT_ID"
     if [ "$(cat "$B_VAULT/hello.md" 2>/dev/null)" = "# Hello from Mac" ] \
         && [ "$(cat "$B_VAULT/notes/note1.md" 2>/dev/null)" = "note one" ]; then
-        pass "OBS-29: Mac → server → iOS propagation"
+        pass "Spec §12: sign in, unlock, download; OBS-29: Mac → server → iOS propagation"
     else
         fail "OBS-29: files missing/incorrect in app container ($B_VAULT)"
     fi
 else
-    fail "OBS-29: sync failed"
+    fail "Spec §12: sign in / unlock / download flow"
+    SEED_ACCOUNT=1
 fi
 B_VAULT="$(app_vault_dir)/Vault/$VAULT_ID"
+
+# ---------- Spec §15.3: the Devices tab ----------
+step "Spec §15.3: the Devices tab lists device A and this phone"
+if run_test testDevicesTabListsBothDevices; then
+    pass "Spec §15.3: both devices listed"
+else
+    fail "Spec §15.3: devices tab"
+fi
+if cli devices | grep -q "e2e-sim"; then
+    pass "Spec §4.1: device A sees device B on the account"
+else
+    fail "Spec §4.1: device B missing from the CLI's device list"
+fi
 
 # ---------- OBS-19 (sim half) / OBS-29: Files app shows the vault ----------
 # Known limitation: on the iOS 26 simulator, fileproviderd never instantiates
@@ -249,9 +319,10 @@ EOF
 cli sync >"$WORK/cli-obs34.log" 2>&1
 if run_test testSyncNow; then
     # Compare files only: manifests don't track directories, so an empty dir
-    # left behind by a deletion is expected to differ between devices.
-    ( cd "$A_VAULT" && find . -type f ! -path "./.obsink/*" ! -name .DS_Store | sort ) >"$WORK/obs34-a.txt"
-    ( cd "$B_VAULT" && find . -type f ! -path "./.obsink/*" ! -name .DS_Store | sort ) >"$WORK/obs34-b.txt"
+    # left behind by a deletion is expected to differ between devices; the
+    # workspace files never sync (the built-in ignore list).
+    ( cd "$A_VAULT" && find . -type f ! -path "./.obsink/*" ! -name .DS_Store ! -name 'workspace*.json' | sort ) >"$WORK/obs34-a.txt"
+    ( cd "$B_VAULT" && find . -type f ! -path "./.obsink/*" ! -name .DS_Store ! -name 'workspace*.json' | sort ) >"$WORK/obs34-b.txt"
     OBS34_OK=1
     diff "$WORK/obs34-a.txt" "$WORK/obs34-b.txt" >"$WORK/obs34-diff.log" 2>&1 || OBS34_OK=0
     if [ "$OBS34_OK" = 1 ]; then
@@ -269,9 +340,9 @@ else
 fi
 
 # ===== OBS-100: Remove from this device =====
-# The vault leaves the app; its cache directory, item database, and File
-# Provider location go with it. The server copy stays (the cleanup below
-# deletes it).
+# The vault leaves the phone; its cache directory, item database, and File
+# Provider location go with it, the server drops this device from the vault,
+# and the card offers Download again.
 step "OBS-100: remove the vault from the device"
 if run_test testRemoveVaultFromDevice; then
     APP_GROUP="$(app_vault_dir)"
@@ -283,14 +354,14 @@ if run_test testRemoveVaultFromDevice; then
     else
         fail "OBS-100: leftovers after removal:$LEFT"
     fi
+    if cli vaults | grep "$VAULT_ID" | grep -q "1 device(s)"; then
+        pass "Spec §4.3: the server no longer lists device B on the vault"
+    else
+        fail "Spec §4.3: device B still attached after removal: $(cli vaults | grep "$VAULT_ID")"
+    fi
 else
     fail "OBS-100: remove-vault UI phase failed"
 fi
 
-# Remove this run's vault so the operator vault list does not grow per run.
-if [ -n "${VAULT_ID:-}" ]; then
-    curl -s -o /dev/null -w "cleanup: DELETE vault $VAULT_ID -> %{http_code}\n" -X DELETE \
-        "${OBSINK_SERVER_URL%/}/vaults/$VAULT_ID" -H "Authorization: Bearer $OBSINK_API_KEY" || true
-fi
 printf '\n==== Result: %d passed, %d failed. Logs: %s ====\n' "$PASS_COUNT" "$FAIL_COUNT" "$WORK"
 [ "$FAIL_COUNT" -eq 0 ]
