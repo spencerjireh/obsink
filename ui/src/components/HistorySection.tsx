@@ -1,8 +1,10 @@
 import { useEffect, useState } from 'react'
 import type { FilePreview, TrashEntry, VersionInfo } from '../types'
 import { useBackend } from '../backend'
+import { toCommandError } from '../lib/errors'
 import { formatBytes, formatRelative } from '../lib/format'
 import { EmptyState } from './EmptyState'
+import { Notice } from './Notices'
 
 type Props = {
   vaultId: string
@@ -27,26 +29,30 @@ export function HistorySection({ vaultId, busy, notify, onError }: Props) {
     null,
   )
   const [working, setWorking] = useState(false)
+  // A failed read stays in this section: the page's notice is for actions,
+  // and a vault on its way out (removed, deleted) must not overwrite it.
+  const [loadError, setLoadError] = useState('')
 
   useEffect(() => {
     let cancelled = false
+    const failed = (error: unknown) => {
+      if (!cancelled) setLoadError(toCommandError(error).message)
+    }
     void backend
       .listFiles(vaultId)
       .then((next) => {
         if (!cancelled) setFiles(next)
       })
-      .catch(onError)
+      .catch(failed)
     void backend
       .listTrash(vaultId)
       .then((next) => {
         if (!cancelled) setTrash(next)
       })
-      .catch(onError)
+      .catch(failed)
     return () => {
       cancelled = true
     }
-    // The vault is fixed for this mount (`key={info.id}` above).
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [backend, vaultId])
 
   useEffect(() => {
@@ -61,11 +67,12 @@ export function HistorySection({ vaultId, busy, notify, onError }: Props) {
       .then((next) => {
         if (!cancelled) setVersions(next)
       })
-      .catch(onError)
+      .catch((error: unknown) => {
+        if (!cancelled) setLoadError(toCommandError(error).message)
+      })
     return () => {
       cancelled = true
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [backend, vaultId, file])
 
   async function run(action: () => Promise<void>) {
@@ -124,6 +131,7 @@ export function HistorySection({ vaultId, busy, notify, onError }: Props) {
       <div className="section__heading">
         <h2 id="history-heading">History</h2>
       </div>
+      {loadError ? <Notice kind="warning">{loadError}</Notice> : null}
 
       <div className="subsection" aria-labelledby="file-history-heading">
         <h3 id="file-history-heading">File history</h3>
