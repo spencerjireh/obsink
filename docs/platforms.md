@@ -113,6 +113,8 @@ It verifies vault create/connect + passphrase validation, the full sync cycle wi
 
 ## iOS
 
+The app requires iOS 26 (`ios/project.yml` `deploymentTarget`): the tab bar and the primary buttons are Liquid Glass as the system draws them (`DESIGN.md` section 6), so there is no fallback UI for older releases.
+
 The `mobile/` crate exposes the core to Swift via UniFFI. Build everything (staticlibs, bindings, XCFramework, Xcode project) with:
 
 ```bash

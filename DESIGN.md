@@ -31,19 +31,21 @@ Each principle follows from a hard rule in `AGENTS.md`.
 ## 2. Brand
 
 - **Name:** `ObSink`. Capital O, capital S. Never "Obsink" or "OBSink".
-- **Mark:** the closed loop. An amber sync ring, two arcs with arrowheads,
-  around a paper disc with an ink keyhole, on an ink field. Two arcs stand for
-  two devices; the keyhole stands for one key per vault.
+- **Mark:** the clasp. A verdigris ring made of two arcs with rounded caps,
+  closed around a bone disc, on the dark ground. Two arcs stand for two
+  devices; the ring they close stands for the one vault they share. No
+  arrowheads, no keyhole: the mark states the loop, not the mechanism.
 - **Files:** `design/icon.svg` (full-bleed 1024 viewBox, source of truth) and
   `design/tray.svg` (monochrome silhouette for the macOS menu bar: heavier
-  ring, solid disc, no keyhole, because 18 pt cannot show it). Every raster
+  ring and a solid disc, because 18 pt cannot show the stroke). Every raster
   comes from `scripts/gen-icons.sh`; do not edit a PNG or `.icns` by hand.
-- **Clear space:** at least one ring stroke width (60/1024 of the icon size)
+- **Clear space:** at least one ring stroke width (72/1024 of the icon size)
   around the mark when it sits next to text.
-- **Do:** use the mark at any size on ink or paper; use the tray silhouette
-  as a template image so macOS tints it.
+- **Do:** use the mark at any size on the dark ground or on bone; use the
+  tray silhouette as a template image so macOS tints it.
 - **Do not:** recolour the ring, add a gradient or shadow, place text inside
-  the ring, rotate the mark, or use the colour mark in the menu bar.
+  the ring, rotate the mark, close the gaps between the arcs, or use the
+  colour mark in the menu bar.
 
 ## 3. Tokens
 
@@ -54,36 +56,41 @@ semantic-colour names on iOS (section 6). Values are sRGB hex.
 
 Brand constants (mode independent, used by the mark and the primary button):
 
-| token           | value     |
-| --------------- | --------- |
-| `--brand-ink`   | `#15141B` |
-| `--brand-amber` | `#E8A84A` |
-| `--brand-paper` | `#F2EFE6` |
+| token               | value     |
+| ------------------- | --------- |
+| `--brand-ground`    | `#0F1613` |
+| `--brand-verdigris` | `#7FCBB8` |
+| `--brand-bone`      | `#EDEEE9` |
+
+The ground is a green-black, not a tinted grey; the accent is oxidised
+copper, blue-leaning so it never reads as the success green; bone is a
+cool off-white, not cream. Obsidian's own purple is never used.
 
 Semantic colours (switch with the system appearance):
 
 | token                | dark      | light     | role                                               |
 | -------------------- | --------- | --------- | -------------------------------------------------- |
-| `--color-bg`         | `#15141B` | `#F2EFE6` | window background                                  |
-| `--color-surface`    | `#1E1D26` | `#FFFFFF` | cards, lists, tab bar, inputs                      |
-| `--color-border`     | `#2C2B35` | `#DDD9CE` | hairlines                                          |
-| `--color-text`       | `#F2EFE6` | `#15141B` | body text                                          |
-| `--color-text-muted` | `#A9A59B` | `#5F5B66` | labels, captions                                   |
-| `--color-accent`     | `#E8A84A` | `#8A5A12` | tinted text, active borders, focus ring            |
-| `--color-warning`    | `#F3C77A` | `#7A4F00` | stale banner, pending local changes, skipped files |
+| `--color-bg`         | `#0F1613` | `#EDEEE9` | window background                                  |
+| `--color-surface`    | `#171F1B` | `#FFFFFF` | cards, lists, tab bar, inputs                      |
+| `--color-border`     | `#263029` | `#D6DAD3` | hairlines                                          |
+| `--color-text`       | `#EDEEE9` | `#17201C` | body text                                          |
+| `--color-text-muted` | `#9AA69F` | `#5C6862` | labels, captions                                   |
+| `--color-accent`     | `#7FCBB8` | `#266A5D` | tinted text, active borders, focus ring, primary button fill |
+| `--color-accent-ink` | `#0F1613` | `#FFFFFF` | text on the primary button                         |
+| `--color-warning`    | `#E9B85A` | `#8A5A00` | stale banner, pending local changes, skipped files |
 | `--color-danger`     | `#FFB4AB` | `#B3261E` | fatal failures, sign-in errors                     |
 | `--color-success`    | `#9ED38B` | `#2E6B2F` | key saved, sync complete                           |
 
 Contrast, measured against `--color-bg` and `--color-surface`:
-`--color-text` 15.9:1 and 14.5:1 dark, 15.9:1 and 18.3:1 light;
-`--color-text-muted` 7.4:1 and 6.8:1 dark, 5.8:1 and 6.6:1 light;
-`--color-accent` 8.8:1 and 8.1:1 dark, 5.1:1 and 5.9:1 light. Warning,
-danger, and success are at or above 5.6:1 in both modes. All text meets
+`--color-text` 15.7:1 and 14.4:1 dark, 14.3:1 and 16.7:1 light;
+`--color-text-muted` 7.3:1 and 6.7:1 dark, 5.0:1 and 5.8:1 light;
+`--color-accent` 9.7:1 and 8.9:1 dark, 5.5:1 and 6.4:1 light. Warning,
+danger, and success are at or above 5.1:1 in both modes. All text meets
 WCAG AA (4.5:1).
 
-The primary button is `--brand-amber` fill with `--brand-ink` text in both
-modes (8.8:1). Raw amber as text on paper is 1.8:1, so light mode uses
-`--color-accent` (deep amber) for tinted text and never `--brand-amber`.
+The primary button is `--color-accent` fill with `--color-accent-ink` text
+(6.4:1 light, 9.7:1 dark), so it switches with the mode; the raw brand
+verdigris on bone is 1.9:1 and is never used as text or fill in light mode.
 
 Notices use the semantic colour at 12% alpha as the fill and at 40% alpha as
 the border, with `--color-text` for the body and the semantic colour for the
@@ -93,8 +100,15 @@ leading tag.
 
 | token          | value                                                                    | use                                                             |
 | -------------- | ------------------------------------------------------------------------ | --------------------------------------------------------------- |
-| `--font-serif` | `'Iowan Old Style', 'Palatino Linotype', 'Book Antiqua', Georgia, serif` | headings, body copy, buttons, vault names (desktop)             |
-| `--font-mono`  | `ui-monospace, 'SF Mono', Menlo, monospace`                              | paths, vault ids, server URLs, counts, invite codes, timestamps |
+| `--font-ui`   | `'Atkinson Hyperlegible Next', -apple-system, BlinkMacSystemFont, system-ui, sans-serif` | headings, body copy, buttons, vault names (desktop, web, site)  |
+| `--font-mono` | `'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, monospace`                            | paths, vault ids, server URLs, counts, invite codes, timestamps |
+
+Both faces ship with the client (`ui/src/assets/fonts/`, `site/fonts/`:
+latin subsets as woff2, the Atkinson file is a variable font covering
+400–700, Plex Mono at 400 and 600; both are SIL Open Font License) so the
+desktop app makes no network request for type. Atkinson Hyperlegible Next
+was drawn for reading at a glance, which is the job of a state UI; the mono
+face carries the data roles.
 
 Sizes: 12 (captions, tags), 14 (body, controls), 16 (section headings), 20
 (counts), 22 (the active vault name; the largest text in the app). Line
@@ -109,7 +123,8 @@ iOS uses the system font with Dynamic Type (`.body`, `.caption`,
 - Spacing scale `--space-1` to `--space-8`: 4, 8, 12, 16, 24, 32, 48, 64 px.
   Controls pad 8x12; cards pad 16; sections gap 24.
 - Radii: `--radius-sm: 6px` for controls and inputs, `--radius-md: 10px` for
-  cards and notices. No pill buttons.
+  cards and notices. No pill buttons on desktop or web; on iOS the glass
+  button keeps the system capsule.
 - Motion: `--duration: 150ms` ease-out for hover and focus transitions only.
   Under `prefers-reduced-motion: reduce` the duration is 0. No entrance
   animations.
@@ -129,7 +144,7 @@ iOS uses the system font with Dynamic Type (`.body`, `.caption`,
 | Icon button         | idle, hover                                                                    | 28px square, no border, muted glyph that turns to `--color-text` on hover; always carries an `aria-label`.                                                                                                                                                                                                                                                                                                         |
 | Status counts       | uploads, downloads, conflicts as three counts                                  | iOS only. Always rendered; zero is shown as `0`. Count in `--font-mono` at 20px, label in muted text.                                                                                                                                                                                                                                                                                                              |
 | Notice              | info, warning, danger                                                          | One line of text; a `FATAL` or `skipped` tag leads a failure line. Warning is used for the stale banner and pending local changes. Danger for `Checkpoint failed: <message>. Sync again.` (the files moved, the bookkeeping did not).                                                                                                                                                                              |
-| Vault row (list)    | active, inactive, not on this device, disabled while busy                      | State dot and name in the display face, state text in mono below. Active row has a 2px accent left border and `aria-current="page"`. A vault this device does not hold shows a muted dot, `Not on this device`, and a ghost `Download` button in the row.                                                                                                                                                          |
+| Vault row (list)    | active, inactive, not on this device, disabled while busy                      | State dot and name in the UI face, state text in mono below. Active row has a 2px accent left border and `aria-current="page"`. A vault this device does not hold shows a muted dot, `Not on this device`, and a ghost `Download` button in the row.                                                                                                                                                          |
 | Conflict card       | selected, unselected                                                           | Path in mono; two rows `This device` / `Other device` with size and modified time; a segmented choice of `Keep local`, `Keep remote`, `Keep both` (or `Delete on server` / `Delete here` when one side is deleted).                                                                                                                                                                                                |
 | Preview             | text, deleted, empty, loading                                                  | Two columns titled `This device` and `Other device`; body in mono, max height 280px, scrolls.                                                                                                                                                                                                                                                                                                                      |
 | Form field          | default, focused, invalid                                                      | Label above the input in muted text; URLs, ids, and codes in mono; passphrase is a secure field (twice when set, at least 12 characters); the error sits below the field in `--color-danger`.                                                                                                                                                                                                                      |
@@ -257,18 +272,26 @@ deleted`), `Manage vault`. `Create vault` and `Download` replace the page
 
 ### iOS (SwiftUI)
 
+- Floor: iOS 26. The tab bar, toolbars and sheets are Liquid Glass as the
+  system draws them; nothing in the app draws its own glass.
 - Colours: system semantic colours (`.primary`, `.secondary`,
   `.systemGroupedBackground`) for surfaces and text; `.orange` for warning,
   `.red` for danger, `.green` for success. Asset catalog colorsets:
-  `AccentColor` (`--color-accent`, light and dark variants) for tinted text
-  and controls; `Amber` and `Ink` (brand constants) for the primary button.
+  `AccentColor` (`--color-accent`, light and dark variants) for tinted text,
+  controls and the primary button fill; `OnAccent` (`--color-accent-ink`)
+  for the text on it. `ios/ObSink/Design/Theme.swift` exposes both and the
+  `.primaryAction()` modifier (`.glassProminent` tinted with the accent) that
+  every primary button uses; no view applies `.borderedProminent` or a
+  `.tint` of its own.
+- Type: the system font with Dynamic Type; `.monospaced()` for the data
+  roles. The UI face is not bundled on iOS; the shared identity there is the
+  accent and the mark.
 - Structure: a `TabView` with `Vaults`, `Devices`, `Settings`. **Vaults**
   is a scroll of cards on the grouped background, one per vault of the
   account: name and `Manage` (the vault screen), a state dot with the shared
   state text (section 5) and `Last synced`, the per-vault usage, the last
   result line, the stale banner, `Resolve n conflicts` (pushes the Conflicts
-  screen), and a full-width `.borderedProminent` `Sync now` (amber with ink
-  text); a `Not on this device` card carries `Download` instead. One sync
+  screen), and a full-width `Sync now` (`.primaryAction()`); a `Not on this device` card carries `Download` instead. One sync
   runs at a time. After the first vault a one-time `Open in Obsidian` card
   explains the Files path (`Got it` dismisses it for good). `+` in the
   toolbar creates a vault. **Devices** lists the account's devices (rename
