@@ -25,10 +25,10 @@ DESIGN_DIR="$REPO_ROOT/design"
 DESKTOP_DIR="$REPO_ROOT/desktop"
 ICONS_DIR="$DESKTOP_DIR/src-tauri/icons"
 IOS_ICON="$REPO_ROOT/ios/ObSink/Assets.xcassets/AppIcon.appiconset/AppIcon.png"
-INK="#15141B"
+INK="#0F1613"
 
 command -v magick >/dev/null || { echo "ImageMagick 7 (magick) is required" >&2; exit 1; }
-[ -d "$REPO_ROOT/node_modules/@tauri-apps/cli" ] || { echo "run 'npm ci' at the repo root first" >&2; exit 1; }
+[ -d "$REPO_ROOT/node_modules/@tauri-apps/cli" ] || [ -d "$DESKTOP_DIR/node_modules/@tauri-apps/cli" ] || { echo "run 'npm ci' at the repo root first" >&2; exit 1; }
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
