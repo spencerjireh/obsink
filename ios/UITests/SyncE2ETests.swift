@@ -294,6 +294,20 @@ final class SyncE2ETests: XCTestCase {
                       "device A (the CLI) is not listed")
     }
 
+    /// On a signed-in phone (the session seeded or already in the Keychain):
+    /// tap `Download` on the first vault that is not on this device and wait
+    /// for its first cycle. `OBSINK_TEST_DEVICE_ID` pins the device id.
+    func testDownloadFirstVault() throws {
+        let app = XCUIApplication()
+        if env["OBSINK_TEST_BEARER"] != nil { seedAccount(app) } else { serverEnv(app) }
+        if let id = env["OBSINK_TEST_DEVICE_ID"] { app.launchEnvironment["OBSINK_UITEST_DEVICE_ID"] = id }
+        app.launch()
+        let download = app.buttons["downloadVaultButton"].firstMatch
+        XCTAssertTrue(download.waitForExistence(timeout: 60), "no vault offers Download")
+        download.tap()
+        waitForStatus(app, prefix: "Synced ·", timeout: 300)
+    }
+
     /// Files-app half of OBS-19/29: the ObSink File Provider location exists
     /// and shows a synced file.
     func testFilesAppShowsVault() throws {
