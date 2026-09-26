@@ -36,9 +36,7 @@ struct ConflictsView: View {
                         Text(model.busy ? "Working…" : "Apply resolutions")
                             .frame(maxWidth: .infinity)
                     }
-                    .buttonStyle(.borderedProminent)
-                    .tint(Color("Amber"))
-                    .foregroundStyle(Color("Ink"))
+                    .primaryAction()
                     .disabled(model.busy)
                     .accessibilityIdentifier("applyResolutionsButton")
                 }

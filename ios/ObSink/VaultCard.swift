@@ -110,9 +110,7 @@ struct VaultCard: View {
                 Text(model.busy && isDetail ? "Working…" : "Sync now")
                     .frame(maxWidth: .infinity)
             }
-            .buttonStyle(.borderedProminent)
-            .tint(Color("Amber"))
-            .foregroundStyle(Color("Ink"))
+            .primaryAction()
             .disabled(!canSync)
             .accessibilityIdentifier(isDetail || model.entries.count == 1 ? "syncButton" : "syncButton-\(entry.vaultID)")
         }
@@ -164,9 +162,7 @@ struct VaultCard: View {
             Text(model.busy && isDetail ? "Working…" : "Download")
                 .frame(maxWidth: .infinity)
         }
-        .buttonStyle(.borderedProminent)
-        .tint(Color("Amber"))
-        .foregroundStyle(Color("Ink"))
+        .primaryAction()
         .disabled(model.busy || model.locked)
         .accessibilityIdentifier("downloadVaultButton")
     }

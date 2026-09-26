@@ -73,9 +73,7 @@ struct VaultsView: View {
                     .accessibilityIdentifier("statusText")
             }
             Button("Create vault") { showingCreate = true }
-                .buttonStyle(.borderedProminent)
-                .tint(Color("Amber"))
-                .foregroundStyle(Color("Ink"))
+                .primaryAction()
                 .accessibilityIdentifier("createVaultButton")
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -94,9 +92,7 @@ struct VaultsView: View {
                 Text("Sign in to see your vaults.").foregroundStyle(.secondary)
             }
             Button("Sign in") { showingSignIn = true }
-                .buttonStyle(.borderedProminent)
-                .tint(Color("Amber"))
-                .foregroundStyle(Color("Ink"))
+                .primaryAction()
                 .accessibilityIdentifier("signInButton")
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -113,9 +109,7 @@ struct VaultsView: View {
                  : "Set the account passphrase to start syncing.")
                 .foregroundStyle(.secondary)
             Button(model.hasServerKey ? "Unlock" : "Set passphrase") { showingSignIn = true }
-                .buttonStyle(.borderedProminent)
-                .tint(Color("Amber"))
-                .foregroundStyle(Color("Ink"))
+                .primaryAction()
                 .accessibilityIdentifier(model.hasServerKey ? "unlockPromptButton" : "setPassphrasePromptButton")
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -152,9 +146,7 @@ struct CreateVaultSheet: View {
                         Text(busy ? "Working…" : "Create vault")
                             .frame(maxWidth: .infinity)
                     }
-                    .buttonStyle(.borderedProminent)
-                    .tint(Color("Amber"))
-                    .foregroundStyle(Color("Ink"))
+                    .primaryAction()
                     .disabled(busy || name.trimmingCharacters(in: .whitespaces).isEmpty)
                     .accessibilityIdentifier("createVaultSubmitButton")
                 }

@@ -2,7 +2,7 @@ name: ObSink
 options:
   bundleIdPrefix: com.obsink
   deploymentTarget:
-    iOS: "17.0"
+    iOS: "26.0"
   createIntermediateGroups: true
 
 settings:
