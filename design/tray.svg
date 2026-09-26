@@ -1,20 +1,14 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
   ObSink menu-bar silhouette. macOS renders it as a template image (tinted to
-  the menu-bar colour) at 18 pt, so it is black on transparent, the ring is
-  heavier than in icon.svg, and the keyhole is dropped (it would be about one
-  pixel). scripts/gen-icons.sh rasterises it to desktop/src-tauri/icons/tray.png.
+  the menu-bar colour) at 18 pt, so it is black on transparent and the ring
+  is heavier than in icon.svg. scripts/gen-icons.sh rasterises it to
+  desktop/src-tauri/icons/tray.png.
 -->
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
-  <g transform="translate(512 512) scale(1.6) translate(-512 -512)">
-  <g fill="none" stroke="#000000" stroke-width="96">
-    <path d="M320.5 351.3A250 250 0 0 1 672.7 320.5"/>
-    <path d="M703.5 672.7A250 250 0 0 1 351.3 703.5"/>
-  </g>
-  <g fill="#000000">
-    <polygon points="496,162 496,362 656,262" transform="rotate(40 512 512)"/>
-    <polygon points="496,162 496,362 656,262" transform="rotate(220 512 512)"/>
+  <g fill="none" stroke="#000000" stroke-width="110" stroke-linecap="round">
+    <path d="M180 420A340 340 0 0 1 844 420"/>
+    <path d="M844 604A340 340 0 0 1 180 604"/>
   </g>
   <circle cx="512" cy="512" r="150" fill="#000000"/>
-  </g>
 </svg>
