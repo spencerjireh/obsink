@@ -1,23 +1,48 @@
 /* Tokens (DESIGN.md section 3). Light is the default; dark follows the system. */
+@font-face {
+  font-family: 'Atkinson Hyperlegible Next';
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url('./assets/fonts/AtkinsonHyperlegibleNext-var-latin.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'IBM Plex Mono';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('./assets/fonts/IBMPlexMono-400-latin.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'IBM Plex Mono';
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url('./assets/fonts/IBMPlexMono-600-latin.woff2') format('woff2');
+}
+
 :root {
   color-scheme: light dark;
 
-  --brand-ink: #15141b;
-  --brand-amber: #e8a84a;
-  --brand-paper: #f2efe6;
+  --brand-ground: #0f1613;
+  --brand-verdigris: #7fcbb8;
+  --brand-bone: #edeee9;
 
-  --color-bg: #f2efe6;
+  --color-bg: #edeee9;
   --color-surface: #ffffff;
-  --color-border: #ddd9ce;
-  --color-text: #15141b;
-  --color-text-muted: #5f5b66;
-  --color-accent: #8a5a12;
-  --color-warning: #7a4f00;
+  --color-border: #d6dad3;
+  --color-text: #17201c;
+  --color-text-muted: #5c6862;
+  --color-accent: #266a5d;
+  --color-accent-ink: #ffffff;
+  --color-warning: #8a5a00;
   --color-danger: #b3261e;
   --color-success: #2e6b2f;
 
-  --font-serif: 'Iowan Old Style', 'Palatino Linotype', 'Book Antiqua', Georgia, serif;
-  --font-mono: ui-monospace, 'SF Mono', Menlo, monospace;
+  --font-ui: 'Atkinson Hyperlegible Next', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, monospace;
 
   --space-1: 4px;
   --space-2: 8px;
@@ -37,13 +62,14 @@
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --color-bg: #15141b;
-    --color-surface: #1e1d26;
-    --color-border: #2c2b35;
-    --color-text: #f2efe6;
-    --color-text-muted: #a9a59b;
-    --color-accent: #e8a84a;
-    --color-warning: #f3c77a;
+    --color-bg: #0f1613;
+    --color-surface: #171f1b;
+    --color-border: #263029;
+    --color-text: #edeee9;
+    --color-text-muted: #9aa69f;
+    --color-accent: #7fcbb8;
+    --color-accent-ink: #0f1613;
+    --color-warning: #e9b85a;
     --color-danger: #ffb4ab;
     --color-success: #9ed38b;
   }
@@ -70,7 +96,7 @@ body {
   margin: 0;
   background: var(--color-bg);
   color: var(--color-text);
-  font-family: var(--font-serif);
+  font-family: var(--font-ui);
   font-size: 14px;
   line-height: 1.4;
   -webkit-font-smoothing: antialiased;
@@ -348,13 +374,13 @@ select {
 }
 
 .button--primary {
-  background: var(--brand-amber);
-  color: var(--brand-ink);
+  background: var(--color-accent);
+  color: var(--color-accent-ink);
   font-weight: 600;
 }
 
 .button--primary:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--brand-amber) 88%, var(--brand-ink));
+  background: color-mix(in srgb, var(--color-accent) 88%, var(--color-text));
 }
 
 .button--ghost {
