@@ -38,12 +38,14 @@ async fn advertises_configured_sign_in_methods_without_auth() {
         serde_json::json!({
             "service": "obsink",
             "protocol": obsink_core::PROTOCOL_VERSION,
-            "auth": { "email": false, "apple": false },
+            // Email code sign-in is always offered (spec §4.1): without a
+            // mailer the operator mints the code with `obsink-server code`.
+            "auth": { "email": true, "apple": false },
             "invite_required": false
         })
     );
     let caps = env.auth_client().capabilities().await.unwrap();
-    assert!(!caps.auth.email && !caps.auth.apple);
+    assert!(caps.auth.email && !caps.auth.apple);
     env.finish().await;
 }
 
@@ -187,7 +189,7 @@ async fn rate_limits_code_requests_and_refuses_when_email_is_not_configured() {
     assert_eq!(refused.status(), 503);
     assert_eq!(
         refused.json::<serde_json::Value>().await.unwrap()["error"],
-        "email sign-in is not configured on this server"
+        "this server does not send email; ask the operator for a sign-in code"
     );
     off.finish().await;
 }
@@ -299,7 +301,9 @@ async fn sends_mail_through_the_mailer_and_hides_the_code_without_the_dev_flag()
 
 /// `obsink-server code <email>` (spec §4.1): a code minted from the shell
 /// verifies like a mailed one; mints have no cooldown between them, only
-/// the latest counts, and `/auth/email/start` right after is rate-limited.
+/// the latest counts. `/auth/email/start` right after answers 503 on a
+/// server that cannot send mail (before the cooldown, so the client opens
+/// the code field) and 429 on one that can.
 #[tokio::test]
 async fn a_code_minted_from_the_shell_signs_in_without_mail() {
     let Some(env) = TestEnv::try_with(|config| config.dev_return_code = false).await else {
@@ -345,11 +349,36 @@ async fn a_code_minted_from_the_shell_signs_in_without_mail() {
         .send()
         .await
         .unwrap();
-    assert_eq!(started.status(), 429, "a mint sets last_sent");
+    assert_eq!(
+        started.status(),
+        503,
+        "no mailer: 503 before the cooldown, the client opens the code field"
+    );
     assert!(email::mint_code(&env.state, "not-an-email", now)
         .await
         .is_err());
     env.finish().await;
+
+    let Some(mail) = TestEnv::try_with(|config| {
+        config.smtp = Some(smtp());
+        config.dev_return_code = false;
+    })
+    .await
+    else {
+        return;
+    };
+    email::mint_code(&mail.state, "shell@example.com", obsink_server::db::now())
+        .await
+        .unwrap();
+    let limited = mail
+        .req(Method::POST, "/auth/email/start")
+        .json(&serde_json::json!({ "email": "shell@example.com" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(limited.status(), 429, "a mint sets last_sent");
+    assert!(mail.mailer.sent.lock().unwrap().is_empty());
+    mail.finish().await;
 }
 
 #[tokio::test]

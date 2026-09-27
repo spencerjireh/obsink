@@ -69,6 +69,11 @@ impl ServerArgs {
     }
 }
 
+/// DESIGN.md §5: what `login` prints when `/auth/email/start` answers 503,
+/// the same string as the desktop, the browser and iOS.
+const NO_EMAIL_DELIVERY: &str =
+    "This server does not send email; ask the operator for a sign-in code.";
+
 /// Explicit flag/env first, then the saved config, then the built-in default
 /// (`FALLBACK_SERVER_URL`), so `obsink login` works right after install.sh.
 fn resolve_server_url(explicit: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
@@ -91,6 +96,11 @@ enum Commands {
     /// Sign in to a server with an emailed one-time code, then unlock the
     /// account on this machine.
     ///
+    /// A server that does not send email answers the code request with
+    /// `This server does not send email; ask the operator for a sign-in
+    /// code.` and the prompt still opens: enter the code the operator
+    /// minted with `obsink-server code <email>`, or pass it as `--code`.
+    ///
     /// A new account sets its passphrase here. An existing account shows an
     /// 8-character fingerprint and waits for a device that is already
     /// unlocked to approve this one (`obsink devices --approve <id>
@@ -101,7 +111,8 @@ enum Commands {
     Login {
         #[arg(long)]
         email: Option<String>,
-        /// Skip the prompt (scripts): the 6-digit code from the email.
+        /// Skip the prompt (scripts): the 6-digit code from the email, or
+        /// the one the operator minted with `obsink-server code`.
         #[arg(long)]
         code: Option<String>,
         #[arg(long, env = "OBSINK_SERVER_URL")]
@@ -396,25 +407,20 @@ async fn run_login(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let url = resolve_server_url(server_url.as_deref())?;
     let auth = AuthClient::new(&url);
+    // Email code sign-in is the only sign-in and every server offers it
+    // (spec §4.1); what `GET /` reports is not a gate.
     let caps = auth.capabilities().await?;
     caps.check_protocol()?;
-    if !caps.auth.email {
-        return Err(format!(
-            "{url} does not offer email sign-in (the operator has not configured SMTP)"
-        )
-        .into());
-    }
     let email = match email {
         Some(email) => email,
         None => prompt_line("Email: ")?,
     };
-    // A supplied --code belongs to a code already sent; requesting
-    // another would replace it server-side.
+    // A supplied --code belongs to a code already sent (or minted by the
+    // operator); requesting another would replace it server-side.
     let code = match code {
         Some(code) => code,
-        None => {
-            let start = auth.email_start(&email).await?;
-            match start.code {
+        None => match auth.email_start(&email).await {
+            Ok(start) => match start.code {
                 Some(dev_code) => {
                     eprintln!("(dev server returned the code inline)");
                     dev_code
@@ -423,8 +429,15 @@ async fn run_login(
                     println!("Sent a 6-digit code to {email}.");
                     prompt_line("Code: ")?
                 }
+            },
+            // Spec §4.1: the server verifies codes but cannot mail one; the
+            // operator minted it with `obsink-server code`.
+            Err(obsink_core::AuthError::Server { status, .. }) if status.as_u16() == 503 => {
+                println!("{NO_EMAIL_DELIVERY}");
+                prompt_line("Code: ")?
             }
-        }
+            Err(error) => return Err(error.into()),
+        },
     };
     let device = Device {
         id: load_or_create_device_id(&url)?,

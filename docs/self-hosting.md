@@ -39,7 +39,7 @@ Every setting is an environment variable. Defaults are in `server/src/config.rs`
 | `DATABASE_URL` | required | Postgres connection string |
 | `OBSINK_DATA_DIR` | `/data` | Blob volume; also holds `server.key` when the key is not set |
 | `OBSINK_SERVER_KEY` | generated | 32-byte base64 envelope key (`obsink-server keygen`). **Back it up**: metadata is unreadable without it |
-| `SMTP_HOST`, `SMTP_PORT` (587), `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM`, `SMTP_TLS` (`starttls`\|`tls`\|`none`) | unset | Email one-time codes. Unset = email sign-in disabled |
+| `SMTP_HOST`, `SMTP_PORT` (587), `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM`, `SMTP_TLS` (`starttls`\|`tls`\|`none`) | unset | Email one-time codes. Unset = the server sends no mail; sign-in codes come from `obsink-server code` (§6) |
 | `AUTH_DEV_RETURN_CODE` | unset | `1` returns the email code in the API response. **Never in production** |
 | `MAX_VAULTS_PER_USER` | `10` | Per-account vault cap |
 | `MAX_VAULT_BYTES` | `1073741824` | Per-vault byte budget for accounts (`507` when exceeded) |
@@ -128,17 +128,17 @@ docker compose -f docker-compose.coolify.yml exec server obsink-server code you@
 # 483920  (valid 10 minutes, 5 attempts)
 ```
 
-It is the same code `/auth/email/start` would have mailed (10 minutes, 5 attempts), so nothing
-else changes: the first account needs no invite, later ones do, and a second device is approved
-from the first or unlocks with the passphrase. The CLI takes the code without asking the server to
-send one: `obsink login --code 483920 --email you@example.com`. The command records the send time,
-so a client that asks for a mailed code within the next 60 seconds gets `429`.
+In any client, press `Send sign-in code`: the server answers
+`This server does not send email; ask the operator for a sign-in code.` and the code field opens.
+Enter the minted code there (the CLI prompts `Code:`, or takes it up front:
+`obsink login --code 483920 --email you@example.com`). It is the same code `/auth/email/start`
+would have mailed, so nothing else changes: the first account needs no invite, later ones do, and
+a second device is approved from the first or unlocks with the passphrase. The `503` comes
+before the resend cooldown, so `Send sign-in code` opens the field whether it is pressed before or
+after the mint.
 
-Two limits of the current clients: the apps always request a mailed code first, and every client
-(the CLI included) refuses to sign in when `GET /` reports `auth.email: false`, which the server
-does unless `SMTP_*` is set or `AUTH_DEV_RETURN_CODE=1`. `AUTH_DEV_RETURN_CODE` stays a
-development flag (the local `docker-compose.yml` sets it): never enable it on an internet-facing
-server, it hands the code to anyone who knows an email address.
+`AUTH_DEV_RETURN_CODE` stays a development flag (the local `docker-compose.yml` sets it): never
+enable it on an internet-facing server, it hands the code to anyone who knows an email address.
 
 ## 7. Backups and upgrades
 

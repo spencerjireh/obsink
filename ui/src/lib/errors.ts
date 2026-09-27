@@ -28,3 +28,13 @@ export function isUnauthorized(error: CommandError): boolean {
 export function isInviteRequired(error: CommandError): boolean {
   return error.kind === 'server' && error.status === 403 && /invite/i.test(error.message)
 }
+
+// DESIGN.md §5: the notice after `Send sign-in code` on a server that cannot
+// mail one (spec §4.1: `/auth/email/start` answers 503); the code field
+// opens for the code the operator minted with `obsink-server code`.
+export const NO_EMAIL_DELIVERY =
+  'This server does not send email; ask the operator for a sign-in code.'
+
+export function isNoEmailDelivery(error: CommandError): boolean {
+  return error.kind === 'server' && error.status === 503
+}

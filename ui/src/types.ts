@@ -177,8 +177,9 @@ export type InviteInfo = {
   used_at: number | null
 }
 
-// `GET /` on the server: whether email sign-in exists and whether a new
-// account needs an invite code.
+// `GET /` on the server: whether email sign-in exists (always, since 0.5; a
+// server that cannot send mail answers the start call with 503 instead) and
+// whether a new account needs an invite code.
 export type AuthCapabilities = { email: boolean; invite_required: boolean }
 
 // The wire format the server speaks against the one this build speaks

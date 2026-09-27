@@ -7,7 +7,14 @@ import type {
   VaultUsage,
 } from '../types'
 import { useBackend } from '../backend'
-import { isInviteRequired, isUnauthorized, SESSION_EXPIRED, toCommandError } from '../lib/errors'
+import {
+  isInviteRequired,
+  isNoEmailDelivery,
+  isUnauthorized,
+  NO_EMAIL_DELIVERY,
+  SESSION_EXPIRED,
+  toCommandError,
+} from '../lib/errors'
 
 type Notify = (message: string) => void
 
@@ -130,7 +137,15 @@ export function useAccount(notify: Notify) {
           notifyRef.current(`Sent a 6-digit code to ${authEmail}.`)
         }
       } catch (error) {
-        fail(error)
+        const failure = toCommandError(error)
+        if (isNoEmailDelivery(failure)) {
+          // Spec §4.1: the server verifies codes but cannot mail one; the
+          // code field opens for the one the operator minted.
+          setCodeSent(true)
+          notifyRef.current(NO_EMAIL_DELIVERY)
+        } else {
+          fail(failure)
+        }
       }
     })
 

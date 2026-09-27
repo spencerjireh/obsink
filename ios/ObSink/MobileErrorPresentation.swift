@@ -44,6 +44,13 @@ extension MobileError {
         return false
     }
 
+    /// Spec §4.1: `/auth/email/start` on a server that cannot send mail;
+    /// the code comes from the operator (`obsink-server code`).
+    var isNoEmailDelivery: Bool {
+        if case .Server(503, _) = self { return true }
+        return false
+    }
+
     private static func sentence(_ text: String) -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let first = trimmed.first else { return trimmed }

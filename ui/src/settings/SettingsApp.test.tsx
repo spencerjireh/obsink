@@ -92,6 +92,46 @@ describe('the unlock step (spec §12.1)', () => {
   })
 })
 
+describe('sign-in on a server without email delivery (spec §4.1)', () => {
+  it('opens the code field on the 503 from the start call and verifies the operator-minted code', async () => {
+    let account: AccountState = { kind: 'signed_out' }
+    const backend = mockBackend({
+      getAccount: () => Promise.resolve(account),
+      authEmailStart: () =>
+        Promise.reject({
+          kind: 'server',
+          status: 503,
+          message: 'this server does not send email; ask the operator for a sign-in code',
+        }),
+      authEmailVerify: (email: string, code: string) => {
+        expect(email).toBe('me@example.com')
+        expect(code).toBe('483920')
+        account = { kind: 'locked', user_id: 'usr_1', email: 'me@example.com', has_key: false }
+        return Promise.resolve(account)
+      },
+    })
+    renderApp(backend)
+    fireEvent.change(await screen.findByTestId('emailField'), {
+      target: { value: 'me@example.com' },
+    })
+    fireEvent.click(screen.getByTestId('sendCodeButton'))
+    const codeField = await screen.findByTestId('codeField')
+    const notice = screen.getByTestId('statusText')
+    expect(notice.textContent).toBe(
+      'This server does not send email; ask the operator for a sign-in code.',
+    )
+    expect(notice.getAttribute('data-kind')).toBe('info')
+
+    fireEvent.change(codeField, { target: { value: '483920' } })
+    fireEvent.click(screen.getByTestId('signInButton'))
+    await waitFor(() =>
+      expect(backend.calls.some((call) => call.method === 'authEmailVerify')).toBe(true),
+    )
+    // Signed in: the passphrase step follows.
+    expect(await screen.findByTestId('unlockField')).toBeTruthy()
+  })
+})
+
 describe('the vault list (spec §15.1)', () => {
   it('lists every vault of the account with Download on the ones not here', async () => {
     const backend = mockBackend({

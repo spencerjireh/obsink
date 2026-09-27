@@ -21,9 +21,15 @@ struct SignInPane: View {
     @State private var authCode = ""
     @State private var inviteCode = ""
     @State private var codeSent = false
+    /// Spec §4.1: the server cannot mail a code; the field is open for the
+    /// one the operator minted (DESIGN.md §5).
+    @State private var codeNotice = ""
     @State private var status = ""
     @State private var busy = false
     @State private var signedInEmail: String?
+
+    /// DESIGN.md §5, shared with the desktop, the browser and the CLI.
+    static let noEmailDeliveryNotice = "This server does not send email; ask the operator for a sign-in code."
 
     private var serverURL: String { ServerConfig.defaultURL }
     private var offersEmail: Bool { capabilities?.email ?? true }
@@ -72,12 +78,15 @@ struct SignInPane: View {
                     .focused($inviteFocused)
             }
             if codeSent {
+                if !codeNotice.isEmpty {
+                    Text(codeNotice).font(.caption).foregroundStyle(.secondary)
+                }
                 LabeledField("6-digit code", text: $authCode, identifier: "codeField")
                     .keyboardType(.numberPad)
                 Button("Verify and sign in") { verifyCode() }
                     .disabled(busy || authCode.trimmingCharacters(in: .whitespaces).count != 6)
                     .accessibilityIdentifier("verifyCodeButton")
-                Button("Change email") { codeSent = false; authCode = "" }
+                Button("Change email") { codeSent = false; authCode = ""; codeNotice = "" }
                     .disabled(busy)
             } else {
                 Button("Send sign-in code") { sendCode() }
@@ -116,11 +125,22 @@ struct SignInPane: View {
                 let devCode = try authEmailStart(serverUrl: url, email: email)
                 await MainActor.run {
                     codeSent = true
+                    codeNotice = ""
                     busy = false
                     if let devCode { authCode = devCode }
                 }
             } catch {
-                await MainActor.run { signInFailed(error) }
+                await MainActor.run {
+                    if let mobile = error as? MobileError, mobile.isNoEmailDelivery {
+                        // Spec §4.1: the server verifies codes but cannot
+                        // mail one; the field opens for the operator's code.
+                        codeSent = true
+                        codeNotice = Self.noEmailDeliveryNotice
+                        busy = false
+                    } else {
+                        signInFailed(error)
+                    }
+                }
             }
         }
     }
@@ -136,6 +156,7 @@ struct SignInPane: View {
                 let session = try authEmailVerify(serverUrl: url, email: email, code: code, device: device, inviteCode: invite)
                 await MainActor.run {
                     codeSent = false
+                    codeNotice = ""
                     authCode = ""
                     busy = false
                     signedIn(session)
