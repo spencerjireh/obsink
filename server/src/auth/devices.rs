@@ -2,6 +2,7 @@
 //! identified by a client-generated id the client keeps for good; the server
 //! keeps one session per device and a sealed name.
 
+use obsink_core::encode_base64;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgConnection, Row};
 
@@ -87,9 +88,24 @@ pub struct DeviceSummary {
     pub last_seen: u64,
     pub current: bool,
     pub vault_ids: Vec<String>,
+    /// A live approval request from this device (spec §4.1); omitted when
+    /// none is pending.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval: Option<DeviceApproval>,
 }
 
-/// Register the device at sign-in, or refresh its name and `last_seen`.
+/// What other devices see of a pending request: the public key the approver
+/// wraps to, when it was made and runs out, and whether it was answered.
+#[derive(Debug, Serialize)]
+pub struct DeviceApproval {
+    pub public_key: String,
+    pub requested: u64,
+    pub expires: u64,
+    pub approved: bool,
+}
+
+/// Register the device at sign-in, or refresh its name and `last_seen`. A
+/// re-sign-in also drops any approval request, so the flow restarts.
 pub async fn upsert(
     conn: &mut PgConnection,
     keys: &ServerKeys,
@@ -101,7 +117,9 @@ pub async fn upsert(
         "INSERT INTO devices (user_id, id, name_enc, platform, created, last_seen)
          VALUES ($1, $2, $3, $4, $5, $5)
          ON CONFLICT (user_id, id) DO UPDATE SET name_enc = EXCLUDED.name_enc,
-             platform = EXCLUDED.platform, last_seen = EXCLUDED.last_seen",
+             platform = EXCLUDED.platform, last_seen = EXCLUDED.last_seen,
+             approval_public_key = NULL, approval_requested = NULL, approval_expires = NULL,
+             approval_wrapped = NULL, approval_approved_by = NULL, approval_approved = NULL",
     )
     .bind(user_id)
     .bind(&device.id)
@@ -117,21 +135,27 @@ fn seal_name(keys: &ServerKeys, user_id: &str, device_id: &str, name: &str) -> V
     keys.seal_field("devices", "name", &format!("{user_id}:{device_id}"), name)
 }
 
-/// Every device of the account, oldest first, with the vaults each holds.
+/// Every device of the account, oldest first, with the vaults each holds and
+/// its approval request while that is live (`approval_expires > now`).
 pub async fn list(
     conn: &mut PgConnection,
     keys: &ServerKeys,
     user_id: &str,
     current_device_id: &str,
+    now: u64,
 ) -> Result<Vec<DeviceSummary>, ApiError> {
     let rows = sqlx::query(
         "SELECT d.id, d.name_enc, d.platform, d.created, d.last_seen,
+                d.approval_public_key, d.approval_requested, d.approval_expires,
+                d.approval_wrapped IS NOT NULL AS approved,
                 COALESCE(array_agg(dv.vault_id ORDER BY dv.attached, dv.vault_id)
                          FILTER (WHERE dv.vault_id IS NOT NULL), '{}') AS vault_ids
          FROM devices d
          LEFT JOIN device_vaults dv ON dv.user_id = d.user_id AND dv.device_id = d.id
          WHERE d.user_id = $1
-         GROUP BY d.id, d.name_enc, d.platform, d.created, d.last_seen
+         GROUP BY d.id, d.name_enc, d.platform, d.created, d.last_seen,
+                  d.approval_public_key, d.approval_requested, d.approval_expires,
+                  d.approval_wrapped
          ORDER BY d.created ASC, d.id ASC",
     )
     .bind(user_id)
@@ -148,6 +172,20 @@ pub async fn list(
                     &row.get::<Vec<u8>, _>("name_enc"),
                 )
                 .map_err(ApiError::internal)?;
+            let public_key: Option<Vec<u8>> = row.get("approval_public_key");
+            let expires: Option<i64> = row.get("approval_expires");
+            let approval = match (public_key, expires) {
+                (Some(public_key), Some(expires)) if db::to_u64(expires) > now => {
+                    let requested: Option<i64> = row.get("approval_requested");
+                    Some(DeviceApproval {
+                        public_key: encode_base64(&public_key),
+                        requested: db::to_u64(requested.unwrap_or_default()),
+                        expires: db::to_u64(expires),
+                        approved: row.get("approved"),
+                    })
+                }
+                _ => None,
+            };
             Ok(DeviceSummary {
                 current: id == current_device_id,
                 id,
@@ -156,6 +194,7 @@ pub async fn list(
                 created: db::to_u64(row.get("created")),
                 last_seen: db::to_u64(row.get("last_seen")),
                 vault_ids: row.get("vault_ids"),
+                approval,
             })
         })
         .collect()

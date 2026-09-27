@@ -3,6 +3,7 @@
 //! is a member of (spec §4.1).
 
 pub mod account;
+pub mod approval;
 pub mod devices;
 pub mod email;
 pub mod invites;

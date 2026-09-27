@@ -97,10 +97,20 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/me", get(me::me))
         .route("/auth/keys", get(auth::keys::get).put(auth::keys::set))
         .route("/auth/keys/rewrap", put(auth::keys::rewrap))
+        .route(
+            "/auth/approval",
+            put(auth::approval::register)
+                .get(auth::approval::poll)
+                .delete(auth::approval::cancel),
+        )
         .route("/auth/session", delete(me::sign_out))
         .route(
             "/auth/devices/{device_id}",
             patch(me::rename_device).delete(me::revoke_device),
+        )
+        .route(
+            "/auth/devices/{device_id}/approval",
+            post(auth::approval::approve),
         )
         .route("/auth/account", delete(me::delete_account))
         .route(
