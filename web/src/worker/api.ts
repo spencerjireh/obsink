@@ -24,7 +24,7 @@ export type WireFileEntry = {
 export type Capabilities = {
   service: string
   protocol?: number
-  auth: { email: boolean; apple?: boolean }
+  auth: { email: boolean }
   invite_required?: boolean
 }
 
@@ -37,6 +37,15 @@ export type Session = {
 // What a sign-in sends for this device.
 export type WireDeviceBody = { id: string; name: string; platform: string }
 
+// Spec §4.1: a device's live approval request as `GET /auth/me` relays it
+// (the public key the approver wraps to; the server never fingerprints it).
+export type WireDeviceApproval = {
+  public_key: string
+  requested: number
+  expires: number
+  approved: boolean
+}
+
 export type WireDevice = {
   id: string
   name: string
@@ -45,6 +54,20 @@ export type WireDevice = {
   last_seen?: number
   current: boolean
   vault_ids?: string[]
+  approval?: WireDeviceApproval | null
+}
+
+// Spec §4.1 `PUT /auth/approval` and `GET /auth/approval`: this device's
+// own request; `wrapped` is null until an unlocked device approved.
+export type ApprovalRegistered = { requested: number; expires: number }
+export type ApprovalStatus = {
+  public_key: string
+  requested: number
+  expires: number
+  wrapped: string | null
+  key_id?: string
+  approved_by?: string
+  approved?: number
 }
 
 export type Me = {
@@ -241,6 +264,43 @@ export class Api {
 
   async rewrapKeys(bearer: string, material: AccountKeyMaterial): Promise<void> {
     await this.send('PUT', '/auth/keys/rewrap', { bearer, json: material })
+  }
+
+  // Spec §12.1, the waiting device: register (or replace) this device's
+  // approval request with a fresh public key (base64, 32 bytes).
+  registerApproval(bearer: string, publicKey: string): Promise<ApprovalRegistered> {
+    return this.json('PUT', '/auth/approval', { bearer, json: { public_key: publicKey } })
+  }
+
+  // `null` when nothing is live (none, expired, or withdrawn).
+  async approvalStatus(bearer: string): Promise<ApprovalStatus | null> {
+    const { approval } = await this.json<{ approval: ApprovalStatus | null }>(
+      'GET',
+      '/auth/approval',
+      { bearer },
+    )
+    return approval
+  }
+
+  // Idempotent: after the key was stored, or on cancel.
+  async clearApproval(bearer: string): Promise<void> {
+    await this.send('DELETE', '/auth/approval', { bearer })
+  }
+
+  // Spec §12.3, the approver: the account key wrapped to the pending
+  // device's public key, with the account verifier as proof of holding it.
+  // A 404 means no live request (expired or withdrawn), a 409 that another
+  // device approved first.
+  async approveDevice(
+    bearer: string,
+    deviceId: string,
+    wrapped: string,
+    verifier: string,
+  ): Promise<void> {
+    await this.send('POST', `/auth/devices/${encodeURIComponent(deviceId)}/approval`, {
+      bearer,
+      json: { wrapped, verifier },
+    })
   }
 
   async logout(bearer: string): Promise<void> {

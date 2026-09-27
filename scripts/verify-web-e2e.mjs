@@ -12,9 +12,14 @@
 // account, when the stack already has accounts). An OPFS directory stands in for the picked
 // folder: `showDirectoryPicker` is shimmed, everything else is the real client.
 //
-// Flow: A signs in and creates a vault with a.md; B connects with the same
-// passphrase and gets a.md; both edit a.md; B resolves the conflict with Keep
-// both; A ends up with a.md and a.conflict.md.
+// Flow: A signs in, sets the passphrase and creates a vault with a.md; B
+// signs in on its own after the server's 60 s per-email cooldown and waits
+// for approval (spec §12.3); A approves it from the Devices tab (a wrong
+// fingerprint first, then the right one); B is unlocked without the
+// passphrase, downloads the vault and gets a.md; a reload of B goes through
+// the passphrase fallback; both edit a.md; B resolves the conflict with Keep
+// both; A ends up with a.md and a.conflict.md. About 90 s, most of it the
+// cooldown.
 
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -59,36 +64,6 @@ const shim = `
   }
 `
 
-// The client's IndexedDB (`web/src/shared/db.ts`), from the page.
-const idbGet = ([store, key]) =>
-  new Promise((resolve, reject) => {
-    const open = indexedDB.open('obsink')
-    open.onerror = () => reject(open.error)
-    open.onsuccess = () => {
-      const request = open.result.transaction(store, 'readonly').objectStore(store).get(key)
-      request.onsuccess = () => resolve(request.result ?? null)
-      request.onerror = () => reject(request.error)
-    }
-  })
-// No version is pinned (the client owns the schema and upgrades it); the
-// stores are created only when this open is the first one, so a page whose
-// worker has not opened the database yet still gets a usable store.
-const idbPut = ([store, key, value]) =>
-  new Promise((resolve, reject) => {
-    const open = indexedDB.open('obsink')
-    open.onupgradeneeded = () => {
-      for (const name of ['kv', 'vaults', 'handles', 'state', 'activity']) {
-        if (!open.result.objectStoreNames.contains(name)) open.result.createObjectStore(name)
-      }
-    }
-    open.onerror = () => reject(open.error)
-    open.onsuccess = () => {
-      const request = open.result.transaction(store, 'readwrite').objectStore(store).put(value, key)
-      request.onsuccess = () => resolve(undefined)
-      request.onerror = () => reject(request.error)
-    }
-  })
-
 async function writeFile(page, name, text) {
   await page.evaluate(
     async ([name, text]) => {
@@ -115,14 +90,20 @@ async function readFiles(page) {
   })
 }
 
-// Spec §12.1: sign in, then set the account passphrase (a new account) or
-// enter it (a device that came later).
+// Spec §12.1 step 1: the email code (an existing account needs no invite).
+// Returns when the code was requested, for the cooldown clock.
 async function signIn(page, invite) {
   await page.getByRole('textbox', { name: 'Email' }).fill(EMAIL)
   await page.getByRole('button', { name: 'Send sign-in code' }).click()
+  const requestedAt = Date.now()
   await page.getByRole('button', { name: 'Verify and sign in' }).waitFor()
   if (invite) await page.getByRole('textbox', { name: 'Invite code' }).fill(invite)
   await page.getByRole('button', { name: 'Verify and sign in' }).click()
+  return requestedAt
+}
+
+// Step 2 on the first device: set the account passphrase.
+async function setPassphrase(page) {
   await page.getByRole('heading', { name: 'Set passphrase' }).waitFor()
   await page.getByRole('textbox', { name: 'Passphrase' }).fill(PASSPHRASE)
   await page.getByRole('textbox', { name: 'Again' }).fill(PASSPHRASE)
@@ -130,15 +111,43 @@ async function signIn(page, invite) {
   await page.getByText('Passphrase set.').waitFor({ timeout: 60_000 })
 }
 
+// Step 2 on a later device, the passphrase fallback (a reload lands here
+// too): the field sits behind `Use passphrase instead` while the device
+// waits for approval.
 async function unlock(page) {
   await page.getByRole('heading', { name: 'Unlock' }).waitFor()
-  // Spec §12.1: a device with a key on the server waits for approval first;
-  // the passphrase field sits behind `Use passphrase instead`.
   const usePassphrase = page.getByTestId('usePassphraseButton')
   if (await usePassphrase.isVisible()) await usePassphrase.click()
   await page.getByRole('textbox', { name: 'Passphrase' }).fill(PASSPHRASE)
   await page.getByRole('button', { name: 'Unlock' }).click()
   await page.getByText('Unlocked.').waitFor({ timeout: 60_000 })
+}
+
+// Step 2 on a later device, the approval path (spec §12.3): the waiting
+// screen shows the 8-character fingerprint of this device's request.
+async function waitForFingerprint(page) {
+  await page.getByRole('heading', { name: 'Unlock' }).waitFor()
+  const text = page.getByTestId('approvalFingerprintText').filter({ hasText: /^[A-Z2-9]{8}$/ })
+  await text.waitFor({ timeout: 15_000 })
+  return (await text.textContent()).trim()
+}
+
+// Spec §15.3 on the unlocked device: the pending row on the Devices tab,
+// `Approve`, a wrong fingerprint is refused locally, the right one posts
+// the wrapped key.
+async function approve(page, fingerprint) {
+  await page.getByRole('tab', { name: 'Devices' }).click()
+  await page.getByText('Waiting for approval').waitFor({ timeout: 15_000 })
+  await page.getByTestId('deviceApproveButton').click()
+  const field = page.getByRole('textbox', { name: 'Fingerprint' })
+  const wrong = (fingerprint[0] === 'A' ? 'B' : 'A') + fingerprint.slice(1)
+  await field.fill(wrong)
+  await page.getByTestId('approveSubmitButton').click()
+  await page.getByText('Fingerprint does not match').waitFor()
+  await field.fill(fingerprint)
+  await page.getByTestId('approveSubmitButton').click()
+  await page.getByText(/^Approved .*\.$/).waitFor({ timeout: 15_000 })
+  await page.getByRole('tab', { name: 'Vaults' }).click()
 }
 
 // The folder step of Create vault / Download, then the done card.
@@ -206,7 +215,8 @@ try {
   const { page: a, close: closeA } = await device()
   devices.push(closeA)
   await writeFile(a, 'a.md', '# from A\n')
-  await signIn(a, invite)
+  const codeRequestedAt = await signIn(a, invite)
+  await setPassphrase(a)
   await a.getByRole('main').getByRole('button', { name: 'Create vault' }).click()
   await a.getByRole('textbox', { name: 'Vault name' }).fill(VAULT)
   await a.getByRole('button', { name: 'Next' }).click()
@@ -214,18 +224,22 @@ try {
   await syncNow(a)
   console.log('A: vault created and a.md uploaded')
 
-  // Device B: the same account (a second sign-in for one address within a
-  // minute hits the server's email cooldown, so B carries A's session),
-  // unlock with the passphrase, download the vault, get the note.
+  // Device B: the same account, its own sign-in once the server's 60 s
+  // per-email cooldown has passed, then approval from A; the passphrase is
+  // never typed on B. Download the vault, get the note.
   const { page: b, close: closeB } = await device()
   devices.push(closeB)
-  await b.evaluate(idbPut, [
-    'kv',
-    `bearer:${new URL(WEB).origin}`,
-    await a.evaluate(idbGet, ['kv', `bearer:${new URL(WEB).origin}`]),
-  ])
-  await b.reload()
-  await unlock(b)
+  const cooldown = codeRequestedAt + 61_000 - Date.now()
+  if (cooldown > 0) {
+    console.log(`waiting ${Math.ceil(cooldown / 1000)} s for the sign-in cooldown`)
+    await b.waitForTimeout(cooldown)
+  }
+  await signIn(b, null)
+  const fingerprint = await waitForFingerprint(b)
+  console.log(`B: waiting for approval, fingerprint ${fingerprint}`)
+  await approve(a, fingerprint)
+  await b.getByText('Unlocked.').waitFor({ timeout: 15_000 })
+  console.log('A: approved B; B unlocked without the passphrase')
   await b.getByTestId('vaultStateText').filter({ hasText: 'Not on this device' }).first().waitFor()
   await b.getByTestId('downloadVaultButton').first().click()
   await folderStep(b, 'downloadVaultSubmitButton', `Downloaded ${VAULT}`)
@@ -233,6 +247,14 @@ try {
   const onB = await readFiles(b)
   if (onB['a.md'] !== '# from A\n') fail(`B did not receive a.md: ${JSON.stringify(onB)}`)
   console.log('B: connected and a.md downloaded')
+
+  // A reload loses the worker's keys (spec §6.3, browser row): the page
+  // comes back locked, and the passphrase behind `Use passphrase instead`
+  // reopens the stored vault.
+  await b.reload()
+  await unlock(b)
+  await b.getByRole('button', { name: 'Sync now' }).waitFor()
+  console.log('B: reloaded and unlocked with the passphrase')
 
   // Both edit a.md: A pushes first, B then hits the conflict.
   await writeFile(a, 'a.md', '# from A, edited\n')

@@ -21,6 +21,8 @@ const handlers: Record<string, (...args: any[]) => Promise<unknown> | unknown> =
   getAccount: account.getAccount,
   setPassphrase: account.setPassphrase,
   unlock: account.unlock,
+  pollApproval: account.pollApproval,
+  approveDevice: account.approveDevice,
   changePassphrase: account.changePassphrase,
   createInvite: account.createInvite,
   listInvites: account.listInvites,
@@ -50,10 +52,13 @@ const handlers: Record<string, (...args: any[]) => Promise<unknown> | unknown> =
 
 // Methods that change what the screens show; the worker announces it the
 // way desktop emits `state://changed` after every mutating command.
+// `pollApproval` is not here: it is a read on most ticks and announces the
+// one that unlocked by itself.
 const CHANGES_STATE = new Set([
   'authEmailVerify',
   'setPassphrase',
   'unlock',
+  'approveDevice',
   'revokeDevice',
   'renameDevice',
   'signOut',
