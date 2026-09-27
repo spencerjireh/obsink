@@ -26,8 +26,6 @@ final class MobileErrorPresentationTests: XCTestCase {
         XCTAssertTrue(MobileError.Server(status: 403, message: "an invite code is required to create an account").isInviteRequired)
         XCTAssertTrue(MobileError.Server(status: 403, message: "invite code is invalid, used, or expired").isInviteRequired)
         XCTAssertFalse(MobileError.Server(status: 401, message: "invite code is invalid").isInviteRequired)
-        XCTAssertTrue(MobileError.Server(status: 403, message: "email verification required: request a code").needsEmailVerification)
-        XCTAssertFalse(MobileError.Server(status: 403, message: "email verification required").isInviteRequired)
     }
 
     func testAProtocolMismatchHasTheUpdateCopy() {

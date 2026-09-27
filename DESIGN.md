@@ -302,11 +302,11 @@ deleted`), `Manage vault`. `Create vault` and `Download` replace the page
 - The server is baked in (`OBSINK_SERVER_URL` at build time, read from
   `Info.plist` `ObSinkServerURL`; `OBSINK_UITEST_SERVER_URL` overrides it
   for tests) and only printed under the account section.
-- Sign-in is a sheet with steps: `Sign in` (Sign in with Apple or an email
-  code, the invite field only when needed), then `Set passphrase` or
-  `Unlock`. `Create vault` is a sheet with a name field; `Download` runs in
-  place on the card. The vault screen has the sections of spec §15.2
-  (`Devices`, `Activity`, `History` as pushed lists).
+- Sign-in is a sheet with steps: `Sign in` (an email code, the invite field
+  only when needed), then `Set passphrase` or `Unlock`. `Create vault` is a
+  sheet with a name field; `Download` runs in place on the card. The vault
+  screen has the sections of spec §15.2 (`Devices`, `Activity`, `History` as
+  pushed lists).
 - `Invites`, `Manage vault`, `Conflicts`, `File history` and `Recently
 deleted` are pushed screens; typed confirmations are a sheet with a
   medium detent (`TypedConfirmationSheet`); `Remove from this device` is a

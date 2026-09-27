@@ -44,12 +44,6 @@ extension MobileError {
         return false
     }
 
-    /// Sign in with Apple gave an email hint without a code (`POST /auth/apple`).
-    var needsEmailVerification: Bool {
-        if case .Server(403, let message) = self { return message.contains("email verification required") }
-        return false
-    }
-
     private static func sentence(_ text: String) -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let first = trimmed.first else { return trimmed }
