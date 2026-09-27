@@ -14,6 +14,8 @@ export function SignInForm({ account, busy }: { account: Account; busy: boolean 
     }
   }, [inviteFocusAt])
 
+  // Only a server older than 0.5 without SMTP reports this; a current one
+  // always offers the code and answers `Send sign-in code` with 503 instead.
   if (capabilities && !capabilities.email) {
     return <EmptyState>This server has no email sign-in.</EmptyState>
   }

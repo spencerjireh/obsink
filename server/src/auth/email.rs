@@ -35,7 +35,8 @@ pub trait Mailer: Send + Sync {
 }
 
 /// No SMTP configured: `/auth/email/start` returns 503 unless the dev flag
-/// hands the code back inline.
+/// hands the code back inline; the operator mints codes with
+/// `obsink-server code` instead.
 pub struct NoMailer;
 
 impl Mailer for NoMailer {
@@ -145,6 +146,15 @@ pub async fn start(
     AppJson(body): AppJson<StartBody>,
 ) -> Result<Json<StartResponse>, ApiError> {
     let email = normalize_email(body.email.as_deref())?;
+    // Before the cooldown: a server that cannot send mail always answers
+    // 503, also right after `obsink-server code` recorded a send time for
+    // this address (the client opens the code field on the 503).
+    if !state.config.can_send_email() {
+        return Err(ApiError::status(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this server does not send email; ask the operator for a sign-in code",
+        ));
+    }
     let email_hmac = state.keys.index("email", &email);
     let now = db::now();
 
@@ -162,13 +172,6 @@ pub async fn start(
         }
     }
     let smtp_configured = state.config.smtp.is_some();
-    if !smtp_configured && !state.config.dev_return_code {
-        return Err(ApiError::status(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "email sign-in is not configured on this server",
-        ));
-    }
-
     let code = new_code();
     if smtp_configured {
         state

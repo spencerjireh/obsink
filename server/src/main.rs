@@ -158,7 +158,7 @@ async fn serve() -> Result<(), String> {
         .map_err(|error| format!("bind {}: {error}", config.listen))?;
     tracing::info!(
         listen = %config.listen,
-        email = config.email_enabled(),
+        sends_email = config.can_send_email(),
         protocol = obsink_core::PROTOCOL_VERSION,
         "obsink-server listening"
     );

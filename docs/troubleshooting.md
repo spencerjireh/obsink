@@ -19,8 +19,8 @@ The server already has accounts, so a new one needs an invite. Ask any existing 
 **`404 vault not found`**
 The vault belongs to a different account (each account sees only its own vaults), was deleted, or you are pointed at the wrong server URL. List vaults: `obsink vaults --server-url <url>`.
 
-**`503 email sign-in is not configured on this server`** / `This server has no email sign-in.`
-The operator has not set `SMTP_*`. Ask the operator to configure SMTP, or to mint the code on the host with `obsink-server code <email>` and pass it to the CLI with `obsink login --code <code>` (see [self-hosting.md](self-hosting.md) §6, including what the clients still refuse).
+**`503 this server does not send email; ask the operator for a sign-in code`** / `This server does not send email; ask the operator for a sign-in code.`
+The operator has not set `SMTP_*`, so `Send sign-in code` cannot mail one; the code field opens anyway. Ask the operator to mint the code on the host with `obsink-server code <email>` and enter it there (the CLI prompts `Code:`, or takes `obsink login --code <code>`); see [self-hosting.md](self-hosting.md) §6. `This server has no email sign-in.` comes only from a server older than 0.5 without SMTP: upgrade it.
 
 **`Waiting for approval from another device.`**
 This device signed in but does not hold the account key. On a device that is already unlocked, open the Devices tab (`obsink devices` on the CLI): the new device is listed with `Waiting for approval`. Press `Approve` on that row and type the 8 characters the waiting device shows (`obsink devices --approve <id> <fingerprint>`); the waiting device then prints `Unlocked.`. No unlocked device at hand: `Use passphrase instead` (`obsink unlock --passphrase`, or a set `OBSINK_PASSPHRASE`) asks for the account passphrase.

@@ -90,9 +90,17 @@ impl Config {
         })
     }
 
-    /// Email sign-in is offered when mail can go out, or when the dev flag
-    /// returns the code inline.
+    /// Email code sign-in is the only sign-in and is always on: a server that
+    /// cannot send mail still verifies a code the operator minted with
+    /// `obsink-server code` (spec §4.1). `GET /` reports this.
     pub fn email_enabled(&self) -> bool {
+        true
+    }
+
+    /// Whether `/auth/email/start` can hand a code out: mail goes out over
+    /// SMTP, or the dev flag returns the code inline. Otherwise it answers
+    /// 503 and the code comes from the operator.
+    pub fn can_send_email(&self) -> bool {
         self.smtp.is_some() || self.dev_return_code
     }
 }
