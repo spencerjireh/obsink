@@ -23,3 +23,4 @@ export function wasm(): Promise<typeof core> {
 export type Core = typeof core
 export type VaultKeys = core.VaultKeys
 export type AccountKey = core.AccountKey
+export type ApprovalRequest = core.ApprovalRequest
