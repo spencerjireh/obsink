@@ -21,6 +21,28 @@ struct VaultEntry: Codable, Identifiable, Equatable {
     }
 }
 
+/// This phone's live approval request (spec §12.1): the fingerprint the
+/// unlock step shows while another device approves it, and when the server
+/// forgets the request.
+struct PendingApproval: Equatable {
+    let fingerprint: String
+    let expires: UInt64
+}
+
+/// Approving a device from this phone (spec §12.3): the two outcomes with
+/// their own copy (DESIGN.md §5). Nothing was sent on a mismatch.
+enum ApprovalError: LocalizedError {
+    case mismatch
+    case expired
+
+    var errorDescription: String? {
+        switch self {
+        case .mismatch: return "Fingerprint does not match. Check it on the other device."
+        case .expired: return "Approval expired. The other device shows a new fingerprint."
+        }
+    }
+}
+
 /// UI snapshot of sync progress, derived from `MobileProgressEvent`.
 struct SyncProgressInfo: Equatable {
     var phase: String
@@ -126,6 +148,12 @@ final class SyncModel: ObservableObject {
     /// The server holds a passphrase: the form is `Unlock`, else `Set
     /// passphrase`.
     @Published var hasServerKey: Bool = false
+    /// The approval request this locked phone registered (spec §12.1); nil
+    /// until it is registered, and once the phone is unlocked.
+    @Published var approval: PendingApproval?
+    /// The request behind `approval`; its secret is mirrored in the Keychain
+    /// under `approval:<user id>` so a relaunch resumes the same request.
+    private var approvalRequest: MobileApprovalRequest?
     /// A bearer call came back 401: the bearer is gone and the account section
     /// offers `Sign in`.
     @Published var sessionExpired: Bool = false
@@ -190,6 +218,7 @@ final class SyncModel: ObservableObject {
             let url = ServerConfig.defaultURL
             if let user = KeychainStore.loadUserID(serverURL: url) {
                 KeychainStore.deleteAccountKey(userID: user)
+                KeychainStore.deleteApprovalSecret(userID: user)
             }
             KeychainStore.deleteBearer(serverURL: url)
             KeychainStore.delete(account: KeychainStore.userAccount(for: url))
@@ -488,6 +517,12 @@ final class SyncModel: ObservableObject {
         hasServerKey = true
         locked = false
         accountNotice = "Unlocked."
+        // The passphrase won: the approval request is worthless to the
+        // approvers' lists (best effort).
+        if approval != nil {
+            Task.detached { try? authCancelApproval(serverUrl: url, token: token) }
+        }
+        clearApproval(userID: userID)
         await unlocked()
     }
 
@@ -497,6 +532,122 @@ final class SyncModel: ObservableObject {
         refreshAccount()
         await refreshVaultList()
         await checkStale()
+    }
+
+    // MARK: Device approval (spec §12.1, §12.3)
+
+    /// One turn of the approval wait on a locked phone whose account has a
+    /// passphrase: register a request (a fresh one, or the one behind the
+    /// secret the Keychain kept across a relaunch), then ask whether another
+    /// device answered. True once the account key arrived and the phone is
+    /// unlocked. A 401 ends the session; other failures are silent, the
+    /// caller polls again in 3 s.
+    func pollApproval() async -> Bool {
+        guard locked, hasServerKey, let token = KeychainStore.loadBearer(serverURL: serverURL), let userID else {
+            return false
+        }
+        let url = serverURL, deviceID = deviceID
+        do {
+            if approvalRequest == nil, let stored = KeychainStore.loadApprovalSecret(userID: userID),
+               let restored = try? approvalRestoreRequest(secret: stored) {
+                // A relaunch during the wait: the same request, polled before
+                // anything is registered so an approval that arrived meanwhile
+                // is picked up (spec §12.1).
+                approvalRequest = restored
+            }
+            if approvalRequest == nil {
+                try await registerApproval(token: token, userID: userID)
+            }
+            guard let request = approvalRequest else { return false }
+            let secret = request.secret
+            let poll = try await Task.detached {
+                try authPollApproval(serverUrl: url, token: token, secret: secret, userId: userID, deviceId: deviceID)
+            }.value
+            switch poll {
+            case .unlocked(let key, let keyId):
+                KeychainStore.deleteAccountKey(userID: userID)
+                KeychainStore.saveAccountKey(key, keyID: keyId, userID: userID)
+                clearApproval(userID: userID)
+                hasServerKey = true
+                locked = false
+                accountNotice = "Unlocked."
+                await unlocked()
+                return true
+            case .pending(let expires):
+                let current = PendingApproval(fingerprint: request.fingerprint, expires: expires)
+                if approval != current { approval = current }
+            case .none:
+                // Expired or cleared: a new request, a new fingerprint.
+                clearApproval(userID: userID)
+                try await registerApproval(token: token, userID: userID)
+            }
+        } catch {
+            if error.isUnauthorized {
+                handleUnauthorized()
+            } else if case .Network = error as? MobileError {
+                // Offline: keep the request; the next turn retries.
+            } else {
+                // A blob this request cannot open, or a server error: start
+                // over on the next turn.
+                clearApproval(userID: userID)
+            }
+        }
+        return false
+    }
+
+    /// `PUT /auth/approval` with a fresh request; its secret goes to the
+    /// Keychain so a relaunch resumes it.
+    private func registerApproval(token: String, userID: String) async throws {
+        let url = serverURL
+        let request = approvalNewRequest()
+        let publicKey = request.publicKey
+        let expires = try await Task.detached {
+            try authRegisterApproval(serverUrl: url, token: token, publicKey: publicKey)
+        }.value
+        KeychainStore.saveApprovalSecret(request.secret, userID: userID)
+        approvalRequest = request
+        approval = PendingApproval(fingerprint: request.fingerprint, expires: expires)
+    }
+
+    /// Forget this phone's request: the secret, the fingerprint.
+    private func clearApproval(userID: String?) {
+        if let userID { KeychainStore.deleteApprovalSecret(userID: userID) }
+        approvalRequest = nil
+        approval = nil
+    }
+
+    /// What the user typed, the way the core compares it: no spaces or
+    /// dashes, upper case, `0` read as `O`.
+    nonisolated static func normalizeFingerprint(_ typed: String) -> String {
+        String(typed.uppercased().filter { !$0.isWhitespace && $0 != "-" }.map { $0 == "0" ? "O" : $0 })
+    }
+
+    /// Spec §12.3 from this unlocked phone: wrap the account key to the
+    /// device's approval key when the typed fingerprint matches it. Nothing
+    /// is sent on a mismatch.
+    func approveDevice(_ device: MobileDevice, fingerprint: String) async throws {
+        guard let token = KeychainStore.loadBearer(serverURL: serverURL), let userID else {
+            throw MobileError.Sync(message: "Sign in first.")
+        }
+        let accountKey = try requireAccountKey()
+        guard let request = device.approval, !request.approved else { throw ApprovalError.expired }
+        let typed = Self.normalizeFingerprint(fingerprint)
+        let url = serverURL, deviceID = device.id, publicKey = request.publicKey
+        do {
+            try await Task.detached {
+                try authApproveDevice(serverUrl: url, token: token, userId: userID, accountKey: accountKey,
+                                      deviceId: deviceID, publicKey: publicKey, typedFingerprint: typed)
+            }.value
+        } catch MobileError.Sync(let message) where message.contains("Fingerprint") {
+            throw ApprovalError.mismatch
+        } catch MobileError.Server(404, _) {
+            throw ApprovalError.expired
+        } catch {
+            if error.isUnauthorized { handleUnauthorized() }
+            throw error
+        }
+        accountNotice = "Approved \(device.name)."
+        refreshAccount()
     }
 
     /// DESIGN.md §5 `Change passphrase`.
@@ -583,6 +734,7 @@ final class SyncModel: ObservableObject {
                     KeychainStore.deleteBearer(serverURL: url)
                     KeychainStore.delete(account: KeychainStore.userAccount(for: url))
                     if let userID { KeychainStore.deleteAccountKey(userID: userID) }
+                    self.clearApproval(userID: userID)
                     self.account = nil
                     self.invites = []
                     self.issuedInvite = nil
@@ -606,6 +758,8 @@ final class SyncModel: ObservableObject {
             Task.detached { try? authLogout(serverUrl: url, token: token) }
         }
         KeychainStore.deleteBearer(serverURL: url)
+        // The server drops the device row and its request with the session.
+        clearApproval(userID: userID)
         account = nil
         invites = []
         issuedInvite = nil
@@ -622,6 +776,7 @@ final class SyncModel: ObservableObject {
     /// `Sign in`.
     func handleUnauthorized() {
         KeychainStore.deleteBearer(serverURL: serverURL)
+        clearApproval(userID: userID)
         hasBearer = false
         sessionExpired = true
         account = nil

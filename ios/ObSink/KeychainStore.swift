@@ -177,6 +177,27 @@ enum KeychainStore {
         delete(account: accountKeyAccount(for: userID))
     }
 
+    static func approvalSecretAccount(for userID: String) -> String {
+        "approval:" + userID
+    }
+
+    /// The secret of this phone's approval request while it waits for
+    /// another device (spec §6.3): a relaunch resumes the same request and
+    /// shows the same fingerprint.
+    @discardableResult
+    static func saveApprovalSecret(_ secret: Data, userID: String) -> Bool {
+        save(secret, account: approvalSecretAccount(for: userID))
+    }
+
+    static func loadApprovalSecret(userID: String) -> Data? {
+        load(account: approvalSecretAccount(for: userID))
+    }
+
+    @discardableResult
+    static func deleteApprovalSecret(userID: String) -> Bool {
+        delete(account: approvalSecretAccount(for: userID))
+    }
+
     static func deviceAccount(for serverURL: String) -> String {
         "device:" + canonicalServerURL(serverURL)
     }

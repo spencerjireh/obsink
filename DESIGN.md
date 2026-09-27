@@ -296,7 +296,9 @@ deleted`), `Manage vault`. `Create vault` and `Download` replace the page
   runs at a time. After the first vault a one-time `Open in Obsidian` card
   explains the Files path (`Got it` dismisses it for good). `+` in the
   toolbar creates a vault. **Devices** lists the account's devices (rename
-  in place, `Sign out`). **Settings** holds the account: signed in as,
+  in place, `Sign out`; a device waiting for its key shows the `Waiting for
+approval` tag and `Approve`, which opens `ApproveDeviceSheet`), refreshed
+  on every open. **Settings** holds the account: signed in as,
   usage, `Change passphrase`, `Invites`, `Sign out`, `Delete account`, or
   `Sign in` when signed out (the session notice when it expired), plus the
   version and the Background App Refresh status.
@@ -304,13 +306,16 @@ deleted`), `Manage vault`. `Create vault` and `Download` replace the page
   `Info.plist` `ObSinkServerURL`; `OBSINK_UITEST_SERVER_URL` overrides it
   for tests) and only printed under the account section.
 - Sign-in is a sheet with steps: `Sign in` (an email code, the invite field
-  only when needed), then `Set passphrase` or `Unlock`. `Create vault` is a
+  only when needed), then `Set passphrase` or `Unlock`; the `Unlock` step
+  shows the approval fingerprint in mono with the waiting line and `Use
+passphrase instead`, which reveals the passphrase field. `Create vault` is a
   sheet with a name field; `Download` runs in place on the card. The vault
   screen has the sections of spec §15.2 (`Devices`, `Activity`, `History` as
   pushed lists).
 - `Invites`, `Manage vault`, `Conflicts`, `File history` and `Recently
 deleted` are pushed screens; typed confirmations are a sheet with a
-  medium detent (`TypedConfirmationSheet`); `Remove from this device` is a
+  medium detent (`TypedConfirmationSheet`, and `ApproveDeviceSheet` for
+  the fingerprint); `Remove from this device` is a
   confirmation dialog. Errors reach Swift typed (`MobileError`) and
   `MobileErrorPresentation.swift` maps each variant to its copy.
 - The vault cache on iOS lives inside the app group, so `Remove from this
@@ -344,13 +349,16 @@ remote`, `keep both` in that order.
   `scripts/verify-ios-sim-e2e.sh`) finds elements by these identifiers:
   `syncButton`, `statusText`, `signInButton`, `unlockField`,
   `unlockConfirmField`, `unlockButton`, `setPassphraseButton`,
+  `approvalFingerprintText`, `approvalWaitingText`, `usePassphraseButton`,
   `createVaultButton`, `createVaultNameField`, `createVaultSubmitButton`,
   `downloadVaultButton` (+ `data-vault-id`), `addVaultStatusText`,
   `addVaultDoneButton`, `staleBanner`, `conflictRowTitle`, `winnerPicker`,
   `applyResolutionsButton`, `vaultUsageText`, `manageVaultButton`,
   `renameVaultField`, `renameVaultButton`, `removeVaultButton`,
   `deleteVaultButton`, `vaultDeviceRow`, `deviceRow`, `deviceRenameField`,
-  `deviceRenameButton`, `deviceSignOutButton`, `historyLink`,
+  `deviceRenameButton`, `deviceSignOutButton`, `devicePendingTag`,
+  `deviceApproveButton`, `approveFingerprintField`, `approveStatusText`,
+  `approveSubmitButton`, `approveCancelButton`, `historyLink`,
   `historyFilePicker`, `historyRow`, `trashRow`, `previewButton`,
   `restoreButton`, `invitesLink`, `inviteRow`, `changePassphraseButton`,
   `deleteAccountButton`, `sessionExpiredText`, `confirmationField`,
