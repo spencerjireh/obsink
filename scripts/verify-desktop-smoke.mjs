@@ -15,8 +15,10 @@
 // It builds the debug binary with the frontend embedded, launches it with a
 // sandboxed HOME and the file-backed keyring, signs in, sets the passphrase
 // and creates a vault through the same commands the UI calls, then drives the real settings window
-// and popover by data-testid: sync, activity log, a conflict against the CLI
-// as the second device, Keep both, vault deletion. Every window stays hidden
+// and popover by data-testid: device approval of the CLI (its own keyring,
+// signed in for real after the 60 s email cooldown; a wrong fingerprint, then
+// the right one on the Devices tab), sync, activity log, a conflict against
+// the CLI as the second device, Keep both, vault deletion. Every window stays hidden
 // (the web views run either way) and no mouse or keyboard input is ever
 // posted, so the run does not interfere with whatever else is on the screen;
 // with OBSINK_SMOKE_SHOTS the windows are shown without taking focus. The tray
@@ -39,6 +41,17 @@ const EMAIL = `desktop-smoke-${Date.now()}@example.test`
 const PASSPHRASE = 'smoke-passphrase-2026'
 const VAULT = `smoke-${Date.now()}`
 const NOTE = 'notes/a.md'
+const CLI_DEVICE = 'smoke CLI'
+// The server refuses a second code for one address within 60 s.
+const EMAIL_COOLDOWN_MS = 61_000
+
+// A sourced .env.deploy must not leak into the sandbox: a passphrase would
+// short-circuit the CLI's approval wait, a device id would make both sides
+// one device, a bearer belongs to another account.
+const BASE_ENV = { ...process.env }
+for (const key of ['OBSINK_PASSPHRASE', 'OBSINK_DEVICE_ID', 'OBSINK_BEARER', 'OBSINK_HOME']) {
+  delete BASE_ENV[key]
+}
 
 function fail(message) {
   throw new Error(`FAIL: ${message}`)
@@ -255,7 +268,7 @@ port = 40_000 + Math.floor(Math.random() * 20_000)
 const app = spawn(APP, [], {
   cwd: sandbox,
   env: {
-    ...process.env,
+    ...BASE_ENV,
     HOME: sandbox,
     OBSINK_KEYRING_DIR: join(sandbox, 'keyring'),
     OBSINK_SERVER_URL: SERVER,
@@ -269,27 +282,58 @@ app.stderr.on('data', (chunk) => (log += chunk))
 let exited = false
 app.on('exit', () => (exited = true))
 
-// The CLI plays device B on the same account: it shares the desktop's file
-// keyring (bearer, user id, account key) with its own config home, which
-// also dodges the email cooldown a second sign-in would hit.
+// The CLI plays device B on the same account: its own keyring and device id
+// (a real second device), signed in for real and unlocked by the desktop's
+// approval below (spec §12.3), never by a passphrase.
+const cliEnv = (home) => ({
+  ...BASE_ENV,
+  OBSINK_HOME: home,
+  OBSINK_KEYRING_DIR: join(sandbox, 'keyring-cli'),
+  OBSINK_DEVICE_ID: `dev_smoke_cli_${Date.now()}`,
+  OBSINK_SERVER_URL: SERVER,
+})
 const cli = (home, ...args) => {
   const result = spawnSync(CLI, args, {
     cwd: sandbox,
     encoding: 'utf8',
     input: '',
-    env: {
-      ...process.env,
-      OBSINK_HOME: home,
-      OBSINK_KEYRING_DIR: join(sandbox, 'keyring'),
-      OBSINK_SERVER_URL: SERVER,
-    },
+    env: cliEnv(home),
   })
   if (result.status !== 0)
     fail(`obsink ${args.join(' ')} exited ${result.status}\n${result.stdout}${result.stderr}`)
   return result.stdout + result.stderr
 }
 
+// `obsink login` waiting for approval: the process, its output so far, and
+// how it ended.
+function cliLogin(home) {
+  const child = spawn(CLI, ['login', '--email', EMAIL, '--device-name', CLI_DEVICE], {
+    cwd: sandbox,
+    env: cliEnv(home),
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  const login = { child, output: '', exit: null }
+  child.stdout.on('data', (chunk) => (login.output += chunk))
+  child.stderr.on('data', (chunk) => (login.output += chunk))
+  child.on('exit', (status) => (login.exit = status))
+  return login
+}
+
+async function waitForOutput(login, pattern, what, timeoutMs = 60_000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const match = login.output.match(pattern)
+    if (match) return match
+    if (login.exit !== null)
+      fail(`obsink login exited ${login.exit} before ${what}\n${login.output}`)
+    await sleep(250)
+  }
+  fail(`timed out waiting for ${what}\n${login.output}`)
+}
+
 let trayProblem = null
+// The CLI's `login`, while it waits for approval.
+let login = null
 try {
   // The seam answers once setup ran; the settings web view loads right after.
   for (let attempt = 0; ; attempt++) {
@@ -313,6 +357,7 @@ try {
   // Sign in and create the vault through the commands the UI calls.
   const invite = await mintInvite()
   const code = await invoke('auth_email_start', { email: EMAIL })
+  const signInAt = Date.now()
   expect(
     typeof code === 'string' && code.length === 6,
     `dev server did not return the code inline: ${code}`,
@@ -360,10 +405,69 @@ try {
   )
   console.log('settings: synced through the UI, activity row present')
 
-  // Device B is the CLI; it gets the note, then both sides edit it. A's edit
-  // lands first and its daemon waits out the 2 s batch window, so B's upload
-  // wins the race and A's next cycle finds the conflict.
+  // Device B is the CLI. It signs in to the same account (after the email
+  // cooldown from the desktop's own sign-in) and waits with a fingerprint;
+  // the desktop's Devices tab approves it: a wrong code first, then the
+  // right one (spec §12.3, §15.3).
   const homeB = join(sandbox, 'cli')
+  const cooldownLeft = signInAt + EMAIL_COOLDOWN_MS - Date.now()
+  if (cooldownLeft > 0) {
+    console.log(`approval: waiting ${Math.ceil(cooldownLeft / 1000)} s for the email cooldown`)
+    await sleep(cooldownLeft)
+  }
+  login = cliLogin(homeB)
+  const [, fingerprint] = await waitForOutput(
+    login,
+    /^Fingerprint: ([A-Z2-9]{8})$/m,
+    'the CLI fingerprint',
+  )
+  console.log(`approval: CLI waits with fingerprint ${fingerprint}`)
+  await click('settings', '[data-testid=settingsTab][data-tab=devices]')
+  await until(
+    'settings',
+    `const row = [...document.querySelectorAll('[data-testid=deviceRow]')].find((el) => el.querySelector('[data-testid=devicePendingTag]'))
+     return !!row && row.textContent.includes(${JSON.stringify(CLI_DEVICE)})`,
+    'the pending CLI row on the Devices tab',
+  )
+  await click(
+    'settings',
+    '[data-testid=deviceRow]:has([data-testid=devicePendingTag]) [data-testid=deviceApproveButton]',
+  )
+  await until(
+    'settings',
+    `return !!document.querySelector('[data-testid=approveFingerprintField]')`,
+    'the approve form',
+  )
+  // Any 8 symbols of the alphabet other than the real ones.
+  const wrongCode = (fingerprint[0] === 'A' ? 'B' : 'A') + fingerprint.slice(1)
+  await type('settings', '[data-testid=approveFingerprintField]', wrongCode)
+  await click('settings', '[data-testid=approveSubmitButton]')
+  await noticeIncludes('settings', 'Fingerprint does not match')
+  await screenshot('settings', 'approve.png')
+  await type('settings', '[data-testid=approveFingerprintField]', fingerprint)
+  await click('settings', '[data-testid=approveSubmitButton]')
+  await noticeIncludes('settings', `Approved ${CLI_DEVICE}.`)
+  await waitForOutput(login, /^Unlocked\.$/m, 'the CLI to unlock')
+  for (let waited = 0; login.exit === null && waited < 10_000; waited += 250) await sleep(250)
+  expect(login.exit === 0, `obsink login exited ${login.exit}\n${login.output}`)
+  login = null
+  await until(
+    'settings',
+    `const row = [...document.querySelectorAll('[data-testid=deviceRow]')].find((el) => el.textContent.includes(${JSON.stringify(CLI_DEVICE)}))
+     return !!row && !row.querySelector('[data-testid=devicePendingTag]')`,
+    'the CLI row to leave the pending state',
+  )
+  console.log('approval: wrong fingerprint refused, right one unlocked the CLI')
+  await navigate(vaultId)
+  await until(
+    'settings',
+    `return document.querySelector('[data-testid=syncButton]')?.textContent === 'Sync now'`,
+    'the vault page again',
+  )
+
+  // B gets the note, then both sides edit it. A's edit lands first and its
+  // daemon waits out the 2 s batch window, so B's upload wins the race and
+  // A's next cycle finds the conflict.
   cli(homeB, 'download', '--vault-id', vaultId, '--directory', vaultB)
   expect(
     (await readFile(join(vaultB, NOTE), 'utf8')) === '# from A\n',
@@ -465,6 +569,7 @@ try {
   if (KEEP) {
     console.log(`kept: app pid ${app.pid}, seam port ${port}, sandbox ${sandbox}`)
   } else {
+    if (login && login.exit === null) login.child.kill('SIGTERM')
     if (!exited) app.kill('SIGTERM')
     await rm(sandbox, { recursive: true, force: true })
   }
