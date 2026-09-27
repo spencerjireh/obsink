@@ -4,6 +4,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use clap::{Parser, Subcommand};
@@ -15,12 +16,13 @@ use obsink_core::{
         delete_account_key, delete_secret, load_account_key, load_bearer, load_or_create_device_id,
         load_secret, load_secret_opt, save_account_key, save_secret, user_account,
     },
-    load_local_state, new_key, new_vault_id, normalize_server_url, prepare_sync,
-    rewrap_account_key, run_daemon, sync_manifest_path, unwrap_vault_key, wrap_vault_key,
-    write_atomic, ApiClient, AuthClient, Conflict, ConflictResolution, ConflictResolutionChoice,
-    CreateVaultRequest, DaemonEvent, DaemonOptions, Device, DevicePlatform, KeyBytes,
-    ProgressEvent, ProgressSink, SetKeysOutcome, SyncActionKind, SyncFailure, SyncPhase, SyncPlan,
-    VaultConfig,
+    load_local_state, new_approval_request, new_key, new_vault_id, normalize_fingerprint,
+    normalize_server_url, prepare_sync, rewrap_account_key, run_daemon, sync_manifest_path,
+    unwrap_vault_key, wrap_vault_key, write_atomic, ApiClient, ApprovalRequest, AuthClient,
+    AuthError, Conflict, ConflictResolution, ConflictResolutionChoice, CreateVaultRequest,
+    DaemonEvent, DaemonOptions, Device, DevicePlatform, KeyBytes, ProgressEvent, ProgressSink,
+    SetKeysOutcome, SyncActionKind, SyncFailure, SyncPhase, SyncPlan, VaultConfig,
+    APPROVAL_FINGERPRINT_LEN,
 };
 use rpassword::prompt_password;
 use serde::{Deserialize, Serialize};
@@ -58,6 +60,8 @@ const PASSPHRASE_ENV: &str = "OBSINK_PASSPHRASE";
 /// Spec §6.1: the wrapped account key is the new exposure, so the passphrase
 /// has a floor.
 const MIN_PASSPHRASE_CHARS: usize = 12;
+/// How often a device waiting for approval asks the server (spec §12.1).
+const APPROVAL_POLL: Duration = Duration::from_secs(3);
 
 impl ServerArgs {
     fn url(&self) -> Result<String, Box<dyn std::error::Error>> {
@@ -84,8 +88,16 @@ fn pick_server_url(explicit: Option<&str>, saved: Option<String>) -> String {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Sign in to a server with an emailed one-time code, then set or enter
-    /// the account passphrase (`OBSINK_PASSPHRASE` skips the prompt).
+    /// Sign in to a server with an emailed one-time code, then unlock the
+    /// account on this machine.
+    ///
+    /// A new account sets its passphrase here. An existing account shows an
+    /// 8-character fingerprint and waits for a device that is already
+    /// unlocked to approve this one (`obsink devices --approve <id>
+    /// <fingerprint>` there, or the Devices tab in the apps). Ctrl-C stops
+    /// the wait; `obsink unlock` waits again. `--passphrase` skips the wait
+    /// and asks for the passphrase instead; a set `OBSINK_PASSPHRASE` does
+    /// the same without a prompt.
     Login {
         #[arg(long)]
         email: Option<String>,
@@ -99,12 +111,27 @@ enum Commands {
         /// Needed to create a new account once the server has any user.
         #[arg(long)]
         invite_code: Option<String>,
+        /// Skip the approval wait and enter the passphrase (implied by a set
+        /// `OBSINK_PASSPHRASE`).
+        #[arg(long)]
+        passphrase: bool,
     },
-    /// Enter the account passphrase on a machine that holds a session but not
-    /// the account key (`OBSINK_PASSPHRASE` skips the prompt).
+    /// Unlock the account on a machine that holds a session but not the
+    /// account key.
+    ///
+    /// Shows an 8-character fingerprint and waits for a device that is
+    /// already unlocked to approve this one (`obsink devices --approve <id>
+    /// <fingerprint>` there, or the Devices tab in the apps); the request
+    /// is renewed with a new fingerprint every 10 minutes. Ctrl-C stops the
+    /// wait. `--passphrase` skips the wait and asks for the passphrase
+    /// instead; a set `OBSINK_PASSPHRASE` does the same without a prompt.
     Unlock {
         #[arg(long, env = "OBSINK_SERVER_URL")]
         server_url: Option<String>,
+        /// Skip the approval wait and enter the passphrase (implied by a set
+        /// `OBSINK_PASSPHRASE`).
+        #[arg(long)]
+        passphrase: bool,
     },
     /// Mint an invite code so someone else can create an account.
     Invite {
@@ -124,7 +151,14 @@ enum Commands {
         #[arg(long, env = "OBSINK_SERVER_URL")]
         server_url: Option<String>,
     },
-    /// The account's devices; rename or sign one out from here.
+    /// The account's devices; rename, approve or sign one out from here.
+    ///
+    /// A device that signed in and is waiting to be unlocked is listed as
+    /// `waiting for approval`. Type the 8 characters it shows:
+    /// `--approve <id> <fingerprint>` (case, spaces and dashes do not
+    /// matter). This machine must be unlocked; the account key is wrapped
+    /// to that device only when the fingerprint matches, and the server
+    /// never sees it.
     Devices {
         #[arg(long, env = "OBSINK_SERVER_URL")]
         server_url: Option<String>,
@@ -134,6 +168,9 @@ enum Commands {
         /// Sign a device out for good (its folders stay where they are).
         #[arg(long, value_name = "ID")]
         revoke: Option<String>,
+        /// Unlock a waiting device: `--approve <id> <fingerprint>`.
+        #[arg(long, num_args = 2, value_names = ["ID", "FINGERPRINT"])]
+        approve: Option<Vec<String>>,
     },
     /// Change the account passphrase (the same key, rewrapped).
     Passphrase {
@@ -240,7 +277,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             server_url,
             device_name,
             invite_code,
-        } => run_login(email, code, server_url, device_name, invite_code).await?,
+            passphrase,
+        } => {
+            run_login(
+                email,
+                code,
+                server_url,
+                device_name,
+                invite_code,
+                passphrase || passphrase_in_env(),
+            )
+            .await?
+        }
         Commands::Logout { server_url } => {
             let url = resolve_server_url(server_url.as_deref())?;
             let account = bearer_account(&url);
@@ -263,12 +311,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             server_url,
             rename,
             revoke,
-        } => run_devices(server_url, rename, revoke).await?,
+            approve,
+        } => run_devices(server_url, rename, revoke, approve).await?,
         Commands::Passphrase { server_url } => run_passphrase(server_url).await?,
-        Commands::Unlock { server_url } => {
+        Commands::Unlock {
+            server_url,
+            passphrase,
+        } => {
             let url = resolve_server_url(server_url.as_deref())?;
             let (token, user_id) = signed_in(&url).await?;
-            unlock_account(&AuthClient::new(&url), &token, &user_id).await?;
+            let device_id = load_or_create_device_id(&url)?;
+            unlock_account(
+                &AuthClient::new(&url),
+                &token,
+                &user_id,
+                &device_id,
+                passphrase || passphrase_in_env(),
+            )
+            .await?;
         }
         Commands::Invite { server_url, list } => {
             let url = resolve_server_url(server_url.as_deref())?;
@@ -332,6 +392,7 @@ async fn run_login(
     server_url: Option<String>,
     device_name: Option<String>,
     invite_code: Option<String>,
+    use_passphrase: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let url = resolve_server_url(server_url.as_deref())?;
     let auth = AuthClient::new(&url);
@@ -394,19 +455,29 @@ async fn run_login(
             .clone()
             .unwrap_or(session.user.id.clone())
     );
-    unlock_account(&auth, &session.token, &session.user.id).await?;
+    unlock_account(
+        &auth,
+        &session.token,
+        &session.user.id,
+        &device.id,
+        use_passphrase,
+    )
+    .await?;
     Ok(())
 }
 
 /// Spec §12.1: set the passphrase on a new account (create-only; a lost race
-/// unlocks the winner's key instead) or enter it on an existing one, and keep
-/// the account key in the keychain.
+/// unlocks the winner's key instead), or on an existing one wait for another
+/// device to approve this one or (`use_passphrase`, also after a lost race)
+/// enter the passphrase; keep the account key in the keychain either way.
 async fn unlock_account(
     auth: &AuthClient,
     token: &str,
     user_id: &str,
+    device_id: &str,
+    use_passphrase: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let outcome = match auth.get_keys(token).await? {
+    let (blob, use_passphrase) = match auth.get_keys(token).await? {
         None => {
             let passphrase = read_new_passphrase()?;
             let (key, material) = create_account_key(&passphrase, user_id)?;
@@ -418,13 +489,12 @@ async fn unlock_account(
                 }
                 SetKeysOutcome::Exists(blob) => {
                     println!("A passphrase was already set on another device. Enter it.");
-                    Some(blob)
+                    (blob, true)
                 }
             }
         }
-        Some(blob) => Some(blob),
+        Some(blob) => (blob, use_passphrase),
     };
-    let blob = outcome.expect("an existing blob");
     if let Ok((_, key_id)) = load_account_key(user_id) {
         if key_id == blob.key_id {
             println!("Unlocked (key already on this machine).");
@@ -433,6 +503,9 @@ async fn unlock_account(
         // A key from a lost first-set race: not the account's.
         delete_account_key(user_id);
     }
+    if !use_passphrase {
+        return wait_for_approval(auth, token, user_id, device_id).await;
+    }
     let passphrase = read_passphrase("Passphrase: ")?;
     let key = blob
         .unlock(&passphrase, user_id)
@@ -440,6 +513,125 @@ async fn unlock_account(
     save_account_key(user_id, &key, &blob.key_id)?;
     println!("Unlocked.");
     Ok(())
+}
+
+/// One poll of this device's approval request.
+enum ApprovalPoll {
+    /// Another device wrapped the account key to this request.
+    Unlocked { key: KeyBytes, key_id: String },
+    /// The request is live and nobody has approved yet.
+    Pending,
+    /// The server has no live request (it expired or was cleared).
+    Gone,
+}
+
+/// Spec §12.1 step 2, the wait: register an approval key, show its
+/// fingerprint, poll every [`APPROVAL_POLL`] until another device relays the
+/// account key, and renew the request with a new fingerprint when it runs
+/// out. The secret lives only in this process (spec §6.3); Ctrl-C ends the
+/// wait and `obsink unlock` starts a fresh request. A relayed blob this
+/// request cannot open is an error, not a retry.
+async fn wait_for_approval(
+    auth: &AuthClient,
+    token: &str,
+    user_id: &str,
+    device_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut request = new_approval_request();
+    auth.register_approval(token, request.public_key()).await?;
+    println!("Fingerprint: {}", request.fingerprint());
+    println!(
+        "Waiting for approval from another device (Ctrl-C stops; obsink unlock waits again, \
+         obsink unlock --passphrase asks for the passphrase)."
+    );
+    // One handler for the whole wait: a Ctrl-C that lands during a request
+    // is still seen on the next turn of the loop.
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+    loop {
+        let outcome = tokio::select! {
+            signal = &mut ctrl_c => {
+                signal?;
+                // The secret dies with this process, so the request is
+                // worthless: take it off the approvers' lists (best effort).
+                let _ = auth.clear_approval(token).await;
+                println!("Stopped. Run obsink unlock to wait again.");
+                return Ok(());
+            }
+            outcome = poll_approval(auth, token, &request, user_id, device_id) => outcome?,
+        };
+        match outcome {
+            ApprovalPoll::Unlocked { key, key_id } => {
+                save_account_key(user_id, &key, &key_id)?;
+                println!("Unlocked.");
+                return Ok(());
+            }
+            ApprovalPoll::Pending => {}
+            ApprovalPoll::Gone => {
+                request = new_approval_request();
+                auth.register_approval(token, request.public_key()).await?;
+                println!("Fingerprint changed: {}", request.fingerprint());
+            }
+        }
+    }
+}
+
+/// Sleep out one poll interval, then ask the server about the request. The
+/// blob is fetched and opened only once the status says it is there, so a
+/// quiet tick costs one request.
+async fn poll_approval(
+    auth: &AuthClient,
+    token: &str,
+    request: &ApprovalRequest,
+    user_id: &str,
+    device_id: &str,
+) -> Result<ApprovalPoll, AuthError> {
+    tokio::time::sleep(APPROVAL_POLL).await;
+    let Some(status) = auth.approval_status(token).await? else {
+        return Ok(ApprovalPoll::Gone);
+    };
+    if status.expires <= unix_now() {
+        return Ok(ApprovalPoll::Gone);
+    }
+    if status.wrapped.is_none() {
+        return Ok(ApprovalPoll::Pending);
+    }
+    Ok(
+        match auth
+            .take_approved_key(token, request, user_id, device_id)
+            .await?
+        {
+            Some((key, key_id)) => ApprovalPoll::Unlocked { key, key_id },
+            None => ApprovalPoll::Pending,
+        },
+    )
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
+/// Whether `OBSINK_PASSPHRASE` is set, which makes `login` and `unlock` take
+/// the passphrase path without a prompt (the harnesses rely on it).
+fn passphrase_in_env() -> bool {
+    std::env::var(PASSPHRASE_ENV).is_ok_and(|value| !value.is_empty())
+}
+
+/// The fingerprint typed after `--approve <id>`, normalised the way the
+/// pending device shows it, and checked for length before any request goes
+/// out.
+fn approval_fingerprint_arg(typed: &str) -> Result<String, String> {
+    let fingerprint = normalize_fingerprint(typed);
+    let len = fingerprint.chars().count();
+    if len != APPROVAL_FINGERPRINT_LEN {
+        return Err(format!(
+            "the fingerprint has {APPROVAL_FINGERPRINT_LEN} characters ({len} given)"
+        ));
+    }
+    Ok(fingerprint)
 }
 
 /// The passphrase from `OBSINK_PASSPHRASE` or the prompt.
@@ -707,11 +899,12 @@ async fn run_download(
     Ok(())
 }
 
-/// `obsink devices`: list, rename, or revoke.
+/// `obsink devices`: list, rename, approve, or revoke.
 async fn run_devices(
     server_url: Option<String>,
     rename: Option<Vec<String>>,
     revoke: Option<String>,
+    approve: Option<Vec<String>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let url = resolve_server_url(server_url.as_deref())?;
     let (token, _) = signed_in(&url).await?;
@@ -720,22 +913,75 @@ async fn run_devices(
         auth.rename_device(&token, &args[0], &args[1]).await?;
         println!("renamed device {} to {}", args[0], args[1]);
     }
+    if let Some(args) = approve {
+        approve_device_cli(&auth, &url, &args[0], &args[1]).await?;
+    }
     if let Some(id) = revoke {
         auth.revoke_device(&token, &id).await?;
         println!("signed out device {id}; its folders stay where they are");
     }
     for device in auth.me(&token).await?.devices {
+        let seen = match device.approval {
+            Some(_) => "waiting for approval".to_string(),
+            None => format!("last seen {}", device.last_seen),
+        };
         println!(
-            "{} [{}] {}{} last seen {} vaults {}",
+            "{} [{}] {}{} {seen} vaults {}",
             device.id,
             device.platform,
             device.name,
             if device.current { " (this device)" } else { "" },
-            device.last_seen,
             device.vault_ids.len()
         );
     }
     Ok(())
+}
+
+/// `obsink devices --approve <id> <fingerprint>` (spec §12.3): wrap this
+/// machine's account key to the waiting device's public key when the typed
+/// fingerprint matches it. A mismatch sends nothing.
+async fn approve_device_cli(
+    auth: &AuthClient,
+    url: &str,
+    device_id: &str,
+    typed: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let fingerprint = approval_fingerprint_arg(typed)?;
+    let (token, user_id, key) = account_key_for(url).await?;
+    let me = auth.me(&token).await?;
+    let device = me
+        .devices
+        .iter()
+        .find(|device| device.id == device_id)
+        .ok_or_else(|| format!("device {device_id} is not one of this account's"))?;
+    let approval = device
+        .approval
+        .as_ref()
+        .ok_or("Approval expired. The other device shows a new fingerprint.")?;
+    match auth
+        .approve_with_key(
+            &token,
+            &key,
+            &user_id,
+            device_id,
+            &approval.public_key,
+            &fingerprint,
+        )
+        .await
+    {
+        Ok(()) => {
+            println!("Approved device {device_id}.");
+            Ok(())
+        }
+        Err(AuthError::Fingerprint) => {
+            Err("Fingerprint does not match. Check it on the other device.".into())
+        }
+        // The request ran out between the listing and the post.
+        Err(AuthError::Server { status, .. }) if status.as_u16() == 404 => {
+            Err("Approval expired. The other device shows a new fingerprint.".into())
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// `obsink history <path>`: the archived versions of one file.
@@ -1146,7 +1392,9 @@ fn load_key_from_keychain(vault_id: &str) -> Result<KeyBytes, Box<dyn std::error
 mod tests {
     use std::path::Path;
 
-    use super::{pick_server_url, resolve_vault_dir, FALLBACK_SERVER_URL};
+    use super::{
+        approval_fingerprint_arg, pick_server_url, resolve_vault_dir, FALLBACK_SERVER_URL,
+    };
 
     #[test]
     fn the_server_url_is_the_flag_then_the_config_then_the_default() {
@@ -1166,6 +1414,17 @@ mod tests {
             FALLBACK_SERVER_URL.trim_end_matches('/')
         );
         assert!(FALLBACK_SERVER_URL.starts_with("http"));
+    }
+
+    #[test]
+    fn the_typed_fingerprint_is_normalised_and_length_checked_before_any_request() {
+        assert_eq!(approval_fingerprint_arg(" abcd-efgh ").unwrap(), "ABCDEFGH");
+        assert_eq!(approval_fingerprint_arg("abcd 0fgh").unwrap(), "ABCDOFGH");
+        assert_eq!(
+            approval_fingerprint_arg("ABCDEFG").unwrap_err(),
+            "the fingerprint has 8 characters (7 given)"
+        );
+        assert!(approval_fingerprint_arg("").is_err());
     }
 
     #[test]
