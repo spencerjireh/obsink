@@ -102,11 +102,11 @@ This prevents most accidental conflicts. On iOS the same check feeds the auto-sy
 
 Every vault request carries `Authorization: Bearer <token>`. The bearer is an `os_…` session token minted by `/auth/*`, stored as SHA-256, with a 180-day absolute expiry. The server resolves it to a **user** and a **device**; every vault route is scoped to the vaults that user is a member of. There is no other principal: scripts and harnesses sign in as ordinary accounts (`AUTH_DEV_RETURN_CODE=1` on a dev server returns the one-time code inline; against production they keep a minted session token).
 
-Clients offer one setup flow: sign in with an emailed 6-digit one-time code (all platforms) or Sign in with Apple (iOS), then unlock with the account passphrase (§6, §12); the server is baked into each build (the CLI also takes `--server-url`), never a field in the UI. Apple sign-in needs no per-server Apple configuration because the identity token's audience is the ObSink app's bundle id (`APPLE_CLIENT_IDS`, default `com.obsink.ios`).
+Clients offer one setup flow: sign in with an emailed 6-digit one-time code, then unlock with the account passphrase or by approval from a device that is already unlocked (§6, §12); the server is baked into each build (the CLI also takes `--server-url`), never a field in the UI.
 
 **Devices.** A device is a physical machine, identified by a client-generated UUID that the client keeps for good (macOS Keychain, shared by the desktop app and the CLI; iOS Keychain; IndexedDB in the browser, where a cleared site profile is a new device). Every sign-in carries `device: { id, name, platform }` with `platform` one of `macos`, `ios`, `browser`, `cli`; the field is required, and a sign-in without it is `400 { "error": "update ObSink to continue" }` (this is what keeps protocol-2 clients out, §6.1). A sign-in for a device id the account already knows replaces that device's session, so a device has exactly one session and signing in twice on one Mac does not produce two rows. `name` is free text (80 characters), sealed at rest, and can be changed from any device.
 
-**Invite-only signup.** The first account on a fresh server signs up without an invite. After that, creating a new account requires an unused, unexpired invite code; existing accounts sign in freely. A code stays spent after the account that redeemed it is deleted. Any signed-in user can mint codes, and `obsink-server invite` mints one from the server's shell with no creator (bootstrap and operator use): 8 characters from `ABCDEFGHJKLMNPQRSTUVWXYZ23456789`, single-use, valid 7 days. Redemption failures are rate-limited process-wide (20 per minute). Invites create accounts; they are not vault sharing.
+**Invite-only signup.** The first account on a fresh server signs up without an invite. After that, creating a new account requires an unused, unexpired invite code; existing accounts sign in freely. A code stays spent after the account that redeemed it is deleted. Any signed-in user can mint codes, and `obsink-server invite` mints one from the server's shell with no creator (bootstrap and operator use): 8 characters from `ABCDEFGHJKLMNPQRSTUVWXYZ23456789`, single-use, valid 7 days. Redemption failures are rate-limited process-wide (20 per minute). Invites create accounts; they are not vault sharing. In the same way, `obsink-server code <email>` mints a one-time sign-in code from the server's shell for servers without SMTP: no mail is sent and no cooldown applies; otherwise it is the same code as `/auth/email/start` (10 minutes, 5 attempts).
 
 Per-account quotas: `MAX_VAULTS_PER_USER` (default 10) and `MAX_VAULT_BYTES` per vault (default 1 GiB), counted against the vault's owner.
 
@@ -114,16 +114,19 @@ Accounts decide only *which encrypted vaults* a bearer may list and write. They 
 
 Auth endpoints (no bearer unless noted):
 
-- `GET /` → `{ service, protocol: 3, auth: { email, apple }, invite_required }` — the wire format the server speaks, which sign-in methods are configured, and whether new sign-ups need an invite. A client built for another protocol shows `Update ObSink` and stops.
+- `GET /` → `{ service, protocol: 3, auth: { email, apple }, invite_required }` — the wire format the server speaks, whether email sign-in is configured, and whether new sign-ups need an invite. `auth.apple` is always `false` since 0.5 (Sign in with Apple was removed; the field stays so older iOS builds hide the button). A client built for another protocol shows `Update ObSink` and stops.
 - `POST /auth/email/start { email }` → sends the code over SMTP. One per email per 60 s; code valid 10 min, 5 attempts. A failed send does not consume the cooldown. `AUTH_DEV_RETURN_CODE=1` (dev only) returns the code in the response.
 - `POST /auth/email/verify { email, code, device, invite_code? }` → `{ token, session, user }`.
-- `POST /auth/apple { identity_token, device, email?, code?, invite_code? }` → same; verifies the RS256 JWT against Apple's JWKS (`iss`, `aud ∈ APPLE_CLIENT_IDS`, `exp`) and links to an existing email account when the token's `email` claim matches. Apple includes that claim only in the first token it issues for an app, so a client may forward the credential's email as `email`; because the hint is unverified, the server honours it only together with `code`, a one-time code from `/auth/email/start` for that address (consumed on success). A hint without a code is `403 { "error": "email verification required: …" }` and the client prompts for the code; a token with no claim and no hint signs in by Apple subject alone (a new account then has no email).
 - `GET /auth/keys` (bearer) → `{ account_key: null }` for an account that has not set a passphrase, else `{ account_key: { key_id, wrapped, salt } }` (§6.1). The verifier is never returned.
 - `PUT /auth/keys { wrapped, salt, verifier }` (bearer) → `201 { key_id }`. Create-only: when the account already has a key the answer is `409 { account_key: { key_id, wrapped, salt } }` and the client unlocks with that instead (two devices setting up the same new account at once cannot fork it). `wrapped` is base64 of `[12-byte nonce][32-byte ciphertext][16-byte tag]`, `salt` base64 of 16 bytes; anything else is `400`.
 - `PUT /auth/keys/rewrap { wrapped, salt, verifier }` (bearer) → `200`. A passphrase change: the same account key wrapped under the new passphrase. `verifier` must equal the stored one (constant-time compare), which only a client holding the unwrapped account key can compute, so a stolen session cannot lock the owner out. `key_id` does not change.
-- `GET /auth/me` (bearer) → `{ user, devices: [{ id, name, platform, created, last_seen, current, vault_ids }], usage: { vaults: [{ id, bytes }], total_bytes, max_vault_bytes, max_vaults } }`. `last_seen` is updated at sign-in and by the checkpoint report, not on every request.
+- `PUT /auth/approval { public_key }` (bearer) → `201 { requested, expires }`. A signed-in device without the account key asks for it; `public_key` is a fresh X25519 public key (base64, 32 bytes). One request per device; registering again replaces it; valid 10 minutes; `400 { "error": "set a passphrase first" }` before the account has a key. The device shows the fingerprint of its key (§6.1); the server never computes or returns a fingerprint.
+- `GET /auth/approval` (bearer) → `{ approval: null }` or `{ approval: { public_key, requested, expires, wrapped, key_id?, approved_by?, approved? } }`. `wrapped` is null until an unlocked device approves; the request is kept until `DELETE /auth/approval` or expiry (approval extends the expiry by 10 minutes so the poller can collect it).
+- `DELETE /auth/approval` (bearer) → `204`, idempotent: withdraw this device's request (after the key is stored, or on Cancel).
+- `POST /auth/devices/:id/approval { wrapped, verifier }` (bearer) → `204`. An unlocked device wraps the account key to the pending device's public key (§6.1) after the user typed that device's fingerprint; `verifier` must equal the stored account verifier (`403 { "error": "passphrase does not match this account" }` otherwise), `400` for one's own id, `404` for a device of another account or one without a live request, `409` when already approved. The server stores the 92-byte blob as sent and cannot open it.
+- `GET /auth/me` (bearer) → `{ user, devices: [{ id, name, platform, created, last_seen, current, vault_ids }], usage: { vaults: [{ id, bytes }], total_bytes, max_vault_bytes, max_vaults } }`. `last_seen` is updated at sign-in and by the checkpoint report, not on every request. A device with a live approval request also carries `approval: { public_key, requested, expires, approved }`.
 - `PATCH /auth/devices/:id { name }` (bearer) → `200`. Rename a device of this account from any device.
-- `DELETE /auth/devices/:id` (bearer) → sign out another device: its session, its `device_vaults` rows and the device row go in one transaction. The revoked device gets `401` on its next request and shows `Session expired`; its folders and keys stay where they are (there is no remote wipe). A later sign-in from the same machine registers it again.
+- `DELETE /auth/devices/:id` (bearer) → sign out another device: its session, its `device_vaults` rows, any approval request (it lives on the device row) and the device row go in one transaction. The revoked device gets `401` on its next request and shows `Session expired`; its folders and keys stay where they are (there is no remote wipe). A later sign-in from the same machine registers it again.
 - `DELETE /auth/session` (bearer) → sign out this device (the same effect on this device's row).
 - `DELETE /auth/account` (bearer) → delete the account, its devices and sessions, its invites, its wrapped keys, and every vault it owns (blobs, versions, trash, manifests). Required by App Store guideline 5.1.1(v).
 - `POST /auth/invites` (bearer) → `201 { invite: { code, created, expires } }`; `GET /auth/invites` → `{ invites: [{ code, created, expires, status, used_at }] }`.
@@ -136,8 +139,8 @@ Clients keep the bearer in the OS keychain (service `obsink`, account `bearer:<c
 
 **Postgres** holds metadata:
 
-- `users` (id, sealed email, sealed Apple subject, keyed-HMAC lookup columns, `account_key_enc`, `account_key_salt`, `account_key_id`, `account_key_verifier`) — the account key columns are null until the first `PUT /auth/keys`; `account_key_enc` is client ciphertext stored as sent, the verifier a 32-byte HMAC
-- `devices` (user_id, id, sealed name, platform, created, last_seen; primary key `(user_id, id)`, so two accounts on one machine never collide)
+- `users` (id, sealed email, keyed-HMAC lookup columns, `account_key_enc`, `account_key_salt`, `account_key_id`, `account_key_verifier`) — the account key columns are null until the first `PUT /auth/keys`; `account_key_enc` is client ciphertext stored as sent, the verifier a 32-byte HMAC. The 0.4 columns for the sealed Apple subject remain, unused
+- `devices` (user_id, id, sealed name, platform, created, last_seen, `approval_public_key`, `approval_requested`, `approval_expires`, `approval_wrapped`, `approval_approved_by`, `approval_approved`; primary key `(user_id, id)`, so two accounts on one machine never collide) — the approval columns hold one live request per device (§4.1); the public key and the wrapped blob are client material stored as sent
 - `sessions` (id, user_id, device_id, SHA-256 of the token, created, expires; unique on `(user_id, device_id)`)
 - `email_codes`, `invites` (`created_by` null for codes minted from the server's shell)
 - `vaults` (id, `owner` → users, sealed name, created, `max_file_size`, `revision`, `last_write`) — `revision` increments on every manifest change and is the manifest ETag; `last_write` is the time of that change
@@ -155,7 +158,7 @@ blobs/_trash/<vault_id>/<sha256(path token)>/<unix>[-n]      soft-deleted blobs 
 
 File names are hashes of the client's path token, so nothing a client sends can escape the store.
 
-**Envelope encryption.** `OBSINK_SERVER_KEY` (32 bytes; generated on first run and written to `<data>/server.key` when unset) is HKDF input for three sub-keys: blobs are wrapped again with AES-GCM (they are already client ciphertext), sensitive columns (emails, Apple subjects, device names, vault names) are sealed with a per-row AAD, and lookups by email or Apple subject go through keyed HMAC indexes. Wrapped account and vault keys are already ciphertext under keys the server never has and are stored as sent. Losing the server key makes the metadata unreadable; the account passphrase is still required to read any content.
+**Envelope encryption.** `OBSINK_SERVER_KEY` (32 bytes; generated on first run and written to `<data>/server.key` when unset) is HKDF input for three sub-keys: blobs are wrapped again with AES-GCM (they are already client ciphertext), sensitive columns (emails, device names, vault names) are sealed with a per-row AAD, and lookups by email go through a keyed HMAC index. Wrapped account and vault keys are already ciphertext under keys the server never has and are stored as sent. Losing the server key makes the metadata unreadable; the account passphrase is still required to read any content.
 
 **Manifest structure** (as served; keys are path tokens, `encPath` recovers the real path):
 
@@ -259,7 +262,7 @@ An in-process task runs at startup and then every `RETENTION_INTERVAL_SECS` (def
 
 **Trash purging** — Hard-deletes trash older than 30 days.
 
-**Housekeeping** — Removes expired sessions, day-old one-time codes, and blob directories whose vault row no longer exists. Devices are never expired: the user sees and removes them.
+**Housekeeping** — Removes expired sessions, day-old one-time codes, and blob directories whose vault row no longer exists; expired approval requests are cleared from their device rows. Devices are never expired: the user sees and removes them.
 
 ---
 
@@ -304,6 +307,8 @@ One passphrase per account; one random key per vault; the server holds only wrap
 | **Verifier** | `HMAC-SHA256(HKDF(account key, "obsink:v3:verify"), user id)` | on the server, never returned; proves a rewrap request comes from a client that holds the account key |
 | **Vault key** | 32 random bytes, generated when the vault is created | in the OS keychain under the vault id, as before; on the server per member as `AES-256-GCM(HKDF(account key, "obsink:v3:vault-wrap"), vault key)` with AAD = vault id |
 | **Sub-keys** | HKDF-SHA256 of the vault key: `content_enc`, `content_mac`, `path_token`, `path_enc` (unchanged from v2) | derived on demand |
+| **Approval key** | an X25519 keypair a signed-in device generates when it lacks the account key; its fingerprint is the first 8 symbols of `SHA-256("obsink:v3:approval-fingerprint" ‖ public key)` read in 5-bit groups through the invite alphabet `ABCDEFGHJKLMNPQRSTUVWXYZ23456789` | secret in the keychain (`approval:<user id>`; browser: worker memory) until the account key arrives, then deleted; public key on the device row for 10 minutes |
+| **Approval wrap** | `AES-256-GCM(HKDF-SHA256(X25519(approver ephemeral, pending public), "obsink:v3:device-approval" ‖ approver pub ‖ pending pub), account key)` with AAD = `user id:device id`, prefixed with the approver's ephemeral public key; 92 bytes | on the device row until the pending device acknowledges (`DELETE /auth/approval`) |
 
 Consequences:
 
@@ -312,6 +317,7 @@ Consequences:
 - Changing the passphrase rewraps the account key (`PUT /auth/keys/rewrap`); nothing else changes. The account key and the vault keys are never rotated in v3.
 - Vault keys do not derive from the account key, so a vault can later be shared by wrapping its key for another member. Only the wrap changes hands, never a passphrase.
 - The passphrase never leaves the device, but the wrapped account key does travel to any session holder, and a database dump contains it. Argon2id at the parameters above is the defence, and clients require at least 12 characters when the passphrase is set.
+- A new device can also be unlocked from one that already is: the server relays a public key and a ciphertext it cannot open. The only thing that stops a server from substituting its own key is the fingerprint the user reads on the new device and types on the unlocked one; the approving client wraps only when they match (8 symbols, 40 bits, chosen knowingly over 12). The passphrase remains the fallback and the only way to unlock the first device.
 - **File encryption**: AES-256-GCM with a random 96-bit nonce per file; blob = `[12-byte nonce][ciphertext][16-byte GCM auth tag]`. Unchanged.
 - `PROTOCOL_VERSION = 3`. v2 vaults (passphrase-derived keys, one passphrase per vault) are not migrated: the cutover wipes the server, and v2 clients cannot sign in (§4.1).
 
@@ -321,15 +327,15 @@ Consequences:
 - File paths: **encrypted** (`encPath`) and **tokenized** (manifest keys are `HMAC(path_token_key, path)`)
 - File hashes: **keyed HMACs** of plaintext content (see §3.3)
 - Vault names, device names, emails: sealed with the server's envelope key (the server can read them; nothing else can)
-- Account key, vault keys: **wrapped** under keys the server never has. The server holds no KEK, no account key, no vault key, and cannot check a passphrase; it can only tell whether a rewrap request knows the account key.
+- Account key, vault keys: **wrapped** under keys the server never has. During an approval the account key travels once more, wrapped to a key the server never has (§6.1). The server holds no KEK, no account key, no vault key, and cannot check a passphrase; it can only tell whether a rewrap or approve request knows the account key.
 
 ### 6.3 Key Storage
 
-| Platform | Account key | Device id | Vault keys |
-|---|---|---|---|
-| macOS (desktop app and CLI share these) | Keychain `account:<user id>`, `key_id` alongside; `user:<canonical server URL>` names the signed-in user id so the entry can be found without a request | Keychain `device:<canonical server URL>` (`OBSINK_DEVICE_ID` overrides for harnesses) | Keychain, account = vault id |
-| iOS | Keychain (app group, `AfterFirstUnlock`), same account names | Keychain | Keychain, account = vault id |
-| Browser | worker memory for the tab's lifetime; a reload shows `Unlock` | IndexedDB | worker memory |
+| Platform | Account key | Device id | Vault keys | Approval secret |
+|---|---|---|---|---|
+| macOS (desktop app and CLI share these) | Keychain `account:<user id>`, `key_id` alongside; `user:<canonical server URL>` names the signed-in user id so the entry can be found without a request | Keychain `device:<canonical server URL>` (`OBSINK_DEVICE_ID` overrides for harnesses) | Keychain, account = vault id | desktop: Keychain `approval:<user id>` while a request is live; CLI: process memory during the wait |
+| iOS | Keychain (app group, `AfterFirstUnlock`), same account names | Keychain | Keychain, account = vault id | Keychain `approval:<user id>` while a request is live |
+| Browser | worker memory for the tab's lifetime; a reload shows `Unlock` | IndexedDB | worker memory | worker memory; a reload starts a new request |
 
 Nothing wrapped is cached in client config: a vault's wrapped key is fetched from `GET /vaults` when the vault is downloaded or created, unwrapped once, and the unwrapped key is what the keychain keeps. A keychain account key whose `key_id` no longer matches `GET /auth/keys` (the losing side of the first-set race in §4.1) is discarded and the client asks for the passphrase again.
 
@@ -458,11 +464,13 @@ Stable UUIDs assigned on first encounter. **Never** use file paths as identifier
 
 ### 12.1 Sign in and unlock
 
-1. **Sign in** with an email code or Sign in with Apple (iOS). Each build talks to one server (baked in at build time; the CLI also takes `--server-url`), so there is no URL to enter. New accounts need an invite code unless the server has no users yet. The client sends its device id, name and platform; the session token goes to the keychain, so this happens once per device.
+1. **Sign in** with an email code. Each build talks to one server (baked in at build time; the CLI also takes `--server-url`), so there is no URL to enter. New accounts need an invite code unless the server has no users yet. The client sends its device id, name and platform; the session token goes to the keychain, so this happens once per device.
 2. **Unlock.** The client calls `GET /auth/keys`.
    - `null` (a new account): `Set passphrase`, twice, at least 12 characters. The client generates the salt and the account key, wraps the key, computes the verifier, and `PUT /auth/keys`. A `409` means another device set it first: the generated key is discarded and the screen becomes `Unlock` with the message `A passphrase was already set on another device. Enter it.`
-   - a key: `Unlock`. The client derives the KEK, unwraps the account key (a failed tag is `Passphrase does not match this account.`), and stores it in the keychain with the `key_id`.
-   A crash between sign-in and the `PUT` is harmless: the next launch finds `null` again.
+   - a key: two options on one screen.
+     - `Unlock` with the passphrase, as before: the client derives the KEK, unwraps the account key (a failed tag is `Passphrase does not match this account.`), and stores it in the keychain with the `key_id`.
+     - Wait for approval: the client generates the approval key (§6.1), `PUT /auth/approval`, shows the fingerprint with `Waiting for approval from another device.` and `Use passphrase instead`, and polls `GET /auth/approval` every 3 s. On another unlocked device the Devices tab lists the new device as waiting (§15.3); the user types the fingerprint there. The new device receives the wrapped key, unwraps it, stores it with the `key_id`, calls `DELETE /auth/approval`, and is unlocked. After 10 minutes the request is re-registered and a new fingerprint shows.
+   A crash between sign-in and the `PUT` is harmless: the next launch finds `null` again. A crash during the approval wait is harmless too: the next launch restores the secret from the keychain and keeps polling, or starts over with a new request.
 3. **The vault list** (`GET /vaults`). The first account on a fresh server sees `No vaults yet.` and `Create vault`.
 
 ### 12.2 First vault
@@ -471,7 +479,7 @@ Stable UUIDs assigned on first encounter. **Never** use file paths as identifier
 
 ### 12.3 Another device
 
-Sign in (a new device row), unlock (the same passphrase; the unwrap is the check), and the list shows every vault as `Not on this device`. `Download` on each one the user wants here: folder (desktop, browser), `GET /vaults` supplies the wrapped key, unwrap, register the device, first sync pulls all files.
+Sign in (a new device row), then wait for approval from an unlocked device or enter the passphrase (§12.1); the list shows every vault as `Not on this device`. `Download` on each one the user wants here: folder (desktop, browser), `GET /vaults` supplies the wrapped key, unwrap, register the device, first sync pulls all files.
 
 ---
 
@@ -502,11 +510,11 @@ obsink/
 │   ├── Dockerfile            build context = repo root
 │   ├── migrations/           sqlx migrations
 │   ├── src/
-│   │   ├── main.rs           serve | migrate | invite | retention | keygen | healthcheck
+│   │   ├── main.rs           serve | migrate | invite | code | retention | keygen | healthcheck
 │   │   ├── config.rs         env vars, server key
 │   │   ├── crypto.rs         envelope encryption
 │   │   ├── blobs.rs          filesystem blob store
-│   │   ├── auth/             session principal, email, apple, sessions, devices, keys, invites
+│   │   ├── auth/             session principal, email, sessions, devices, keys, approval, invites
 │   │   ├── routes/           vaults (members, devices), files, batch, history (versions, trash), me
 │   │   └── retention.rs      pruning task
 │   └── tests/                DATABASE_URL-gated integration tests
@@ -587,11 +595,11 @@ Every vault the account is a member of, from `GET /vaults` merged with the devic
 
 ### 15.3 Devices tab
 
-One row per device of the account, from `GET /auth/me`: name (editable in place, `Rename`), platform, `Last seen <relative>`, `This device` tag, the vaults it holds as a muted line, and `Sign out`. Signing out this device is the ordinary sign-out; signing out another device is `DELETE /auth/devices/:id`. The revoked device shows `Session expired` on its next request and keeps its folders and keys.
+One row per device of the account, from `GET /auth/me`: name (editable in place, `Rename`), platform, `Last seen <relative>`, `This device` tag, the vaults it holds as a muted line, and `Sign out`. Signing out this device is the ordinary sign-out; signing out another device is `DELETE /auth/devices/:id`. The revoked device shows `Session expired` on its next request and keeps its folders and keys. A device waiting for its key shows `Waiting for approval` in place of `Last seen` and `Approve`: a field for the fingerprint shown on that device; `Approve` wraps the key only when it matches and says `Fingerprint does not match. Check it on the other device.` otherwise; nothing else gates the approver. `Sign out` on a pending device removes it and its request.
 
 ### 15.4 Settings tab
 
-Signed in as (email or user id), the server in mono, usage across vaults, `Change passphrase` (current, new twice), `Invite someone` and the invite list, `Sign out`, `Delete account`. When signed out: the sign-in form. When signed in and locked (browser after a reload, or a lost first-set race): the unlock form, above everything else.
+Signed in as (email or user id), the server in mono, usage across vaults, `Change passphrase` (current, new twice), `Invite someone` and the invite list, `Sign out`, `Delete account`. When signed out: the sign-in form. When signed in and locked (browser after a reload, or a lost first-set race): the unlock form, above everything else, with the approval fingerprint above the passphrase fallback (§12.1).
 
 ### 15.5 Protocol gate
 
@@ -599,4 +607,4 @@ Signed in as (email or user id), the server in mono, usage across vaults, `Chang
 
 ### 15.6 iOS
 
-The same three tabs (`Vaults`, `Devices`, `Settings`). The vault list is a scroll of cards with the same states and a `Download` button on a `Not on this device` card; the vault page is the pushed `Manage` screen with the sections above. `Unlock` and `Set passphrase` are steps of the sign-in sheet.
+The same three tabs (`Vaults`, `Devices`, `Settings`). The vault list is a scroll of cards with the same states and a `Download` button on a `Not on this device` card; the vault page is the pushed `Manage` screen with the sections above. `Unlock` (the approval wait included) and `Set passphrase` are steps of the sign-in sheet.
