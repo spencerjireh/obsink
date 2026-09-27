@@ -28,7 +28,6 @@ export async function getAuthCapabilities(): Promise<AuthCapabilities> {
   const caps = await api.capabilities()
   return {
     email: caps.auth.email,
-    apple: caps.auth.apple,
     invite_required: caps.invite_required ?? false,
   }
 }

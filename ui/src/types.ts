@@ -140,7 +140,14 @@ export type DeviceInfo = {
   last_seen: number
   current: boolean
   vault_ids: string[]
+  // Spec §12.3: the device asked to be approved and the request is live
+  // (omitted or null when none is). An unlocked device offers `Approve`.
+  approval?: { requested: number; expires: number } | null
 }
+
+// Spec §12.3: this device's own live approval request as the waiting screen
+// shows it. `fingerprint` is the 8 characters the approver types.
+export type ApprovalRequest = { fingerprint: string; expires: number }
 
 // Signed out; signed in but the account key is not at hand (`has_key` says
 // whether the account has a passphrase to enter or needs one set); or fully
@@ -170,9 +177,9 @@ export type InviteInfo = {
   used_at: number | null
 }
 
-// `GET /` on the server: which sign-in methods exist and whether a new
+// `GET /` on the server: whether email sign-in exists and whether a new
 // account needs an invite code.
-export type AuthCapabilities = { email: boolean; apple: boolean; invite_required: boolean }
+export type AuthCapabilities = { email: boolean; invite_required: boolean }
 
 // The wire format the server speaks against the one this build speaks
 // (spec §15.5); `server` is null when the server did not answer.

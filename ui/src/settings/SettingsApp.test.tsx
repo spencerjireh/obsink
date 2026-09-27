@@ -1,7 +1,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { BackendProvider } from '../backend'
-import type { AccountState } from '../types'
+import type { AccountState, DeviceInfo } from '../types'
 import { mockBackend, unlockedAccount, vault } from '../test/mock-backend'
 import { SettingsApp } from './SettingsApp'
 
@@ -188,7 +188,7 @@ const otherDevice = {
 }
 const thisDevice = { ...otherDevice, id: 'dev-1', name: 'MacBook', current: true, vault_ids: [] }
 
-function accountWithDevices(devices = [thisDevice, otherDevice]): AccountState {
+function accountWithDevices(devices: DeviceInfo[] = [thisDevice, otherDevice]): AccountState {
   return { kind: 'account', user_id: 'usr_1', email: 'me@example.com', devices, usage: null }
 }
 
@@ -280,6 +280,167 @@ describe('the tabs (spec §15)', () => {
       'old one',
       'correct horse battery',
     ])
+  })
+})
+
+describe('device approval (spec §12.3, §15.3)', () => {
+  const lockedWithKey: AccountState = {
+    kind: 'locked',
+    user_id: 'usr_1',
+    email: 'me@x',
+    has_key: true,
+  }
+  const pendingDevice = {
+    ...otherDevice,
+    id: 'dev-3',
+    name: 'iPhone',
+    platform: 'ios' as const,
+    vault_ids: [],
+    approval: { requested: 1_700_000_000, expires: 1_700_000_600 },
+  }
+
+  it('shows the fingerprint, waits, and unlocks when the poll flips', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    try {
+      let polls = 0
+      const backend = mockBackend({
+        getAccount: () => Promise.resolve(lockedWithKey),
+        pollApproval: () => {
+          polls += 1
+          return Promise.resolve(
+            polls < 2
+              ? {
+                  approval: { fingerprint: 'ABCDEFGH', expires: 1_700_000_600 },
+                  account: lockedWithKey,
+                }
+              : { approval: null, account: unlockedAccount() },
+          )
+        },
+      })
+      renderApp(backend)
+      const fingerprint = await screen.findByTestId('approvalFingerprintText')
+      expect(fingerprint.textContent).toBe('ABCDEFGH')
+      expect(screen.getByTestId('approvalWaitingText').textContent).toBe(
+        'Waiting for approval from another device.',
+      )
+      // The passphrase field waits behind the button.
+      expect(screen.queryByTestId('unlockField')).toBeNull()
+      expect(screen.getByTestId('usePassphraseButton')).toBeTruthy()
+      await act(async () => {
+        vi.advanceTimersByTime(3000)
+      })
+      expect(await screen.findByText('Unlocked.')).toBeTruthy()
+      expect(screen.queryByTestId('approvalFingerprintText')).toBeNull()
+      expect(polls).toBe(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('reveals the passphrase field on Use passphrase instead and unlocks with it', async () => {
+    const backend = mockBackend({
+      getAccount: () => Promise.resolve(lockedWithKey),
+      unlock: () => Promise.resolve(unlockedAccount()),
+    })
+    renderApp(backend)
+    const button = await screen.findByTestId('usePassphraseButton')
+    // The default poll registers nothing: still asking.
+    expect(screen.getByTestId('approvalWaitingText').textContent).toBe('Requesting approval…')
+    expect(screen.queryByTestId('unlockField')).toBeNull()
+    fireEvent.click(button)
+    expect(screen.queryByTestId('usePassphraseButton')).toBeNull()
+    fireEvent.change(screen.getByTestId('unlockField'), {
+      target: { value: 'correct horse battery' },
+    })
+    fireEvent.click(screen.getByTestId('unlockButton'))
+    expect(await screen.findByText('Unlocked.')).toBeTruthy()
+    expect(backend.calls.find((entry) => entry.method === 'unlock')?.args).toEqual([
+      'correct horse battery',
+    ])
+  })
+
+  it('never polls for a fresh account that has no passphrase yet', async () => {
+    const backend = mockBackend({
+      getAccount: () =>
+        Promise.resolve({ kind: 'locked', user_id: 'usr_1', email: 'me@x', has_key: false }),
+      pollApproval: () => Promise.reject({ kind: 'other', message: 'must not poll' }),
+    })
+    renderApp(backend)
+    await screen.findByTestId('setPassphraseButton')
+    expect(screen.queryByTestId('approvalFingerprintText')).toBeNull()
+    expect(screen.queryByTestId('usePassphraseButton')).toBeNull()
+    expect(backend.calls.some((entry) => entry.method === 'pollApproval')).toBe(false)
+  })
+
+  it('approves a pending device from its row after the fingerprint is typed', async () => {
+    const backend = mockBackend({
+      getAccount: () => Promise.resolve(accountWithDevices([thisDevice, pendingDevice])),
+      approveDevice: () => Promise.resolve(accountWithDevices([thisDevice, pendingDevice])),
+    })
+    renderApp(backend)
+    fireEvent.click((await screen.findAllByRole('tab'))[1])
+    const row = (await screen.findAllByTestId('deviceRow'))[1]
+    expect(within(row).getByTestId('devicePendingTag').textContent).toBe('Waiting for approval')
+    expect(within(row).queryByText(/Last seen/)).toBeNull()
+    expect(within(row).queryByTestId('deviceRenameButton')).toBeNull()
+    expect(within(row).getByTestId('deviceSignOutButton')).toBeTruthy()
+    fireEvent.click(within(row).getByTestId('deviceApproveButton'))
+    expect(await screen.findByRole('heading', { name: 'Approve iPhone' })).toBeTruthy()
+    expect(screen.getByText('Type the 8 characters shown on iPhone.')).toBeTruthy()
+    const submit = screen.getByTestId('approveSubmitButton') as HTMLButtonElement
+    expect(submit.disabled).toBe(true)
+    const field = screen.getByTestId('approveFingerprintField') as HTMLInputElement
+    fireEvent.change(field, { target: { value: 'abcd' } })
+    expect(submit.disabled).toBe(true)
+    fireEvent.change(field, { target: { value: 'abcd efgh' } })
+    expect(field.value).toBe('ABCD EFGH')
+    expect(submit.disabled).toBe(false)
+    fireEvent.click(submit)
+    expect(await screen.findByText('Approved iPhone.')).toBeTruthy()
+    expect(backend.calls.find((entry) => entry.method === 'approveDevice')?.args).toEqual([
+      'dev-3',
+      'ABCDEFGH',
+    ])
+    expect(screen.queryByTestId('approveFingerprintField')).toBeNull()
+  })
+
+  it('keeps the form open and says so when the fingerprint does not match', async () => {
+    const message = 'Fingerprint does not match. Check it on the other device.'
+    const backend = mockBackend({
+      getAccount: () => Promise.resolve(accountWithDevices([thisDevice, pendingDevice])),
+      approveDevice: () => Promise.reject({ kind: 'other', message }),
+    })
+    renderApp(backend)
+    fireEvent.click((await screen.findAllByRole('tab'))[1])
+    const row = (await screen.findAllByTestId('deviceRow'))[1]
+    fireEvent.click(within(row).getByTestId('deviceApproveButton'))
+    fireEvent.change(await screen.findByTestId('approveFingerprintField'), {
+      target: { value: 'ABCD-EFGJ' },
+    })
+    fireEvent.click(screen.getByTestId('approveSubmitButton'))
+    expect(await screen.findByText(message)).toBeTruthy()
+    expect(screen.getByTestId('approveFingerprintField')).toBeTruthy()
+    expect(backend.calls.find((entry) => entry.method === 'approveDevice')?.args).toEqual([
+      'dev-3',
+      'ABCDEFGJ',
+    ])
+  })
+
+  it('re-reads the account when the Devices tab opens', async () => {
+    const backend = mockBackend({ getAccount: () => Promise.resolve(accountWithDevices()) })
+    renderApp(backend)
+    const tabs = await screen.findAllByRole('tab')
+    await waitFor(() =>
+      expect(backend.calls.some((entry) => entry.method === 'getAccount')).toBe(true),
+    )
+    const before = backend.calls.filter((entry) => entry.method === 'getAccount').length
+    fireEvent.click(tabs[1])
+    await screen.findAllByTestId('deviceRow')
+    await waitFor(() =>
+      expect(backend.calls.filter((entry) => entry.method === 'getAccount').length).toBeGreaterThan(
+        before,
+      ),
+    )
   })
 })
 
