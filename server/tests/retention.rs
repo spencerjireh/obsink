@@ -168,3 +168,62 @@ async fn removes_orphaned_vault_directories() {
     );
     env.finish().await;
 }
+
+#[tokio::test]
+async fn clears_expired_approval_requests_and_keeps_live_ones() {
+    let Some(env) = TestEnv::try_with_owner().await else {
+        return;
+    };
+    env.clear_email_cooldown(common::OWNER_EMAIL).await;
+    let stale = env.sign_in(common::OWNER_EMAIL, "stale", None).await;
+    env.clear_email_cooldown(common::OWNER_EMAIL).await;
+    let live = env.sign_in(common::OWNER_EMAIL, "live", None).await;
+    for account in [&stale, &live] {
+        let response = env
+            .with_token(&account.token, reqwest::Method::PUT, "/auth/approval")
+            .json(&serde_json::json!({
+                "public_key": obsink_core::encode_base64(
+                    obsink_core::new_approval_request().public_key()
+                )
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 201);
+    }
+    sqlx::query("UPDATE devices SET approval_expires = 1 WHERE id = 'stale'")
+        .execute(&env.state.pool)
+        .await
+        .unwrap();
+    let report = retention::run_once(&env.state, obsink_server::db::now())
+        .await
+        .unwrap();
+    assert_eq!(report.approvals_expired, 1);
+    let (cleared,): (bool,) = sqlx::query_as(
+        "SELECT approval_public_key IS NULL AND approval_requested IS NULL
+             AND approval_expires IS NULL AND approval_wrapped IS NULL
+             AND approval_approved_by IS NULL AND approval_approved IS NULL
+         FROM devices WHERE id = 'stale'",
+    )
+    .fetch_one(&env.state.pool)
+    .await
+    .unwrap();
+    assert!(cleared);
+    let status: serde_json::Value = env
+        .with_token(&live.token, reqwest::Method::GET, "/auth/approval")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(status["approval"]["public_key"].is_string());
+    assert_eq!(
+        retention::run_once(&env.state, obsink_server::db::now())
+            .await
+            .unwrap()
+            .approvals_expired,
+        0
+    );
+    env.finish().await;
+}

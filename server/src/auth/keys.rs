@@ -43,7 +43,13 @@ struct Material {
     verifier: Vec<u8>,
 }
 
-fn decode_field(value: Option<&str>, name: &str, len: usize) -> Result<Vec<u8>, ApiError> {
+/// Base64 body field of a fixed length: missing, malformed and wrong-length
+/// values are each a 400 naming the field.
+pub(crate) fn decode_field(
+    value: Option<&str>,
+    name: &str,
+    len: usize,
+) -> Result<Vec<u8>, ApiError> {
     let bytes = value
         .map(decode_base64)
         .transpose()

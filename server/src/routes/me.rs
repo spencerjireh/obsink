@@ -96,6 +96,7 @@ pub async fn me(
         &state.keys,
         &principal.user_id,
         &principal.device_id,
+        db::now(),
     )
     .await?;
     Ok(Json(MeResponse {

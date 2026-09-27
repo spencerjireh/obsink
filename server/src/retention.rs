@@ -1,6 +1,7 @@
 //! Retention: prune old versions and trash (spec §8.1, §9.2), drop expired
-//! sessions and stale one-time codes, and sweep blob directories whose vault
-//! row is gone. Runs at startup and then on an interval.
+//! sessions, stale one-time codes and expired approval requests, and sweep
+//! blob directories whose vault row is gone. Runs at startup and then on an
+//! interval.
 
 use std::{
     fs, io,
@@ -29,6 +30,8 @@ pub struct Report {
     pub trash_removed: usize,
     pub sessions_removed: u64,
     pub codes_removed: u64,
+    /// Expired device approval requests cleared from their device rows.
+    pub approvals_expired: u64,
     pub orphan_dirs_removed: usize,
 }
 
@@ -36,11 +39,12 @@ impl std::fmt::Display for Report {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "versions={} trash={} sessions={} codes={} orphan_dirs={}",
+            "versions={} trash={} sessions={} codes={} approvals={} orphan_dirs={}",
             self.versions_removed,
             self.trash_removed,
             self.sessions_removed,
             self.codes_removed,
+            self.approvals_expired,
             self.orphan_dirs_removed
         )
     }
@@ -187,6 +191,16 @@ pub async fn run_once(state: &AppState, now: u64) -> Result<Report, ApiError> {
         .execute(&state.pool)
         .await?
         .rows_affected();
+    report.approvals_expired = sqlx::query(
+        "UPDATE devices SET approval_public_key = NULL, approval_requested = NULL,
+             approval_expires = NULL, approval_wrapped = NULL, approval_approved_by = NULL,
+             approval_approved = NULL
+         WHERE approval_public_key IS NOT NULL AND approval_expires <= $1",
+    )
+    .bind(db::to_i64(now))
+    .execute(&state.pool)
+    .await?
+    .rows_affected();
 
     report.orphan_dirs_removed = sweep_orphans(state, SystemTime::now()).await?;
     Ok(report)
