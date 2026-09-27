@@ -8,8 +8,8 @@ You need:
 - A host with Docker and Docker Compose v2 (a small VPS, a NAS, a home server).
 - A domain and TLS. The server speaks plain HTTP on port 8080; put a reverse proxy in front
   (Coolify's Traefik, Caddy, nginx, or Tailscale). iOS refuses plain HTTP to a public host.
-- Optional: an SMTP account for email sign-in codes. Without SMTP, iOS users sign in with Apple
-  and desktop/CLI users need a dev-only flag (see "Without SMTP").
+- Optional: an SMTP account for email sign-in codes. Without SMTP, print the codes from the
+  server's shell (see "Without SMTP").
 
 ## 1. Try it locally
 
@@ -40,7 +40,6 @@ Every setting is an environment variable. Defaults are in `server/src/config.rs`
 | `OBSINK_DATA_DIR` | `/data` | Blob volume; also holds `server.key` when the key is not set |
 | `OBSINK_SERVER_KEY` | generated | 32-byte base64 envelope key (`obsink-server keygen`). **Back it up**: metadata is unreadable without it |
 | `SMTP_HOST`, `SMTP_PORT` (587), `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM`, `SMTP_TLS` (`starttls`\|`tls`\|`none`) | unset | Email one-time codes. Unset = email sign-in disabled |
-| `APPLE_CLIENT_IDS` | `com.obsink.ios` | Accepted audiences for Sign in with Apple; empty disables it |
 | `AUTH_DEV_RETURN_CODE` | unset | `1` returns the email code in the API response. **Never in production** |
 | `MAX_VAULTS_PER_USER` | `10` | Per-account vault cap |
 | `MAX_VAULT_BYTES` | `1073741824` | Per-vault byte budget for accounts (`507` when exceeded) |
@@ -50,9 +49,6 @@ Every setting is an environment variable. Defaults are in `server/src/config.rs`
 | `OBSINK_MIGRATE_ON_START` | `1` | Apply migrations at startup |
 | `OBSINK_LISTEN` | `0.0.0.0:8080` | Bind address |
 | `RUST_LOG` | `obsink_server=info,tower_http=info` | Log filter |
-
-Sign in with Apple works on any server without Apple-side configuration: the identity token's
-audience is the ObSink app's bundle id, which the server verifies against Apple's public keys.
 
 ## 3. Deploy with Coolify
 
@@ -102,6 +98,12 @@ docker compose -f docker-compose.coolify.yml exec server obsink-server invite --
 
 Friends enter the code in the "Invite code" field when they sign in for the first time.
 
+A second device of an account signs in with its own email code and then waits for approval: it
+shows an 8-character fingerprint, and any unlocked device of the account (the Devices tab in the
+apps, `obsink devices --approve <id> <fingerprint>` on the CLI) types it to hand over the account
+key. The passphrase is the fallback (`Use passphrase instead`, `obsink unlock --passphrase`). The
+server relays a public key and a ciphertext it cannot open (spec §6.1).
+
 ## 5. Verify
 
 There is no operator principal: the harnesses sign in as an account. Sign a
@@ -119,11 +121,24 @@ Both create and delete their own vaults under the harness account.
 
 ## 6. Without SMTP
 
-If you cannot send mail, iOS users still have Sign in with Apple. For desktop and CLI, run a
-one-off local stack with `AUTH_DEV_RETURN_CODE=1` (as `docker-compose.yml` does) so the code is
-printed instead of mailed, or mint sessions through an invite from a device that can sign in.
-Do not enable `AUTH_DEV_RETURN_CODE` on an internet-facing server: it hands the code to anyone who
-knows an email address.
+If you cannot send mail, mint the code from the server's shell:
+
+```bash
+docker compose -f docker-compose.coolify.yml exec server obsink-server code you@example.com
+# 483920  (valid 10 minutes, 5 attempts)
+```
+
+It is the same code `/auth/email/start` would have mailed (10 minutes, 5 attempts), so nothing
+else changes: the first account needs no invite, later ones do, and a second device is approved
+from the first or unlocks with the passphrase. The CLI takes the code without asking the server to
+send one: `obsink login --code 483920 --email you@example.com`. The command records the send time,
+so a client that asks for a mailed code within the next 60 seconds gets `429`.
+
+Two limits of the current clients: the apps always request a mailed code first, and every client
+(the CLI included) refuses to sign in when `GET /` reports `auth.email: false`, which the server
+does unless `SMTP_*` is set or `AUTH_DEV_RETURN_CODE=1`. `AUTH_DEV_RETURN_CODE` stays a
+development flag (the local `docker-compose.yml` sets it): never enable it on an internet-facing
+server, it hands the code to anyone who knows an email address.
 
 ## 7. Backups and upgrades
 
@@ -143,9 +158,10 @@ knows an email address.
 
 ## What gets stored where
 
-- Postgres: accounts (sealed email/Apple subject), sessions (token hashes), invites, vault rows,
-  and one manifest row per file (path token, keyed content hash, size, mtime, tombstone flag,
-  encrypted real path).
+- Postgres: accounts (sealed email), devices (sealed name; a pending approval request as the
+  device's public key and the account key wrapped to it, both client material the server cannot
+  open), sessions (token hashes), invites, vault rows, and one manifest row per file (path token,
+  keyed content hash, size, mtime, tombstone flag, encrypted real path).
 - `/data/blobs/live/<vault>/…`: current blobs. `/data/blobs/_versions/…` and
   `/data/blobs/_trash/…`: history, pruned by retention.
 - `/data/server.key`: the envelope key, only when `OBSINK_SERVER_KEY` is unset.

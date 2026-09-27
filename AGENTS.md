@@ -9,9 +9,11 @@ ObSink is a free, self-hosted, end-to-end encrypted sync engine for
 Tauri desktop app (macOS), and an iOS client; the backend is a Rust server
 (`server/`, axum + Postgres + an encrypted blob volume) that operators run with
 `docker compose up` behind their own TLS proxy. Accounts are invite-only
-(email one-time code everywhere, Sign in with Apple on iOS); one account
-passphrase unlocks every vault, and every vault an account owns is listed on
-every device (spec §6, §15). **`spec.md` is the
+(an email one-time code everywhere, and nothing else); one account passphrase
+unlocks every vault, a later device is unlocked by approval from one that
+already is (an 8-character fingerprint typed there) or with the passphrase,
+and every vault an account owns is listed on every device (spec §6, §12,
+§15). **`spec.md` is the
 spec source of truth** — read it before your first task. Architecture/wire-format
 details live in `docs/architecture.md`; per-platform status in `docs/platforms.md`;
 deployment in `docs/self-hosting.md`.
@@ -20,18 +22,18 @@ deployment in `docs/self-hosting.md`.
 
 - **Rust** — stable, edition 2021 (Cargo workspace: `core`, `core-wasm`, `cli`,
   `desktop/src-tauri`, `mobile`, `server`). Core deps: `aes-gcm` 0.10, `argon2` 0.5,
-  `hkdf` 0.12, `hmac` 0.12, `sha2` 0.10, `reqwest` 0.12 (rustls-tls),
-  `tokio` 1, `tracing` 0.1; `security-framework` 3 behind the `keychain`
-  feature (CLI + desktop keychain access without a `security` argv).
+  `hkdf` 0.12, `hmac` 0.12, `sha2` 0.10, `x25519-dalek` 2 (device approval
+  key agreement), `reqwest` 0.12 (rustls-tls), `tokio` 1, `tracing` 0.1;
+  `security-framework` 3 behind the `keychain` feature (CLI + desktop keychain
+  access without a `security` argv).
 - **Server** — `server/` crate (`obsink-server`): `axum` 0.8 (HTTP +
   multipart), `tokio`, `tower-http` (tracing), `sqlx` 0.8 (Postgres, runtime
   queries, embedded migrations), `lettre` 0.11 (SMTP one-time codes),
-  `jsonwebtoken` 9 (Apple identity tokens), `reqwest` (JWKS fetch,
-  healthcheck), `subtle` (constant-time verifier compare), `rand`/`uuid`
-  (tokens, ids), `walkdir` (retention), `clap` (subcommands); envelope crypto
-  uses the same `aes-gcm`/`hkdf`/`hmac`/`sha2` versions as core. Dev:
-  `tempfile`, `rsa` (forges Apple tokens in tests). Env vars are listed in
-  `server/src/config.rs`; deployment in `docs/self-hosting.md`; API in spec §4.
+  `reqwest` (healthcheck), `subtle` (constant-time verifier compare),
+  `rand`/`uuid` (tokens, ids), `walkdir` (retention), `clap` (subcommands);
+  envelope crypto uses the same `aes-gcm`/`hkdf`/`hmac`/`sha2` versions as
+  core. Dev: `tempfile`. Env vars are listed in `server/src/config.rs`;
+  deployment in `docs/self-hosting.md`; API in spec §4.
 - **Desktop** — Tauri v2 (`@tauri-apps` 2.0), React 18.3, Vite 5.4, TypeScript 5.6.
 - **Web** — npm workspaces `ui` (the React screens and the `Backend` interface,
   shared with desktop), `desktop` (the Tauri `Backend`) and `web` (the browser
@@ -62,7 +64,7 @@ obsink/
                          #   (crypto, manifest, ignore, sync_rules, pacing, server_url also build for wasm32)
   core-wasm/             # wasm-bindgen bindings over the pure core modules for the browser client
   cli/                   # `obsink` CLI (reference client)
-  server/                # obsink-server (axum): accounts, vaults, files, batch, retention; Dockerfile
+  server/                # obsink-server (axum): accounts, device approval, vaults, files, batch, retention; Dockerfile
   ui/                    # shared React screens + the Backend interface (npm workspace, TS source)
   desktop/               # Tauri v2 shell (src-tauri/) + the Tauri Backend and entry (src/)
   web/                   # browser client at /app: worker Backend (File System Access + core-wasm + fetch);
@@ -155,6 +157,7 @@ DATABASE_URL=postgres://postgres:postgres@localhost:5433/postgres OBSINK_TEST_RE
 # Local server stack (server built from this checkout + Postgres + Mailpit on :8025)
 docker compose up -d --wait     # OBSINK_PORT=18080 if 8080 is taken; never reads .env.deploy
 docker compose exec server obsink-server invite
+docker compose exec server obsink-server code you@example.com   # a sign-in code without mail (servers without SMTP)
 
 # Desktop (lint + format check, build the web bundle, then check the Tauri Rust)
 npm ci && npm run lint && npm run format:check && npm run typecheck -w ui && npm run build -w desktop && cargo test -p obsink-desktop
@@ -196,7 +199,12 @@ RUST_LOG=obsink_core=debug cargo run -p obsink -- sync
   `obsink-server invite` on the server).
 - `OBSINK_PASSPHRASE`, `OBSINK_DEVICE_ID` — the harness account's passphrase and
   a fixed device id, so `login`, `unlock`, `init` and `download` run
-  non-interactively; the two-device scripts set a different device id per side
+  non-interactively; a set `OBSINK_PASSPHRASE` also makes `login` and `unlock`
+  skip the approval wait (as `--passphrase` does), so a harness that wants the
+  approval path (the desktop smoke, the web e2e, the simulator e2e) leaves it
+  unset for the second device. Approval is the harness-free path for a real
+  second device: nothing but an unlocked device and the typed fingerprint. The
+  two-device scripts set a different device id per side
   (`OBSINK_HARNESS_EMAIL` lets the CLI harness sign device two in for real on
   the compose stack, where the code comes back inline).
 - `OBSINK_INVITE_CODE` — an invite for the harnesses that create a fresh
@@ -227,6 +235,8 @@ P8 pivot are decommissioned; nothing in the repo references them.
   message: `feat(ios): file-provider enumerateChanges (OBS-12)` (format below).
 - Crypto changes require matching test updates (round-trip, wrong-key rejection,
   tamper detection). Never ship crypto without tests.
+- Merging a PR deploys nothing: the Coolify redeploy, the `vX.Y.Z` tag and
+  `scripts/release-ios.sh` are separate steps (see "Version bump and release").
 
 ## Git workflow
 
@@ -287,6 +297,8 @@ Status, tasks, decisions, and session logs live in the Plane project **OBS**
   cancelled; P11 planned). P8 = the self-hosted server pivot (OBS-82..89); P7
   (Cloudflare accounts) is superseded by it. P11 = the account key, devices and
   the vault list (wire format v3, OBS-131..144; decision 2026-09-22 on OBS-74).
+  P12 = one sign-in: email code only, device key approval (OBS-146..156;
+  decision 2026-09-27 on OBS-74).
 - Work items are session-sized; move to **In Progress** when starting, comment
   outcomes (e.g. test output or a deploy URL), then mark **Done**. Reference the
   item in commits: `feat(ios): file-provider enumerateChanges (OBS-12)`.
