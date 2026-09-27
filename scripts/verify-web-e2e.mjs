@@ -132,6 +132,10 @@ async function signIn(page, invite) {
 
 async function unlock(page) {
   await page.getByRole('heading', { name: 'Unlock' }).waitFor()
+  // Spec §12.1: a device with a key on the server waits for approval first;
+  // the passphrase field sits behind `Use passphrase instead`.
+  const usePassphrase = page.getByTestId('usePassphraseButton')
+  if (await usePassphrase.isVisible()) await usePassphrase.click()
   await page.getByRole('textbox', { name: 'Passphrase' }).fill(PASSPHRASE)
   await page.getByRole('button', { name: 'Unlock' }).click()
   await page.getByText('Unlocked.').waitFor({ timeout: 60_000 })
