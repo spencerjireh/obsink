@@ -17,7 +17,7 @@ use std::sync::Arc;
 use sqlx::PgPool;
 
 use crate::{
-    auth::{apple::AppleVerifier, email::Mailer, invites::RedeemLimiter},
+    auth::{email::Mailer, invites::RedeemLimiter},
     blobs::BlobStore,
     config::Config,
     crypto::ServerKeys,
@@ -30,7 +30,6 @@ pub struct AppState {
     pub keys: Arc<ServerKeys>,
     pub blobs: Arc<BlobStore>,
     pub mailer: Arc<dyn Mailer>,
-    pub apple: Arc<AppleVerifier>,
     pub redeem_limiter: Arc<RedeemLimiter>,
 }
 
@@ -42,17 +41,12 @@ impl AppState {
         mailer: Arc<dyn Mailer>,
     ) -> Self {
         let blobs = Arc::new(BlobStore::new(&config.data_dir));
-        let apple = Arc::new(AppleVerifier::new(
-            config.apple_jwks_url.clone(),
-            config.apple_client_ids.clone(),
-        ));
         Self {
             config: Arc::new(config),
             pool,
             keys: Arc::new(ServerKeys::from_master(&master_key)),
             blobs,
             mailer,
-            apple,
             redeem_limiter: Arc::new(RedeemLimiter::default()),
         }
     }

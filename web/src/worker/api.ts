@@ -24,7 +24,7 @@ export type WireFileEntry = {
 export type Capabilities = {
   service: string
   protocol?: number
-  auth: { email: boolean; apple: boolean }
+  auth: { email: boolean; apple?: boolean }
   invite_required?: boolean
 }
 

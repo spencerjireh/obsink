@@ -37,9 +37,6 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Raw `OBSINK_SERVER_KEY` (base64). `None` = read or create `<data>/server.key`.
     pub server_key: Option<String>,
-    /// Accepted `aud` values for Apple identity tokens. Empty disables Apple.
-    pub apple_client_ids: Vec<String>,
-    pub apple_jwks_url: String,
     pub smtp: Option<SmtpConfig>,
     /// Return the one-time code in the `/auth/email/start` response (dev only).
     pub dev_return_code: bool,
@@ -82,11 +79,6 @@ impl Config {
             database_url,
             data_dir: PathBuf::from(env("OBSINK_DATA_DIR").unwrap_or_else(|| "/data".to_string())),
             server_key: env("OBSINK_SERVER_KEY"),
-            apple_client_ids: std::env::var("APPLE_CLIENT_IDS")
-                .map(|value| split_csv(&value))
-                .unwrap_or_else(|_| vec!["com.obsink.ios".to_string()]),
-            apple_jwks_url: env("APPLE_JWKS_URL")
-                .unwrap_or_else(|| "https://appleid.apple.com/auth/keys".to_string()),
             smtp,
             dev_return_code: env("AUTH_DEV_RETURN_CODE").as_deref() == Some("1"),
             max_vaults_per_user: parse_or("MAX_VAULTS_PER_USER", DEFAULT_MAX_VAULTS_PER_USER)?,
@@ -103,10 +95,6 @@ impl Config {
     pub fn email_enabled(&self) -> bool {
         self.smtp.is_some() || self.dev_return_code
     }
-
-    pub fn apple_enabled(&self) -> bool {
-        !self.apple_client_ids.is_empty()
-    }
 }
 
 fn env(key: &str) -> Option<String> {
@@ -122,15 +110,6 @@ fn parse_or<T: std::str::FromStr>(key: &str, default: T) -> Result<T, String> {
             .map_err(|_| format!("{key} is not a valid number: {value}")),
         None => Ok(default),
     }
-}
-
-fn split_csv(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .map(str::to_string)
-        .collect()
 }
 
 /// The 32-byte master key for envelope encryption: `OBSINK_SERVER_KEY` if
@@ -207,8 +186,6 @@ mod tests {
             database_url: String::new(),
             data_dir: dir.to_path_buf(),
             server_key: None,
-            apple_client_ids: Vec::new(),
-            apple_jwks_url: String::new(),
             smtp: None,
             dev_return_code: false,
             max_vaults_per_user: 1,

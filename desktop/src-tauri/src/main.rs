@@ -406,7 +406,6 @@ fn api_client(server_url: &str, bearer: String, vault_id: &str, local_path: &str
 #[derive(Debug, Clone, Serialize)]
 struct AuthCapabilities {
     email: bool,
-    apple: bool,
     /// New accounts need an invite code once the server has any user.
     invite_required: bool,
 }
@@ -500,7 +499,6 @@ async fn get_auth_capabilities() -> Result<AuthCapabilities, CommandError> {
     let caps = AuthClient::new(&server_url).capabilities().await?;
     Ok(AuthCapabilities {
         email: caps.auth.email,
-        apple: caps.auth.apple,
         invite_required: caps.invite_required,
     })
 }
