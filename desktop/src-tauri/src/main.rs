@@ -4,7 +4,7 @@ use std::{
     path::{Component, Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use dirs::home_dir;
@@ -18,16 +18,18 @@ use obsink_core::{
     complete_sync, create_account_key, daemon_channel, decode_base64, derive_keys,
     diff_local_and_remote, encode_base64, fetch_remote_manifest,
     keychain::{
-        bearer_account, delete_account_key, delete_secret, load_account_key,
-        load_bearer as load_stored_bearer, load_or_create_device_id, load_secret, load_secret_opt,
-        save_account_key, save_secret, user_account,
+        bearer_account, delete_account_key, delete_approval_secret, delete_secret,
+        load_account_key, load_approval_secret, load_bearer as load_stored_bearer,
+        load_or_create_device_id, load_secret, load_secret_opt, save_account_key,
+        save_approval_secret, save_secret, user_account,
     },
-    load_local_state, new_key, new_vault_id, normalize_server_url, prepare_sync,
-    rewrap_account_key, run_daemon, sync_manifest_path, unwrap_vault_key, wrap_vault_key,
-    write_atomic, ApiClient, ApiError, AuthClient, AuthError, Conflict, ConflictResolution,
-    CreateVaultRequest, DaemonCallError, DaemonEvent, DaemonHandle, DaemonOptions, Device,
-    DevicePlatform, KeyBytes, ManifestDiff, ProgressEvent, ProgressSink, SetKeysOutcome,
-    SyncEngineError, SyncPlan, SyncResult, VaultConfig, VaultSummary, PROTOCOL_VERSION,
+    load_local_state, new_approval_request, new_key, new_vault_id, normalize_server_url,
+    prepare_sync, rewrap_account_key, run_daemon, sync_manifest_path, unwrap_vault_key,
+    wrap_vault_key, write_atomic, ApiClient, ApiError, ApprovalRequest, AuthClient, AuthError,
+    Conflict, ConflictResolution, CreateVaultRequest, DaemonCallError, DaemonEvent, DaemonHandle,
+    DaemonOptions, Device, DevicePlatform, KeyBytes, ManifestDiff, ProgressEvent, ProgressSink,
+    SetKeysOutcome, SyncEngineError, SyncPlan, SyncResult, VaultConfig, VaultSummary,
+    PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
 
@@ -56,6 +58,29 @@ struct AppState {
     /// (`Sync now` and resolutions are commands to it), so no two cycles
     /// can overlap.
     daemons: Mutex<HashMap<String, DaemonHandle>>,
+    /// The approval request this Mac is waiting on (spec §12.1), if any.
+    pending_approval: Mutex<Option<PendingApproval>>,
+    /// One poll at a time: two overlapping ticks would register two
+    /// requests and show two fingerprints.
+    approval_poll: tokio::sync::Mutex<()>,
+}
+
+/// This Mac's live approval request (spec §12.1 step 2): the keypair whose
+/// public half the server relays to approvers, the device id it was
+/// registered under, and when the server drops it. The secret is also in
+/// the keychain (`approval:<user id>`) so a restart resumes the wait.
+struct PendingApproval {
+    device_id: String,
+    request: ApprovalRequest,
+    expires: u64,
+}
+
+/// Seconds since the epoch, as the server stamps `expires`.
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
 }
 
 fn daemon_handle(state: &AppState, vault_id: &str) -> Option<DaemonHandle> {
@@ -483,6 +508,35 @@ struct DeviceInfo {
     last_seen: u64,
     current: bool,
     vault_ids: Vec<String>,
+    /// Spec §12.3: the device is waiting for its key and nobody has answered
+    /// yet (`None` once an approver did; that device picks the key up within
+    /// a poll and the row reads as any other).
+    approval: Option<DeviceApprovalInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DeviceApprovalInfo {
+    requested: u64,
+    expires: u64,
+}
+
+/// This Mac's own live request as the unlock form shows it (spec §12.1).
+#[derive(Debug, Clone, Serialize)]
+struct ApprovalInfo {
+    fingerprint: String,
+    expires: u64,
+}
+
+/// One tick of the waiting device: the request to show (`None` when there
+/// is nothing to wait for) and the account as it stands after the tick.
+#[derive(Debug, Clone, Serialize)]
+struct PollApprovalResponse {
+    approval: Option<ApprovalInfo>,
+    account: AccountState,
+    /// This tick took the key: the command layer refreshes daemons and
+    /// windows. Not for the UI, which reads `account`.
+    #[serde(skip)]
+    unlocked: bool,
 }
 
 /// What `set_passphrase` did: this Mac set it, or another device had already
@@ -614,6 +668,13 @@ async fn get_account() -> Result<AccountState, CommandError> {
                 last_seen: device.last_seen,
                 current: device.current,
                 vault_ids: device.vault_ids,
+                approval: device
+                    .approval
+                    .filter(|approval| !approval.approved)
+                    .map(|approval| DeviceApprovalInfo {
+                        requested: approval.requested,
+                        expires: approval.expires,
+                    }),
             })
             .collect(),
         usage: me.usage.map(|usage| UsageInfo {
@@ -680,8 +741,15 @@ async fn set_passphrase_inner(passphrase: String) -> Result<SetPassphraseRespons
 }
 
 #[tauri::command]
-async fn unlock(passphrase: String, app: AppHandle) -> Result<AccountState, CommandError> {
+async fn unlock(
+    passphrase: String,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<AccountState, CommandError> {
     let result = unlock_inner(passphrase).await;
+    if result.is_ok() {
+        abandon_approval(&state).await;
+    }
     reconcile_daemons(&app);
     emit_state_changed(&app, None);
     result
@@ -701,6 +769,234 @@ async fn unlock_inner(passphrase: String) -> Result<AccountState, CommandError> 
     delete_account_key(&user_id);
     save_account_key(&user_id, &key, &blob.key_id)?;
     get_account().await
+}
+
+const APPROVAL_EXPIRED: &str = "Approval expired. The other device shows a new fingerprint.";
+const FINGERPRINT_MISMATCH: &str = "Fingerprint does not match. Check it on the other device.";
+const APPROVAL_DONE: &str = "Already approved. The other device picks its key up in a moment.";
+
+/// Spec §12.1 step 2, one tick of the wait: the unlock form calls this
+/// every 3 s while the account is locked with a passphrase set. The tick
+/// that takes the key unlocks the account, so daemons and windows refresh.
+#[tauri::command]
+async fn poll_approval(
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<PollApprovalResponse, CommandError> {
+    let result = poll_approval_inner(&state).await;
+    if matches!(&result, Ok(response) if response.unlocked) {
+        reconcile_daemons(&app);
+        emit_state_changed(&app, None);
+    }
+    result
+}
+
+/// Register a request (a new fingerprint), keep its secret for a restart.
+async fn register_approval(
+    server_url: &str,
+    bearer: &str,
+    user_id: &str,
+    device_id: &str,
+) -> Result<PendingApproval, CommandError> {
+    let request = new_approval_request();
+    let registered = bearer_call(
+        server_url,
+        AuthClient::new(server_url).register_approval(bearer, request.public_key()),
+    )
+    .await?;
+    save_approval_secret(user_id, request.secret_bytes())?;
+    Ok(PendingApproval {
+        device_id: device_id.to_string(),
+        request,
+        expires: registered.expires,
+    })
+}
+
+/// Drop the in-memory request (the keychain copy goes with `user_id`).
+fn clear_pending_approval(state: &AppState, user_id: Option<&str>) {
+    state.pending_approval.lock().unwrap().take();
+    if let Some(user_id) = user_id {
+        delete_approval_secret(user_id);
+    }
+}
+
+/// While the account is locked with a passphrase set: make sure a request
+/// is live for this device (the one in memory, the one restored from the
+/// keychain after a restart, or a fresh one when the server has none or
+/// let it run out), take the key once an approver relayed it, and report
+/// the fingerprint to show. In any other state nothing is sent and the
+/// account comes back unchanged.
+async fn poll_approval_inner(state: &AppState) -> Result<PollApprovalResponse, CommandError> {
+    let _one_at_a_time = state.approval_poll.lock().await;
+    let server_url = default_server_url();
+    let account = get_account().await?;
+    let user_id = match &account {
+        AccountState::Locked {
+            user_id,
+            has_key: true,
+            ..
+        } => user_id.clone(),
+        AccountState::Account { user_id, .. } | AccountState::Locked { user_id, .. } => {
+            clear_pending_approval(state, Some(user_id.as_str()));
+            return Ok(PollApprovalResponse {
+                approval: None,
+                account,
+                unlocked: false,
+            });
+        }
+        AccountState::SignedOut => {
+            clear_pending_approval(state, None);
+            return Ok(PollApprovalResponse {
+                approval: None,
+                account,
+                unlocked: false,
+            });
+        }
+    };
+    let bearer = load_bearer(&server_url)?;
+    let device_id = load_or_create_device_id(&server_url)?;
+    let auth = AuthClient::new(&server_url);
+    let now = unix_now();
+
+    // The candidate: what this process registered, else what a previous one
+    // left in the keychain. The server decides below whether it is live.
+    let candidate = match state.pending_approval.lock().unwrap().take() {
+        Some(pending) if pending.device_id == device_id => Some(pending),
+        _ => load_approval_secret(&user_id)?.map(|secret| PendingApproval {
+            device_id: device_id.clone(),
+            request: ApprovalRequest::from_secret(&secret),
+            expires: 0,
+        }),
+    };
+    let status = bearer_call(&server_url, auth.approval_status(&bearer))
+        .await?
+        .filter(|status| status.expires > now);
+    let pending = match (candidate, status) {
+        (Some(mut pending), Some(status))
+            if status.public_key == encode_base64(pending.request.public_key()) =>
+        {
+            if status.wrapped.is_some() {
+                let taken = bearer_call(
+                    &server_url,
+                    auth.take_approved_key(&bearer, &pending.request, &user_id, &device_id),
+                )
+                .await;
+                match taken {
+                    Ok(Some((key, key_id))) => {
+                        delete_account_key(&user_id);
+                        save_account_key(&user_id, &key, &key_id)?;
+                        delete_approval_secret(&user_id);
+                        return Ok(PollApprovalResponse {
+                            approval: None,
+                            account: get_account().await?,
+                            unlocked: true,
+                        });
+                    }
+                    // Cleared between the two reads: the next tick re-registers.
+                    Ok(None) => {}
+                    // A blob this request cannot open is poison: forget the
+                    // request so the next tick starts over with a new one. A
+                    // failed round trip is not: the keychain copy resumes it.
+                    Err(error) => {
+                        if error.kind == ErrorKind::Other {
+                            delete_approval_secret(&user_id);
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            pending.expires = status.expires;
+            pending
+        }
+        // Nothing live on the server (never registered, expired, cleared, or
+        // another key than ours): a fresh request, a new fingerprint.
+        _ => register_approval(&server_url, &bearer, &user_id, &device_id).await?,
+    };
+    let approval = ApprovalInfo {
+        fingerprint: pending.request.fingerprint(),
+        expires: pending.expires,
+    };
+    *state.pending_approval.lock().unwrap() = Some(pending);
+    Ok(PollApprovalResponse {
+        approval: Some(approval),
+        account,
+        unlocked: false,
+    })
+}
+
+/// Spec §15.3, the approver's side: wrap this Mac's account key to the
+/// pending device once the typed fingerprint matches its public key.
+#[tauri::command]
+async fn approve_device(
+    device_id: String,
+    fingerprint: String,
+) -> Result<AccountState, CommandError> {
+    approve_device_inner(&device_id, &fingerprint).await
+}
+
+async fn approve_device_inner(
+    device_id: &str,
+    fingerprint: &str,
+) -> Result<AccountState, CommandError> {
+    let server_url = default_server_url();
+    let (bearer, user_id, key) = account_key_for(&server_url).await?;
+    let auth = AuthClient::new(&server_url);
+    let me = bearer_call(&server_url, auth.me(&bearer)).await?;
+    let device = me
+        .devices
+        .iter()
+        .find(|device| device.id == device_id)
+        .ok_or_else(|| CommandError::other("That device is no longer signed in."))?;
+    let approval = device
+        .approval
+        .as_ref()
+        .ok_or_else(|| CommandError::other(APPROVAL_EXPIRED))?;
+    // Answered already (the row shows it until the device collects the key).
+    if approval.approved {
+        return Err(CommandError::other(APPROVAL_DONE));
+    }
+    let posted = auth
+        .approve_with_key(
+            &bearer,
+            &key,
+            &user_id,
+            device_id,
+            &approval.public_key,
+            fingerprint,
+        )
+        .await;
+    match posted {
+        Ok(()) => {}
+        Err(AuthError::Fingerprint) => return Err(CommandError::other(FINGERPRINT_MISMATCH)),
+        // The request ran out between the listing and the post.
+        Err(AuthError::Server { status, .. }) if status.as_u16() == 404 => {
+            return Err(CommandError::other(APPROVAL_EXPIRED));
+        }
+        // Another approver got there first.
+        Err(AuthError::Server { status, .. }) if status.as_u16() == 409 => {
+            return Err(CommandError::other(APPROVAL_DONE));
+        }
+        Err(error) => forget_bearer_on_401(&server_url, Err::<(), _>(error.into()))?,
+    }
+    get_account().await
+}
+
+/// `Use passphrase instead`, a sign-out: a request this Mac was waiting on
+/// is worthless now, so take it off the approvers' lists (best effort) and
+/// forget the secret.
+async fn abandon_approval(state: &AppState) {
+    let server_url = default_server_url();
+    let user_id = load_secret_opt(&user_account(&server_url)).ok().flatten();
+    let waiting = state.pending_approval.lock().unwrap().is_some()
+        || user_id
+            .as_deref()
+            .is_some_and(|user_id| matches!(load_approval_secret(user_id), Ok(Some(_))));
+    if waiting {
+        if let Ok(bearer) = load_stored_bearer(&server_url) {
+            let _ = AuthClient::new(&server_url).clear_approval(&bearer).await;
+        }
+    }
+    clear_pending_approval(state, user_id.as_deref());
 }
 
 /// DESIGN.md §5 `Change passphrase`: the current passphrase must open the
@@ -792,16 +1088,17 @@ async fn rename_device(device_id: String, name: String) -> Result<AccountState, 
 /// Sign out of the server. Vault entries and keys stay; sync will ask for a
 /// sign-in again.
 #[tauri::command]
-async fn sign_out(app: AppHandle) -> Result<(), CommandError> {
-    let result = sign_out_inner().await;
+async fn sign_out(state: tauri::State<'_, AppState>, app: AppHandle) -> Result<(), CommandError> {
+    let result = sign_out_inner(&state).await;
     reconcile_daemons(&app);
     emit_state_changed(&app, None);
     result
 }
 
-async fn sign_out_inner() -> Result<(), CommandError> {
+async fn sign_out_inner(state: &AppState) -> Result<(), CommandError> {
     let server_url = default_server_url();
     let account = bearer_account(&server_url);
+    abandon_approval(state).await;
     if let Ok(bearer) = load_secret(&account) {
         // Best effort: the local credential goes away regardless.
         let _ = AuthClient::new(&server_url).logout(&bearer).await;
@@ -814,14 +1111,17 @@ async fn sign_out_inner() -> Result<(), CommandError> {
 /// bearer, the account key and every vault entry. Vault folders on disk
 /// stay: the files are the user's, and nothing here can recover a key.
 #[tauri::command]
-async fn delete_account(app: AppHandle) -> Result<(), CommandError> {
-    let result = delete_account_inner().await;
+async fn delete_account(
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<(), CommandError> {
+    let result = delete_account_inner(&state).await;
     reconcile_daemons(&app);
     emit_state_changed(&app, None);
     result
 }
 
-async fn delete_account_inner() -> Result<(), CommandError> {
+async fn delete_account_inner(state: &AppState) -> Result<(), CommandError> {
     let server_url = default_server_url();
     let (bearer, user_id) = signed_in(&server_url).await?;
     bearer_call(
@@ -832,6 +1132,7 @@ async fn delete_account_inner() -> Result<(), CommandError> {
     delete_secret(&bearer_account(&server_url));
     delete_secret(&user_account(&server_url));
     delete_account_key(&user_id);
+    clear_pending_approval(state, Some(&user_id));
     forget_all_vaults()?;
     Ok(())
 }
@@ -2242,6 +2543,7 @@ fn main() {
         .plugin(tauri_plugin_opener::init())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
+            approve_device,
             auth_email_start,
             auth_email_verify,
             change_passphrase,
@@ -2264,6 +2566,7 @@ fn main() {
             move_vault_folder,
             open_settings,
             open_vault_folder,
+            poll_approval,
             preview_trash,
             preview_version,
             remove_vault,
@@ -2887,6 +3190,78 @@ mod live_tests {
             unlock_inner(passphrase()).await.unwrap(),
             AccountState::Account { .. }
         ));
+        let user_a = load_secret(&user_account(&server_url)).unwrap();
+        let key_a = load_account_key(&user_a).unwrap();
+
+        // Device approval (spec §12.1, §12.3, §15.3): B signs in to the same
+        // account, waits with a fingerprint; A approves it wrong, then right.
+        device_b.activate();
+        let code = start_code_after_cooldown(&email).await;
+        let signed_in_b = auth_email_verify_inner(email.clone(), code, None)
+            .await
+            .unwrap();
+        assert!(
+            matches!(signed_in_b, AccountState::Locked { has_key: true, .. }),
+            "{signed_in_b:?}"
+        );
+        let b_id = load_or_create_device_id(&server_url).unwrap();
+        let poll = poll_approval_inner(&state).await.unwrap();
+        let fingerprint = poll.approval.expect("a request is registered").fingerprint;
+        assert_eq!(fingerprint.len(), obsink_core::APPROVAL_FINGERPRINT_LEN);
+        assert!(matches!(poll.account, AccountState::Locked { .. }));
+        assert!(!poll.unlocked);
+        assert!(matches!(
+            get_account().await.unwrap(),
+            AccountState::Locked { has_key: true, .. }
+        ));
+        assert!(load_approval_secret(&user_a).unwrap().is_some());
+        // A restart keeps the same request: the secret comes back from the
+        // keychain and the server still holds its public key.
+        state.pending_approval.lock().unwrap().take();
+        let again = poll_approval_inner(&state).await.unwrap();
+        assert_eq!(again.approval.unwrap().fingerprint, fingerprint);
+
+        device_a.activate();
+        let listed = devices_of(&get_account().await.unwrap());
+        let row = listed
+            .iter()
+            .find(|device| device.id == b_id)
+            .expect("B is a device of the account");
+        assert!(row.approval.is_some(), "{row:?}");
+        assert!(!row.current);
+        let wrong = approve_device_inner(&b_id, "ZZZZZZZZ").await.unwrap_err();
+        assert!(wrong.message.contains("does not match"), "{wrong}");
+        let still = devices_of(&get_account().await.unwrap());
+        assert!(still
+            .iter()
+            .any(|device| device.id == b_id && device.approval.is_some()));
+        let approved = approve_device_inner(&b_id, &fingerprint.to_lowercase())
+            .await
+            .unwrap();
+        let after = devices_of(&approved);
+        assert!(after
+            .iter()
+            .any(|device| device.id == b_id && device.approval.is_none()));
+        let twice = approve_device_inner(&b_id, &fingerprint).await.unwrap_err();
+        assert!(twice.message.contains("Already approved"), "{twice}");
+
+        device_b.activate();
+        let unlocked = poll_approval_inner(&state).await.unwrap();
+        assert!(unlocked.unlocked);
+        assert!(unlocked.approval.is_none());
+        assert!(matches!(unlocked.account, AccountState::Account { .. }));
+        assert_eq!(load_account_key(&user_a).unwrap(), key_a);
+        assert!(load_approval_secret(&user_a).unwrap().is_none());
+        assert!(state.pending_approval.lock().unwrap().is_none());
+        // An unlocked device has nothing to wait for: no request goes out.
+        let idle = poll_approval_inner(&state).await.unwrap();
+        assert!(idle.approval.is_none() && !idle.unlocked);
+        assert!(AuthClient::new(&server_url)
+            .approval_status(&load_secret(&bearer_account(&server_url)).unwrap())
+            .await
+            .unwrap()
+            .is_none());
+        device_a.activate();
 
         let created = create_vault_inner(CreateVaultCommand {
             vault_name: "desktop-account-vault".to_string(),
@@ -3035,7 +3410,7 @@ mod live_tests {
         .unwrap();
         let token_b = load_secret(&bearer_account(&server_url)).unwrap();
         let user_b = load_secret(&user_account(&server_url)).unwrap();
-        delete_account_inner().await.unwrap();
+        delete_account_inner(&state).await.unwrap();
         assert!(matches!(
             get_account().await.unwrap(),
             AccountState::SignedOut
@@ -3051,7 +3426,7 @@ mod live_tests {
 
         // Sign out A: the entry and the keys stay, the account reads signed out.
         device_a.activate();
-        sign_out_inner().await.unwrap();
+        sign_out_inner(&state).await.unwrap();
         assert!(matches!(
             get_account().await.unwrap(),
             AccountState::SignedOut
