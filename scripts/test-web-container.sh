@@ -145,6 +145,9 @@ status 200 "$base/install.sh"
 curl -fsS "$base/install.sh" | head -1 | grep -q '^#!/bin/sh' && pass "install.sh body" || fail "install.sh body"
 header "$base/install.sh" Cache-Control no-cache
 status 200 "$base/icon.svg"
+header "$base/icon.svg" Cache-Control no-cache
+status 200 "$base/fonts/IBMPlexMono-400-latin.woff2"
+header "$base/fonts/IBMPlexMono-400-latin.woff2" Cache-Control max-age=86400
 status 301 "$base/favicon.ico"
 status 200 "$base/robots.txt"
 status 404 "$base/no-such-page"

@@ -10,7 +10,10 @@
 #   /app/*                        ->  the browser client (SPA); hashed assets are
 #                                     immutable, index.html is always revalidated,
 #                                     a missing asset is a 404, not the index
-#   /install.sh, everything else  ->  the static site
+#   /install.sh, everything else  ->  the static site; unhashed files (/, /install.sh,
+#                                     /icon.svg) are always revalidated and fonts are
+#                                     cached for a day, so the CDN in front (Cloudflare)
+#                                     never keeps a stale copy past a redeploy
 #
 # No request-body limit and no proxy timeouts: batch uploads are up to
 # 128 MiB and may take minutes.
@@ -73,8 +76,10 @@
 		root * /srv/site
 		@landing path / /index.html
 		header @landing Vary Accept
-		@revalidate path / /index.html /install.sh
+		@revalidate path / /index.html /install.sh /icon.svg
 		header @revalidate Cache-Control no-cache
+		@font path /fonts/*
+		header @font Cache-Control "public, max-age=86400"
 		file_server
 	}
 
