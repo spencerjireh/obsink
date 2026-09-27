@@ -14,6 +14,9 @@ ASC_KEY_PATH); source it first: `set -a; . ./.env.deploy; set +a`.
       Wait for the build to finish processing, record the export-compliance
       answer, and add it to the named beta group (created if missing, as an
       internal group so no Beta App Review is needed).
+  uv run scripts/testflight.py expire [--keep N]
+      Expire every processed build older than the newest (or than build N),
+      so testers can only install the current one.
 """
 
 import argparse
@@ -120,6 +123,24 @@ def cmd_distribute(args):
     print(f"build {build['attributes']['version']} added to '{args.group}' — testers get the TestFlight push now")
 
 
+def cmd_expire(args):
+    app = app_id()
+    all_builds = builds(app, limit=200)
+    keep = str(args.keep) if args.keep else next(
+        (b["attributes"]["version"] for b in all_builds if b["attributes"]["processingState"] == "VALID"), None)
+    if keep is None:
+        sys.exit("no processed build to keep")
+    expired = 0
+    for b in all_builds:
+        a = b["attributes"]
+        if a["version"] == keep or a["expired"] or a["processingState"] != "VALID":
+            continue
+        call("PATCH", f"/builds/{b['id']}", json={"data": {"type": "builds", "id": b["id"], "attributes": {"expired": True}}})
+        print(f"expired build {a['version']}")
+        expired += 1
+    print(f"kept build {keep}; expired {expired} build(s)")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -129,6 +150,9 @@ def main():
     d.add_argument("--build", help="build number; default: newest")
     d.add_argument("--encryption", choices=["exempt", "non-exempt"])
     d.set_defaults(fn=cmd_distribute)
+    e = sub.add_parser("expire")
+    e.add_argument("--keep", help="build number to keep; default: newest processed build")
+    e.set_defaults(fn=cmd_expire)
     args = p.parse_args()
     args.fn(args)
 
