@@ -1,8 +1,7 @@
-import AuthenticationServices
 import SwiftUI
 
-/// Sign in to this build's server (spec §12.1): Sign in with Apple or an
-/// emailed code, with the invite field only when the server needs one
+/// Sign in to this build's server (spec §12.1): an emailed one-time code,
+/// with the invite field only when the server needs one
 /// (`GET /`) or just refused a sign-up without one; then the passphrase
 /// step: `Set passphrase` (a new account, twice, 12 characters at least) or
 /// `Unlock` (an existing one). The bearer, the user id and the account key
@@ -25,13 +24,8 @@ struct SignInPane: View {
     @State private var status = ""
     @State private var busy = false
     @State private var signedInEmail: String?
-    /// Sign in with Apple gave a token without an email claim plus an email
-    /// hint; the server wants a one-time code for that address before it
-    /// links the two. Held until the code is verified.
-    @State private var pendingAppleToken: String? = nil
 
     private var serverURL: String { ServerConfig.defaultURL }
-    private var offersApple: Bool { capabilities?.apple ?? true }
     private var offersEmail: Bool { capabilities?.email ?? true }
     private var showInviteField: Bool { (capabilities?.inviteRequired ?? true) || inviteForced }
     private var inviteOrNil: String? {
@@ -64,47 +58,28 @@ struct SignInPane: View {
 
     @ViewBuilder
     private var signInBody: some View {
-        if !offersApple && !offersEmail {
-            Text("This server has no sign-in method this app supports.")
+        if !offersEmail {
+            Text("This server has no email sign-in.")
                 .font(.caption).foregroundStyle(.secondary)
         } else {
-            if offersApple {
-                SignInWithAppleButton(.signIn) { request in
-                    request.requestedScopes = [.email]
-                } onCompletion: { result in
-                    handleApple(result)
-                }
-                .signInWithAppleButtonStyle(.black)
-                .frame(height: 44)
-                .accessibilityIdentifier("signInWithAppleButton")
-            }
-            if offersApple && offersEmail {
-                Text("or use your email").font(.caption).foregroundStyle(.secondary)
-            }
-            if offersEmail {
-                LabeledField("Email", text: $authEmail, identifier: "emailField")
-                    .keyboardType(.emailAddress)
-                    .disabled(codeSent)
-            }
+            LabeledField("Email", text: $authEmail, identifier: "emailField")
+                .keyboardType(.emailAddress)
+                .disabled(codeSent)
             if showInviteField {
                 LabeledField("Invite code", text: $inviteCode, identifier: "inviteField")
                     .textInputAutocapitalization(.characters)
                     .autocorrectionDisabled()
                     .focused($inviteFocused)
             }
-            if offersEmail && codeSent {
-                if pendingAppleToken != nil {
-                    Text("Enter the code sent to \(authEmail) to link it to your Apple ID.")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
+            if codeSent {
                 LabeledField("6-digit code", text: $authCode, identifier: "codeField")
                     .keyboardType(.numberPad)
                 Button("Verify and sign in") { verifyCode() }
                     .disabled(busy || authCode.trimmingCharacters(in: .whitespaces).count != 6)
                     .accessibilityIdentifier("verifyCodeButton")
-                Button("Change email") { codeSent = false; authCode = ""; pendingAppleToken = nil }
+                Button("Change email") { codeSent = false; authCode = "" }
                     .disabled(busy)
-            } else if offersEmail {
+            } else {
                 Button("Send sign-in code") { sendCode() }
                     .disabled(busy || !authEmail.contains("@"))
                     .accessibilityIdentifier("sendCodeButton")
@@ -155,19 +130,13 @@ struct SignInPane: View {
         let url = serverURL, email = authEmail.trimmingCharacters(in: .whitespaces)
         let code = authCode.trimmingCharacters(in: .whitespaces)
         let device = model.thisDevice()
-        let invite = inviteOrNil, appleToken = pendingAppleToken
+        let invite = inviteOrNil
         Task.detached {
             do {
-                let session: MobileSession
-                if let appleToken {
-                    session = try authApple(serverUrl: url, identityToken: appleToken, device: device, email: email, code: code, inviteCode: invite)
-                } else {
-                    session = try authEmailVerify(serverUrl: url, email: email, code: code, device: device, inviteCode: invite)
-                }
+                let session = try authEmailVerify(serverUrl: url, email: email, code: code, device: device, inviteCode: invite)
                 await MainActor.run {
                     codeSent = false
                     authCode = ""
-                    pendingAppleToken = nil
                     busy = false
                     signedIn(session)
                 }
@@ -181,55 +150,6 @@ struct SignInPane: View {
         signedInEmail = session.email
         model.signedIn(session: session)
         step = .passphrase
-    }
-
-    private func handleApple(_ result: Result<ASAuthorization, Error>) {
-        switch result {
-        case .failure(let error):
-            // User cancel is not an error worth showing.
-            if (error as? ASAuthorizationError)?.code != .canceled {
-                status = error.localizedDescription
-            }
-        case .success(let authorization):
-            guard let credential = authorization.credential as? ASAuthorizationAppleIDCredential,
-                  let tokenData = credential.identityToken,
-                  let identityToken = String(data: tokenData, encoding: .utf8) else {
-                status = "Apple did not return an identity token."
-                return
-            }
-            busy = true; status = ""
-            let url = serverURL, email = credential.email, device = model.thisDevice()
-            let invite = inviteOrNil
-            Task.detached {
-                do {
-                    let session = try authApple(serverUrl: url, identityToken: identityToken, device: device, email: email, code: nil, inviteCode: invite)
-                    await MainActor.run {
-                        busy = false
-                        signedIn(session)
-                    }
-                } catch {
-                    // The token had no email claim: the server links the hint
-                    // only once a one-time code for that address checks out.
-                    if let email, (error as? MobileError)?.needsEmailVerification == true {
-                        do {
-                            let devCode = try authEmailStart(serverUrl: url, email: email)
-                            await MainActor.run {
-                                authEmail = email
-                                pendingAppleToken = identityToken
-                                codeSent = true
-                                authCode = devCode ?? ""
-                                busy = false
-                            }
-                            return
-                        } catch {
-                            await MainActor.run { signInFailed(error) }
-                            return
-                        }
-                    }
-                    await MainActor.run { signInFailed(error) }
-                }
-            }
-        }
     }
 }
 
