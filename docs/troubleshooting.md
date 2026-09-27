@@ -19,8 +19,17 @@ The server already has accounts, so a new one needs an invite. Ask any existing 
 **`404 vault not found`**
 The vault belongs to a different account (each account sees only its own vaults), was deleted, or you are pointed at the wrong server URL. List vaults: `obsink vaults --server-url <url>`.
 
-**`503 email sign-in is not configured on this server`**
-The operator has not set `SMTP_*`. Use Sign in with Apple on iOS, or ask the operator to configure SMTP (see [self-hosting.md](self-hosting.md)).
+**`503 email sign-in is not configured on this server`** / `This server has no email sign-in.`
+The operator has not set `SMTP_*`. Ask the operator to configure SMTP, or to mint the code on the host with `obsink-server code <email>` and pass it to the CLI with `obsink login --code <code>` (see [self-hosting.md](self-hosting.md) §6, including what the clients still refuse).
+
+**`Waiting for approval from another device.`**
+This device signed in but does not hold the account key. On a device that is already unlocked, open the Devices tab (`obsink devices` on the CLI): the new device is listed with `Waiting for approval`. Press `Approve` on that row and type the 8 characters the waiting device shows (`obsink devices --approve <id> <fingerprint>`); the waiting device then prints `Unlocked.`. No unlocked device at hand: `Use passphrase instead` (`obsink unlock --passphrase`, or a set `OBSINK_PASSPHRASE`) asks for the account passphrase.
+
+**`Fingerprint does not match. Check it on the other device.`**
+Nothing was sent. Read the fingerprint again on the waiting device and type it as shown: case, spaces and dashes do not matter, and the alphabet (`ABCDEFGHJKLMNPQRSTUVWXYZ23456789`) has no `0`, `1` or `I`, so a `0` reads as `O`. A fingerprint that changed since you first read it means the request expired and was renewed (`Fingerprint changed:` on the CLI); type the new one.
+
+**`Approval expired. The other device shows a new fingerprint.`**
+A request lives 10 minutes. The waiting device re-registers on expiry and shows a new fingerprint (a closed app registers again when it reopens; the CLI prints `Fingerprint changed:`); refresh the Devices tab and approve the new code.
 
 ## Decryption / passphrase
 
@@ -91,7 +100,7 @@ A format change invalidates old manifests; v3 replaced the whole schema, so a se
 Folder sync needs the File System Access API, which Chrome, Edge and other Chromium browsers provide over HTTPS only. Safari and Firefox do not; use the desktop app, the CLI or the iOS app. A self-hosted copy served over plain HTTP shows the same page with a note about HTTPS.
 
 **`Locked` after a reload**
-The account key lives only in the worker's memory; nothing about the passphrase is stored in the browser. Enter the account passphrase in `Unlock`. The bearer, the device id, the vault list and the sync bookkeeping survive the reload (IndexedDB), so nothing else is lost.
+The account key lives only in the worker's memory; nothing about the passphrase is stored in the browser. The tab shows the waiting screen with a fingerprint: approve it from an unlocked device, or `Use passphrase instead` and enter the account passphrase. The bearer, the device id, the vault list and the sync bookkeeping survive the reload (IndexedDB), so nothing else is lost.
 
 **`Needs folder access`**
 Chrome grants access to a picked folder per session. Press `Allow access` on the vault page and accept the prompt; the folder itself is remembered. If the folder was moved or deleted, remove the vault and add it again.

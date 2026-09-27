@@ -31,12 +31,14 @@ desktop/CLI daemon. Obsidian opens the synced directory as a normal vault; no pl
   wrapped again with a server key derived from `OBSINK_SERVER_KEY`, so a copied volume or database
   dump is useless on its own.
 - **Invite-only accounts.** The first sign-up on a fresh server is open; every later account needs
-  an invite code minted by an existing user. Sign in with an emailed one-time code (SMTP) or Sign in
-  with Apple on iOS.
+  an invite code minted by an existing user. Sign in with an emailed one-time code (SMTP, or
+  `obsink-server code` from the server's shell). The first device sets the account passphrase; a
+  later device is approved from an unlocked one by typing the 8-character fingerprint it shows, or
+  unlocks with the passphrase.
 - **Retention.** Overwrites and deletes move to `_versions/` and `_trash/`; a daily task prunes to
   10 versions or 14 days, and 30 days respectively.
 
-Wire protocol is `PROTOCOL_VERSION = 2`. Full manifest schema, key-derivation table, and rationale
+Wire protocol is `PROTOCOL_VERSION = 3`. Full manifest schema, key-derivation table, and rationale
 in [docs/architecture.md](docs/architecture.md).
 
 ## Sync cycle
@@ -66,10 +68,12 @@ harness scripts sign in as one). Full contract in [spec.md §4](spec.md).
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/` | Sign-in methods offered, wire-format `protocol`, whether an invite is required |
-| `POST` | `/auth/email/start`, `/auth/email/verify`, `/auth/apple` | Sign in as a device (one session per device) |
+| `POST` | `/auth/email/start`, `/auth/email/verify` | Sign in as a device (one session per device) |
 | `GET`, `PUT` | `/auth/keys` (+ `/rewrap`) | The wrapped account key: read, set once, change the passphrase |
-| `GET` | `/auth/me` | Account, devices (with their vaults), storage usage |
+| `PUT`, `GET`, `DELETE` | `/auth/approval` | A signed-in device without the account key registers its approval public key, polls for the key wrapped to it, withdraws the request |
+| `GET` | `/auth/me` | Account, devices (with their vaults and a pending approval request), storage usage |
 | `PATCH`, `DELETE` | `/auth/devices/:id` | Rename or sign out a device |
+| `POST` | `/auth/devices/:id/approval` | An unlocked device hands the account key, wrapped to that device's key, to a waiting device |
 | `POST` | `/auth/invites` | Mint an invite code |
 | `GET`, `POST` | `/vaults` | The account's vaults (wrapped keys, devices, revision); create one |
 | `PATCH`, `DELETE` | `/vaults/:id` | Rename; delete on the server |
@@ -94,7 +98,7 @@ exponential backoff; HTTP status errors surface immediately as typed `ApiError`s
 | `core/` | Sync engine: `crypto`, `hasher`, `manifest`, `sync_engine`, `api_client`, `auth`, `types`; the pure modules also build for wasm32 |
 | `core-wasm/` | wasm-bindgen bindings over the pure core (keys, diff, rules) for the browser client |
 | `cli/` | `obsink` CLI — the reference client |
-| `server/` | `obsink-server` (axum): accounts, invites, vaults, files, batch, retention; Dockerfile |
+| `server/` | `obsink-server` (axum): accounts, invites, device approval, vaults, files, batch, retention; Dockerfile |
 | `ui/` | The React screens and the `Backend` interface they run on (npm workspace shared by `desktop/` and the browser client) |
 | `desktop/` | Tauri v2 shell (menu-bar on macOS) and its Tauri `Backend` |
 | `web/` | Browser client at `/app` (Chromium browsers): the same screens over a worker that syncs a local folder through the File System Access API; Dockerfile + Caddyfile of the website container |
@@ -144,11 +148,20 @@ cargo run -p obsink -- init \
 cargo run -p obsink -- sync
 ```
 
-Put the same vault on another device (sign in there with the same passphrase; the vault key comes
-from the account):
+Put the same vault on another device. `login` there prints an 8-character fingerprint and waits;
+approve it from the first machine with `obsink devices --approve <id> <fingerprint>` (or from the
+Devices tab of the desktop, browser or iOS app), or pass `--passphrase` to enter the passphrase
+instead (`OBSINK_PASSPHRASE` does the same for scripts). The vault key comes from the account:
 
 ```bash
+# On the new device: prints `Fingerprint: XXXXXXXX` and waits (Ctrl-C stops; `unlock` waits again)
 cargo run -p obsink -- login --server-url https://obsink.example.com --email you@example.com
+
+# On the first machine: the new device is listed as `waiting for approval`; type its fingerprint
+cargo run -p obsink -- devices --server-url https://obsink.example.com
+cargo run -p obsink -- devices --server-url https://obsink.example.com --approve <id> XXXXXXXX
+
+# Back on the new device, once it prints `Unlocked.`
 cargo run -p obsink -- vaults --server-url https://obsink.example.com
 cargo run -p obsink -- download \
   --server-url https://obsink.example.com \
@@ -156,10 +169,11 @@ cargo run -p obsink -- download \
   --directory ~/Obsidian/my-notes
 ```
 
-Other subcommands: `vaults` (every vault of the account and its state here), `devices` (rename or
-sign out a device), `passphrase` (change it), `rename`, `history` / `trash` / `restore` (archived
-versions and recently deleted files), `status`, `watch` (keep a folder in sync), `whoami`,
-`invite` (mint a code for someone else), `unlock`, `logout`.
+Other subcommands: `vaults` (every vault of the account and its state here), `devices` (list,
+rename, approve or sign out a device), `passphrase` (change it), `rename`, `history` / `trash` /
+`restore` (archived versions and recently deleted files), `status`, `watch` (keep a folder in
+sync), `whoami`, `invite` (mint a code for someone else), `unlock` (wait for approval again, or
+`--passphrase`), `logout`.
 
 The desktop app and the iOS app wrap the same core — see [docs/platforms.md](docs/platforms.md).
 

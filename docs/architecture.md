@@ -66,6 +66,7 @@ One passphrase per account, one random key per vault, and the server holds only 
 - **KEK** = Argon2id(passphrase, 16 random bytes of salt; 64 MiB / 3 iterations / 1 lane). Derived on demand, never stored.
 - **Account key**: 32 random bytes, generated when the passphrase is first set. Stored on the server as `AES-256-GCM(KEK, account key)` with the user id as AAD, next to the salt and a `key_id`; kept unwrapped in the client's keychain. A wrong passphrase is a failed GCM tag on the client. A server-side verifier, `HMAC(HKDF(account key, "obsink:v3:verify"), user id)`, gates a rewrap (passphrase change) and is never returned.
 - **Vault key**: 32 random bytes per vault. Stored per member as `AES-256-GCM(HKDF(account key, "obsink:v3:vault-wrap"), vault key)` with the vault id as AAD (`vault_members.wrapped_key`); kept unwrapped in the keychain under the vault id. Because it does not derive from the account key, a later "share vault" only has to wrap it for another member.
+- **Device approval** (spec §6.1): a signed-in device without the account key generates an ephemeral X25519 keypair (`x25519-dalek`), registers the public key on its device row (`PUT /auth/approval`) and shows its fingerprint: the first 8 symbols of `SHA-256("obsink:v3:approval-fingerprint" ‖ public key)` in the invite alphabet. An unlocked device fetches that public key from `GET /auth/me`, and only after the user types a matching fingerprint does it wrap the account key: `ss = X25519(ephemeral approver secret, pending public)`, `HKDF-SHA256(ss, "obsink:v3:device-approval" ‖ approver pub ‖ pending pub)` into an AES-256-GCM key, AAD `user id:device id`, the blob prefixed with the approver's public key (92 bytes) and posted with the account verifier (`POST /auth/devices/:id/approval`). The pending device polls, unwraps, stores the key with the `key_id` and deletes the request. The server relays a public key and a ciphertext it cannot open and never computes a fingerprint; the typed fingerprint is the only check against a substituted key (40 bits, chosen knowingly). The passphrase stays the fallback and the only way to unlock the first device.
 - **Sub-keys**: the vault key is HKDF-SHA256 input keying material for four purpose-separated sub-keys (`derive_keys`), unchanged from v2:
 
 | Sub-key | Used for |
@@ -118,10 +119,12 @@ Sync is observable through a `ProgressSink` trait (`Phase` / `FileStarted` / `Fi
 
 ## Server storage
 
+The server's modules (`server/src/`): `auth/` (`account`, `approval`, `devices`, `email`, `invites`, `keys`, `sessions`, `users`), `routes/` (capabilities and the router, `me`, `vaults`, `files`, `batch`, `history`), `blobs`, `crypto` (the envelope), `retention`, `config`, `db`, `error`.
+
 Postgres tables (`server/migrations/0001_init.sql`):
 
-- `users` — id, sealed email, sealed Apple subject, keyed-HMAC lookup columns, the wrapped account key with its salt, `key_id` and verifier
-- `devices` — `(user_id, id)`, sealed name, platform, created, last_seen; one session per device
+- `users` — id, sealed email, keyed-HMAC lookup columns, the wrapped account key with its salt, `key_id` and verifier (the 0.4 columns for a sealed Apple subject remain, unused)
+- `devices` — `(user_id, id)`, sealed name, platform, created, last_seen; one session per device; one live approval request per device in `approval_public_key`, `approval_requested`, `approval_expires`, `approval_wrapped`, `approval_approved_by`, `approval_approved` (migration `0002_device_approval.sql`; the key and the blob are client material stored as sent)
 - `sessions` — id, user, device, `sha256(token)`, created, expires (180 days)
 - `email_codes`, `invites` — one-time codes (keyed HMAC, attempts, cooldown) and invite codes
 - `vaults` — id, owner, sealed name, `max_file_size`, `revision`, `last_write`
@@ -139,7 +142,7 @@ Every write (`PUT`, `DELETE`, each batch operation) is one transaction: check me
 
 Envelope encryption (`server/src/crypto.rs`): `OBSINK_SERVER_KEY` is HKDF input for three sub-keys — blob wrapping, column sealing (AES-GCM with a `<table>.<column>:<row id>` AAD so ciphertexts cannot be moved between rows), and keyed lookup HMACs. Path tokens, content hashes, `encPath`, and the wrapped account and vault keys are stored as the client sent them: they are already HMACs or ciphertext under keys the server never has.
 
-The retention task (`server/src/retention.rs`) runs at startup and every `RETENTION_INTERVAL_SECS`: prune `_versions/` (keep newest 10 per file / 14 days) and `_trash/` (30 days), delete expired sessions and day-old codes, and remove blob directories whose vault row is gone.
+The retention task (`server/src/retention.rs`) runs at startup and every `RETENTION_INTERVAL_SECS`: prune `_versions/` (keep newest 10 per file / 14 days) and `_trash/` (30 days), delete expired sessions and day-old codes, clear expired approval requests from their device rows, and remove blob directories whose vault row is gone.
 
 ## Testing
 
