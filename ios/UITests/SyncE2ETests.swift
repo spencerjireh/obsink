@@ -22,6 +22,8 @@ import XCTest
 ///     target vault and its key (hex), seeded so the phases skip the download
 ///   OBSINK_TEST_CHOICE                     — conflict winner (resolve test)
 ///   OBSINK_TEST_EXPECT_FILE                — filename (Files-app test)
+///   OBSINK_TEST_FINGERPRINT                — the 8 characters a waiting CLI shows
+///     (approve test)
 final class SyncE2ETests: XCTestCase {
     private var env: [String: String] { ProcessInfo.processInfo.environment }
 
@@ -107,13 +109,18 @@ final class SyncE2ETests: XCTestCase {
         XCTAssertTrue(field.waitForExistence(timeout: 10), "field missing")
         field.tap()
         field.typeText(text)
-        if app.keyboards.buttons["Return"].exists { app.keyboards.buttons["Return"].tap() }
+        // Put the keyboard away so the buttons below the field are hittable.
+        for key in ["Return", "Done"] where app.keyboards.buttons[key].exists {
+            app.keyboards.buttons[key].tap()
+            break
+        }
     }
 
     // MARK: Phases
 
     /// Spec §12.1 through the UI: sign in with the email code (the dev server
-    /// returns it inline, so the field fills itself), enter the account
+    /// returns it inline, so the field fills itself), see the approval wait
+    /// (a fingerprint, `Use passphrase instead`), enter the account
     /// passphrase (`Unlock`: device A set it), then `Download` the vault from
     /// its `Not on this device` card and wait for the first cycle.
     func testSignInUnlockAndDownload() throws {
@@ -140,6 +147,19 @@ final class SyncE2ETests: XCTestCase {
             XCTWaiter.Result.completed, "the code was not filled in (is AUTH_DEV_RETURN_CODE set?)"
         )
         verify.tap()
+
+        // The unlock step waits for an approval first: the fingerprint the
+        // approver would type, and the way to the passphrase.
+        let fingerprint = app.staticTexts["approvalFingerprintText"]
+        let eightChars = NSPredicate(format: "label.length == 8")
+        XCTAssertEqual(
+            XCTWaiter().wait(for: [XCTNSPredicateExpectation(predicate: eightChars, object: fingerprint)], timeout: 60),
+            XCTWaiter.Result.completed, "no 8-character fingerprint on the unlock step — last: \(fingerprint.label)"
+        )
+        XCTAssertFalse(app.secureTextFields["unlockField"].exists, "the passphrase field shows only behind Use passphrase instead")
+        let usePassphrase = app.buttons["usePassphraseButton"]
+        XCTAssertTrue(usePassphrase.waitForExistence(timeout: 10), "Use passphrase instead missing")
+        usePassphrase.tap()
 
         let unlockField = app.secureTextFields["unlockField"]
         XCTAssertTrue(unlockField.waitForExistence(timeout: 60), "the passphrase step never appeared")
@@ -292,6 +312,63 @@ final class SyncE2ETests: XCTestCase {
         XCTAssertTrue(anyElement(app, "deviceRowCurrentTag").waitForExistence(timeout: 10))
         XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label CONTAINS 'CLI'")).firstMatch.exists,
                       "device A (the CLI) is not listed")
+    }
+
+    /// Spec §12.3 from the approver's side: a CLI that signed in and waits
+    /// (`OBSINK_TEST_FINGERPRINT` is what it shows) is listed as waiting on
+    /// the Devices tab; a wrong code is refused with nothing sent, the right
+    /// one approves it and the row reads as usual again.
+    func testApproveDevice() throws {
+        let fingerprint = env["OBSINK_TEST_FINGERPRINT"]!
+        XCTAssertEqual(fingerprint.count, 8, "the harness passes the CLI's 8-character fingerprint")
+        // Another symbol of the fingerprint alphabet in the first place.
+        let alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+        let first = fingerprint.first!
+        let other = alphabet.first { $0 != first }!
+        let wrong = String(other) + fingerprint.dropFirst()
+
+        let app = launchSeeded()
+        settle(app)
+        app.tabBars.buttons["Devices"].tap()
+        let pending = anyElement(app, "devicePendingTag")
+        XCTAssertTrue(pending.waitForExistence(timeout: 60), "no device row waits for approval")
+        let approve = app.buttons["deviceApproveButton"].firstMatch
+        XCTAssertTrue(approve.waitForExistence(timeout: 10), "Approve missing on the waiting row")
+        approve.tap()
+
+        // A mismatch: the message, the sheet stays.
+        let field = anyElement(app, "approveFingerprintField")
+        type(app, field, wrong)
+        let submit = app.buttons["approveSubmitButton"]
+        XCTAssertTrue(submit.waitForExistence(timeout: 10))
+        submit.tap()
+        let status = app.staticTexts["approveStatusText"]
+        let mismatch = NSPredicate(format: "label BEGINSWITH 'Fingerprint does not match'")
+        XCTAssertEqual(
+            XCTWaiter().wait(for: [XCTNSPredicateExpectation(predicate: mismatch, object: status)], timeout: 30),
+            XCTWaiter.Result.completed, "a wrong fingerprint was not refused — last: \(status.label)"
+        )
+        XCTAssertTrue(pending.exists, "the device is no longer waiting after a refused code")
+        app.buttons["approveCancelButton"].tap()
+
+        // The right one: the sheet closes, the row stops waiting, the notice.
+        XCTAssertTrue(approve.waitForExistence(timeout: 10), "Approve missing after Cancel")
+        approve.tap()
+        type(app, anyElement(app, "approveFingerprintField"), fingerprint)
+        XCTAssertTrue(submit.waitForExistence(timeout: 10))
+        submit.tap()
+        let gone = NSPredicate(format: "exists == false")
+        XCTAssertEqual(
+            XCTWaiter().wait(for: [XCTNSPredicateExpectation(predicate: gone, object: anyElement(app, "approveFingerprintField"))], timeout: 30),
+            XCTWaiter.Result.completed, "the approve sheet stayed open — status: \(status.exists ? status.label : "none")"
+        )
+        XCTAssertEqual(
+            XCTWaiter().wait(for: [XCTNSPredicateExpectation(predicate: gone, object: pending)], timeout: 15),
+            XCTWaiter.Result.completed, "the row still waits for approval"
+        )
+        let notice = anyElement(app, "accountNoticeText")
+        XCTAssertTrue(notice.waitForExistence(timeout: 10), "no account notice")
+        XCTAssertEqual(notice.label, "Approved CLI (device C).")
     }
 
     /// On a signed-in phone (the session seeded or already in the Keychain):

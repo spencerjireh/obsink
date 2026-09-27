@@ -8,8 +8,10 @@
 # Both are devices of one account: A signs it up (setting the passphrase) and
 # creates the vault; B signs in through the UI, unlocks with the passphrase
 # and downloads the vault, then the later phases run with A's session and the
-# account key seeded so each one is independent. On-disk state on the iOS
-# side is verified straight through the app-group container
+# account key seeded so each one is independent. "Device C" is a second CLI
+# with its own keyring that signs in without the passphrase and waits to be
+# approved from the phone (spec §12.3). On-disk state on the iOS side is
+# verified straight through the app-group container
 # (`simctl get_app_container … groups`), which the host can read.
 #
 # Requires: .env.deploy at the repo root (OBSINK_SERVER_URL, DEVELOPMENT_TEAM,
@@ -70,10 +72,24 @@ cli() {
         "$REPO_ROOT/target/debug/obsink" "$@"
 }
 
+# Device C: another CLI of the same account with no passphrase in reach, so
+# `login` waits for an approval (a set OBSINK_PASSPHRASE would skip the wait).
+C_HOME="$WORK/deviceC"
+C_KEYRING="$C_HOME/keyring"
+mkdir -p "$C_KEYRING"
+cli_c() {
+    env -u OBSINK_PASSPHRASE OBSINK_HOME="$C_HOME" OBSINK_KEYRING_DIR="$C_KEYRING" \
+        OBSINK_DEVICE_ID="e2e-cli-c" OBSINK_SERVER_URL="$SERVER_URL" \
+        "$REPO_ROOT/target/debug/obsink" "$@"
+}
+
 # The file keyring names entries after the keychain account with `/` and `:`
 # flattened (core `keychain::keyring_file`).
 keyring_entry() {
-    cat "$A_KEYRING/$(printf '%s' "$1" | tr '/:' '__')"
+    keyring_entry_in "$A_KEYRING" "$1"
+}
+keyring_entry_in() {
+    cat "$1/$(printf '%s' "$2" | tr '/:' '__')"
 }
 
 # Run one XCUITest phase; extra env for the app goes via TEST_RUNNER_*.
@@ -159,8 +175,13 @@ VAULT_KEY="$(keyring_entry "$VAULT_ID")"
 # phase fails, device A's session is seeded so the rest still runs.
 SEED_ACCOUNT=0
 
-# The vault is deleted at the end whatever happens.
+# The vault is deleted at the end whatever happens; a CLI still waiting for
+# an approval is stopped.
+CLI_C_PID=""
 cleanup() {
+    if [ -n "$CLI_C_PID" ] && kill -0 "$CLI_C_PID" 2>/dev/null; then
+        kill "$CLI_C_PID" 2>/dev/null || true
+    fi
     if [ -n "${VAULT_ID:-}" ]; then
         curl -s -o /dev/null -w "cleanup: DELETE vault $VAULT_ID -> %{http_code}\n" -X DELETE \
             "$SERVER_URL/vaults/$VAULT_ID" -H "Authorization: Bearer $BEARER" || true
@@ -173,6 +194,9 @@ step "Spec §12: device B signs in, unlocks with the passphrase and downloads th
 # The server refuses a second code for one address within 60 s of device A's.
 WAIT=$((LOGIN_AT + 61 - $(date +%s)))
 [ "$WAIT" -gt 0 ] && { echo "waiting ${WAIT}s for the email cooldown"; sleep "$WAIT"; }
+# The phone asks for its code shortly after this; device C waits the
+# cooldown out from here.
+PHONE_SIGNIN_AT="$(date +%s)"
 if run_test testSignInUnlockAndDownload; then
     B_VAULT="$(app_vault_dir)/Vault/$VAULT_ID"
     if [ "$(cat "$B_VAULT/hello.md" 2>/dev/null)" = "# Hello from Mac" ] \
@@ -199,6 +223,53 @@ if cli devices | grep -q "e2e-sim"; then
 else
     fail "Spec §4.1: device B missing from the CLI's device list"
 fi
+
+# ---------- Spec §12.3: the phone approves a CLI that waits for its key ----------
+step "Spec §12.3: device C signs in without the passphrase; the phone approves it"
+# The phone requested its code within the first seconds of its sign-in
+# phase; one cooldown (plus that lead) later the same address may ask again.
+WAIT=$((PHONE_SIGNIN_AT + 81 - $(date +%s)))
+[ "$WAIT" -gt 0 ] && { echo "waiting ${WAIT}s for the email cooldown"; sleep "$WAIT"; }
+cli_c login --email "$EMAIL" --device-name "CLI (device C)" >"$WORK/cli-c-login.log" 2>&1 &
+CLI_C_PID=$!
+FP=""
+for _ in $(seq 1 60); do
+    FP="$(sed -n 's/^Fingerprint: //p' "$WORK/cli-c-login.log" | head -1)"
+    [ -n "$FP" ] && break
+    kill -0 "$CLI_C_PID" 2>/dev/null || break
+    sleep 1
+done
+if [ -z "$FP" ]; then
+    cat "$WORK/cli-c-login.log"
+    fail "Spec §12.3: device C showed no fingerprint"
+elif run_test testApproveDevice TEST_RUNNER_OBSINK_TEST_FINGERPRINT="$FP"; then
+    echo "device C fingerprint: $FP"
+    for _ in $(seq 1 60); do
+        kill -0 "$CLI_C_PID" 2>/dev/null || break
+        sleep 1
+    done
+    if kill -0 "$CLI_C_PID" 2>/dev/null; then
+        kill "$CLI_C_PID" 2>/dev/null || true
+        cat "$WORK/cli-c-login.log"
+        fail "Spec §12.3: device C still waiting 60 s after the approval"
+    else
+        C_EXIT=0
+        wait "$CLI_C_PID" || C_EXIT=$?
+        C_ACCOUNT_ENTRY="$(keyring_entry_in "$C_KEYRING" "account:$USER_ID" 2>/dev/null || true)"
+        if [ "$C_EXIT" -eq 0 ] && grep -q '^Unlocked\.$' "$WORK/cli-c-login.log" \
+            && [ "$C_ACCOUNT_ENTRY" = "$ACCOUNT_KEY:$ACCOUNT_KEY_ID" ]; then
+            pass "Spec §12.3: device C approved from the phone (unlocked with A's account key)"
+        else
+            cat "$WORK/cli-c-login.log"
+            fail "Spec §12.3: device C exit $C_EXIT; keyring entry '${C_ACCOUNT_ENTRY:0:12}…' vs A's"
+        fi
+    fi
+else
+    kill "$CLI_C_PID" 2>/dev/null || true
+    cat "$WORK/cli-c-login.log"
+    fail "Spec §12.3: approve flow on the phone"
+fi
+CLI_C_PID=""
 
 # ---------- OBS-19 (sim half) / OBS-29: Files app shows the vault ----------
 # Known limitation: on the iOS 26 simulator, fileproviderd never instantiates
