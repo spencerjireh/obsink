@@ -2,12 +2,14 @@ import SwiftUI
 
 /// The Devices tab (spec §15.3): one row per device of the account with
 /// its platform, name (`Rename` in place), `Last seen`, the `This device`
-/// tag, the vaults it holds, and `Sign out`. Signing out this device is the
-/// ordinary sign-out; another row revokes that device on the server after a
-/// confirmation (its folders and keys stay).
+/// tag, the vaults it holds, and `Sign out`. A device waiting for its key
+/// shows `Waiting for approval` and `Approve` instead (spec §12.3). Signing
+/// out this device is the ordinary sign-out; another row revokes that device
+/// on the server after a confirmation (its folders and keys stay).
 struct DevicesView: View {
     @ObservedObject var model: SyncModel
     @State private var revoking: MobileDevice?
+    @State private var approving: MobileDevice?
     @State private var renamingID: String?
     @State private var draftName = ""
     @State private var renameStatus = ""
@@ -34,6 +36,9 @@ struct DevicesView: View {
                 }
             }
             .navigationTitle("Devices")
+            // Approvers poll on tab open (spec §12.3): a device that signed
+            // in since the last refresh shows up waiting.
+            .onAppear { model.refreshAccount() }
             .refreshable { model.refreshAccount() }
             .sheet(item: $revoking) { device in
                 TypedConfirmationSheet(
@@ -45,11 +50,21 @@ struct DevicesView: View {
                     model.revokeDevice(device.id)
                 }
             }
+            .sheet(item: $approving) { device in
+                ApproveDeviceSheet(model: model, device: device)
+            }
         }
+    }
+
+    /// The request is live and nobody has answered it yet; once answered,
+    /// the row reads as usual while the device picks its key up.
+    private func isPending(_ device: MobileDevice) -> Bool {
+        device.approval.map { !$0.approved } ?? false
     }
 
     @ViewBuilder
     private func deviceRow(_ device: MobileDevice) -> some View {
+        let pending = isPending(device)
         VStack(alignment: .leading, spacing: 6) {
             HStack(alignment: .center, spacing: 12) {
                 Image(systemName: PlatformLabel.symbol(device.platform)).foregroundStyle(.secondary)
@@ -72,9 +87,23 @@ struct DevicesView: View {
                             }
                         }
                     }
-                    Text("\(PlatformLabel.text(device.platform)) · Last seen \(RelativeTime.relative(Date(timeIntervalSince1970: TimeInterval(device.lastSeen))).lowercased())")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    if pending {
+                        HStack(spacing: 6) {
+                            Text(PlatformLabel.text(device.platform))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Text("Waiting for approval")
+                                .font(.caption2)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.orange.opacity(0.15), in: Capsule())
+                                .accessibilityIdentifier("devicePendingTag")
+                        }
+                    } else {
+                        Text("\(PlatformLabel.text(device.platform)) · Last seen \(RelativeTime.relative(Date(timeIntervalSince1970: TimeInterval(device.lastSeen))).lowercased())")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                     Text(vaultsLine(device))
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -82,7 +111,11 @@ struct DevicesView: View {
                 Spacer()
             }
             HStack(spacing: 12) {
-                if renamingID == device.id {
+                if pending {
+                    Button("Approve") { approving = device }
+                        .disabled(model.busy || model.locked)
+                        .accessibilityIdentifier("deviceApproveButton")
+                } else if renamingID == device.id {
                     Button("Save") { saveName(device) }
                         .disabled(model.busy || draftName.trimmingCharacters(in: .whitespaces).isEmpty)
                         .accessibilityIdentifier("deviceRenameButton")

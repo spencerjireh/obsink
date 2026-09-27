@@ -154,8 +154,10 @@ struct SignInPane: View {
 }
 
 /// Spec §12.1, the step after sign-in: `Set passphrase` on a new account
-/// (twice), `Unlock` on an existing one or after a lost first-set race. The
-/// unlocked account key goes to the Keychain.
+/// (twice); on an existing one `Unlock`, which waits for another device to
+/// approve this phone (the fingerprint, polled every 3 s) with the
+/// passphrase behind `Use passphrase instead`, or after a lost first-set
+/// race. The unlocked account key goes to the Keychain.
 struct PassphraseStep: View {
     @ObservedObject var model: SyncModel
     @Binding var status: String
@@ -166,12 +168,14 @@ struct PassphraseStep: View {
     @State private var busy = false
     @State private var raceNotice = ""
     @State private var checked = false
+    @State private var showPassphrase = false
 
     private var setting: Bool { !model.hasServerKey }
     private var tooShort: Bool { !passphrase.isEmpty && passphrase.count < SyncModel.minPassphraseChars }
     private var valid: Bool {
         setting ? passphrase.count >= SyncModel.minPassphraseChars && !again.isEmpty : !passphrase.isEmpty
     }
+    private var passphraseVisible: Bool { setting || showPassphrase || !raceNotice.isEmpty }
 
     var body: some View {
         Group {
@@ -184,23 +188,28 @@ struct PassphraseStep: View {
                 Text(setting ? "Set passphrase" : "Unlock").font(.headline)
                 Text(setting
                      ? "It unlocks every vault on every device. There is no recovery if it is lost."
-                     : "The account passphrase, set on your first device.")
+                     : "Approve this device from one that is unlocked, or enter the passphrase.")
                     .font(.caption).foregroundStyle(.secondary)
                 if !raceNotice.isEmpty {
                     Text(raceNotice).font(.caption).foregroundStyle(.orange)
                 }
-                SecureField("Passphrase", text: $passphrase)
-                    .accessibilityIdentifier("unlockField")
-                if setting {
-                    SecureField("Again", text: $again)
-                        .accessibilityIdentifier("unlockConfirmField")
-                    Text("At least \(SyncModel.minPassphraseChars) characters.")
-                        .font(.caption)
-                        .foregroundStyle(tooShort ? Color.orange : Color.secondary)
+                if !setting {
+                    approvalWait
                 }
-                Button(busy ? "Working…" : (setting ? "Set passphrase" : "Unlock")) { submit() }
-                    .disabled(busy || !valid)
-                    .accessibilityIdentifier(setting ? "setPassphraseButton" : "unlockButton")
+                if passphraseVisible {
+                    SecureField("Passphrase", text: $passphrase)
+                        .accessibilityIdentifier("unlockField")
+                    if setting {
+                        SecureField("Again", text: $again)
+                            .accessibilityIdentifier("unlockConfirmField")
+                        Text("At least \(SyncModel.minPassphraseChars) characters.")
+                            .font(.caption)
+                            .foregroundStyle(tooShort ? Color.orange : Color.secondary)
+                    }
+                    Button(busy ? "Working…" : (setting ? "Set passphrase" : "Unlock")) { submit() }
+                        .disabled(busy || !valid)
+                        .accessibilityIdentifier(setting ? "setPassphraseButton" : "unlockButton")
+                }
             }
         }
         .task {
@@ -211,6 +220,34 @@ struct PassphraseStep: View {
                 onUnlocked()
             }
             checked = true
+            // Spec §12.1: wait for an approval while the account has a
+            // passphrase this phone does not hold.
+            while !Task.isCancelled && model.locked && model.hasServerKey {
+                if await model.pollApproval() {
+                    onUnlocked()
+                    break
+                }
+                try? await Task.sleep(for: .seconds(3))
+            }
+        }
+    }
+
+    /// The approval wait (spec §12.1): the fingerprint the approver types,
+    /// the state line, and the way to the passphrase.
+    @ViewBuilder
+    private var approvalWait: some View {
+        Text(model.approval?.fingerprint ?? "")
+            .font(.title2.monospaced())
+            .accessibilityIdentifier("approvalFingerprintText")
+        HStack(spacing: 8) {
+            ProgressView()
+            Text(model.approval == nil ? "Requesting approval…" : "Waiting for approval from another device.")
+                .font(.caption).foregroundStyle(.secondary)
+                .accessibilityIdentifier("approvalWaitingText")
+        }
+        if !passphraseVisible {
+            Button("Use passphrase instead") { showPassphrase = true }
+                .accessibilityIdentifier("usePassphraseButton")
         }
     }
 

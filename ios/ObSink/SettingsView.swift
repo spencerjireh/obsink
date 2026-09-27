@@ -18,7 +18,9 @@ struct SettingsView: View {
                             .font(.callout)
                             .accessibilityIdentifier("accountText")
                         if model.locked {
-                            Label(model.hasServerKey ? "Locked. Enter the account passphrase." : "Set the account passphrase to start.",
+                            Label(model.hasServerKey
+                                  ? "Locked. Approve this device from another one, or enter the passphrase."
+                                  : "Set the account passphrase to start.",
                                   systemImage: "lock")
                                 .font(.caption).foregroundStyle(.orange)
                             Button(model.hasServerKey ? "Unlock" : "Set passphrase") { showingSignIn = true }
