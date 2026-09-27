@@ -3,7 +3,10 @@ mod common;
 use std::sync::atomic::Ordering;
 
 use common::TestEnv;
-use obsink_server::config::{SmtpConfig, SmtpTls};
+use obsink_server::{
+    auth::email,
+    config::{SmtpConfig, SmtpTls},
+};
 use reqwest::Method;
 
 fn smtp() -> SmtpConfig {
@@ -291,6 +294,61 @@ async fn sends_mail_through_the_mailer_and_hides_the_code_without_the_dev_flag()
         .await
         .unwrap();
     assert_eq!(ok.status(), 200);
+    env.finish().await;
+}
+
+/// `obsink-server code <email>` (spec §4.1): a code minted from the shell
+/// verifies like a mailed one; mints have no cooldown between them, only
+/// the latest counts, and `/auth/email/start` right after is rate-limited.
+#[tokio::test]
+async fn a_code_minted_from_the_shell_signs_in_without_mail() {
+    let Some(env) = TestEnv::try_with(|config| config.dev_return_code = false).await else {
+        return;
+    };
+    let now = obsink_server::db::now();
+    let first = email::mint_code(&env.state, " Shell@Example.com", now)
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 6);
+    assert!(first.chars().all(|c| c.is_ascii_digit()));
+    assert!(
+        env.mailer.sent.lock().unwrap().is_empty(),
+        "no mail goes out"
+    );
+    let second = email::mint_code(&env.state, "shell@example.com", now)
+        .await
+        .unwrap();
+    assert_eq!(env.table_count("email_codes").await, 1);
+
+    let stale = env
+        .req(Method::POST, "/auth/email/verify")
+        .json(&serde_json::json!({ "email": "shell@example.com", "code": first, "device": TestEnv::device("shell") }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), 401, "only the latest mint verifies");
+    let ok = env
+        .req(Method::POST, "/auth/email/verify")
+        .json(&serde_json::json!({ "email": "shell@example.com", "code": second, "device": TestEnv::device("shell") }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200, "{}", ok.text().await.unwrap());
+
+    let third = email::mint_code(&env.state, "shell@example.com", obsink_server::db::now())
+        .await
+        .unwrap();
+    assert_eq!(third.len(), 6);
+    let started = env
+        .req(Method::POST, "/auth/email/start")
+        .json(&serde_json::json!({ "email": "shell@example.com" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(started.status(), 429, "a mint sets last_sent");
+    assert!(email::mint_code(&env.state, "not-an-email", now)
+        .await
+        .is_err());
     env.finish().await;
 }
 
