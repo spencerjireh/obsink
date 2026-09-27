@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use obsink_server::{
-    auth::email::{Mailer, NoMailer, SmtpMailer},
+    auth::email::{self, Mailer, NoMailer, SmtpMailer, OTP_MAX_ATTEMPTS, OTP_TTL_SECS},
     auth::invites::{self, INVITE_TTL_SECS},
     config::{self, Config},
     db, retention, router, AppState,
@@ -30,6 +30,8 @@ enum Command {
         #[arg(long, default_value_t = 7)]
         expires_days: u64,
     },
+    /// Mint a one-time sign-in code for an email address (servers without SMTP).
+    Code { email: String },
     /// Run one retention pass (versions, trash, expired sessions/codes, orphans).
     Retention,
     /// Print a fresh base64 value for OBSINK_SERVER_KEY.
@@ -103,6 +105,18 @@ async fn run(command: Command) -> Result<(), String> {
                     .map_err(|e| format!("{e:?}"))?;
                 println!("{}  (expires {})", invite.code, invite.expires);
             }
+            Ok(())
+        }
+        Command::Code { email } => {
+            let (state, _) = build_state().await?;
+            let code = email::mint_code(&state, &email, db::now())
+                .await
+                .map_err(|e| format!("{e:?}"))?;
+            println!(
+                "{code}  (valid {} minutes, {} attempts)",
+                OTP_TTL_SECS / 60,
+                OTP_MAX_ATTEMPTS
+            );
             Ok(())
         }
         Command::Retention => {

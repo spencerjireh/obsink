@@ -169,7 +169,7 @@ pub async fn start(
         ));
     }
 
-    let code = crate::crypto::random_digits(6);
+    let code = new_code();
     if smtp_configured {
         state
             .mailer
@@ -186,24 +186,51 @@ pub async fn start(
                 ApiError::status(StatusCode::BAD_GATEWAY, "could not send sign-in email")
             })?;
     }
+    store_code(&state, &email, &code, now).await?;
 
+    Ok(Json(StartResponse {
+        sent: smtp_configured,
+        code: state.config.dev_return_code.then_some(code),
+    }))
+}
+
+/// A fresh six-digit one-time code.
+pub fn new_code() -> String {
+    crate::crypto::random_digits(6)
+}
+
+/// Record `code` as the outstanding one for `email` (normalised), replacing
+/// any earlier code: fresh expiry, attempts reset, `last_sent` = `now`.
+pub async fn store_code(
+    state: &AppState,
+    email: &str,
+    code: &str,
+    now: u64,
+) -> Result<(), ApiError> {
     sqlx::query(
         "INSERT INTO email_codes (email_hmac, code_hmac, expires, attempts, last_sent)
          VALUES ($1, $2, $3, 0, $4)
          ON CONFLICT (email_hmac) DO UPDATE SET code_hmac = EXCLUDED.code_hmac,
              expires = EXCLUDED.expires, attempts = 0, last_sent = EXCLUDED.last_sent",
     )
-    .bind(&email_hmac)
+    .bind(state.keys.index("email", email))
     .bind(state.keys.index("otp", &format!("{email}:{code}")))
     .bind(db::to_i64(now + OTP_TTL_SECS))
     .bind(db::to_i64(now))
     .execute(&state.pool)
     .await?;
+    Ok(())
+}
 
-    Ok(Json(StartResponse {
-        sent: smtp_configured,
-        code: state.config.dev_return_code.then_some(code),
-    }))
+/// Mint a code from the server's shell (`obsink-server code <email>`, spec
+/// §4.1): no mail, no SMTP gate and no cooldown check, otherwise the same
+/// code `/auth/email/start` would record (10 minutes, 5 attempts). It sets
+/// `last_sent`, so a `/auth/email/start` right after is rate-limited.
+pub async fn mint_code(state: &AppState, email: &str, now: u64) -> Result<String, ApiError> {
+    let email = normalize_email(Some(email))?;
+    let code = new_code();
+    store_code(state, &email, &code, now).await?;
+    Ok(code)
 }
 
 /// Outcome of checking a one-time code. A rejection carries the response to
