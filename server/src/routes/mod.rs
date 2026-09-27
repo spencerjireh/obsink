@@ -42,7 +42,9 @@ async fn capabilities(State(state): State<AppState>) -> Result<Json<Capabilities
         protocol: obsink_core::PROTOCOL_VERSION,
         auth: AuthMethods {
             email: state.config.email_enabled(),
-            apple: state.config.apple_enabled(),
+            // Sign in with Apple was removed in 0.5; the field stays so older
+            // iOS builds hide the button (spec §4.1).
+            apple: false,
         },
         invite_required: users > 0,
     }))
@@ -92,7 +94,6 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/auth/email/start", post(auth::email::start))
         .route("/auth/email/verify", post(auth::email::verify))
-        .route("/auth/apple", post(auth::apple::sign_in))
         .route("/auth/me", get(me::me))
         .route("/auth/keys", get(auth::keys::get).put(auth::keys::set))
         .route("/auth/keys/rewrap", put(auth::keys::rewrap))

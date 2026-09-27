@@ -145,7 +145,6 @@ async fn serve() -> Result<(), String> {
     tracing::info!(
         listen = %config.listen,
         email = config.email_enabled(),
-        apple = config.apple_enabled(),
         protocol = obsink_core::PROTOCOL_VERSION,
         "obsink-server listening"
     );

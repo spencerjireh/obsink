@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{PgConnection, Row};
 
 use crate::{
-    auth::{account, account::Identity, devices, devices::DeviceBody, sessions::SessionResponse},
+    auth::{account, devices, devices::DeviceBody, sessions::SessionResponse},
     config::{SmtpConfig, SmtpTls},
     db,
     error::{ApiError, AppJson},
@@ -321,7 +321,7 @@ pub async fn verify(
     let session = account::sign_in(
         &state,
         &mut tx,
-        Identity::Email(email.clone()),
+        &email,
         body.invite_code.as_deref(),
         &device,
         now,

@@ -35,12 +35,12 @@ async fn advertises_configured_sign_in_methods_without_auth() {
         serde_json::json!({
             "service": "obsink",
             "protocol": obsink_core::PROTOCOL_VERSION,
-            "auth": { "email": false, "apple": true },
+            "auth": { "email": false, "apple": false },
             "invite_required": false
         })
     );
     let caps = env.auth_client().capabilities().await.unwrap();
-    assert!(!caps.auth.email && caps.auth.apple);
+    assert!(!caps.auth.email && !caps.auth.apple);
     env.finish().await;
 }
 

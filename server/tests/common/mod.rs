@@ -25,8 +25,6 @@ use obsink_server::{
 };
 use sqlx::{postgres::PgPoolOptions, PgPool};
 
-pub const APPLE_AUDIENCE: &str = "com.obsink.ios";
-
 /// The account `try_with_owner` signs in before the test starts: the stand-in
 /// for what used to be the operator bearer.
 pub const OWNER_EMAIL: &str = "owner@example.com";
@@ -81,8 +79,6 @@ pub fn test_config(data_dir: &std::path::Path, database_url: String) -> Config {
         database_url,
         data_dir: data_dir.to_path_buf(),
         server_key: None,
-        apple_client_ids: vec![APPLE_AUDIENCE.to_string()],
-        apple_jwks_url: "http://127.0.0.1:9/keys".to_string(),
         smtp: None,
         dev_return_code: true,
         max_vaults_per_user: DEFAULT_MAX_VAULTS_PER_USER,

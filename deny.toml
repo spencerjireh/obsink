@@ -23,9 +23,7 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 # Tauri, UniFFI and httpmock pull unmaintained transitive crates we cannot replace ourselves.
 unmaintained = "workspace"
 yanked = "deny"
-ignore = [
-  { id = "RUSTSEC-2023-0071", reason = "rsa: Marvin timing side channel. Dev-dependency of obsink-server only (tests forge Apple identity tokens); never linked into a shipped binary; no fixed release exists." },
-]
+ignore = []
 
 [licenses]
 allow = [

@@ -24,7 +24,6 @@ services:
       SMTP_PORT: "1025"
       SMTP_TLS: none
       SMTP_FROM: "ObSink <login@obsink.local>"
-      APPLE_CLIENT_IDS: ${APPLE_CLIENT_IDS:-com.obsink.ios}
       RUST_LOG: ${RUST_LOG:-obsink_server=info,tower_http=info}
     volumes:
       - obsink-data:/data

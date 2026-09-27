@@ -4,7 +4,7 @@
 //! client's key hygiene (spec §6.1). Three purpose-separated sub-keys come out:
 //! `blob_enc` wraps stored blobs (which are already client ciphertext),
 //! `field_enc` seals sensitive Postgres columns, and `index_mac` keys the
-//! lookup HMACs (email, Apple subject, one-time codes) so the database holds
+//! lookup HMACs (email, one-time codes) so the database holds
 //! neither plaintext identifiers nor unkeyed hashes of them.
 //!
 //! Sealed format: `"OBSK" || 0x01 || nonce[12] || ciphertext || tag[16]`.
@@ -102,7 +102,7 @@ impl ServerKeys {
     // --- lookup indexes ------------------------------------------------------
 
     /// Deterministic keyed index for equality lookups (`kind` separates
-    /// namespaces: `email`, `apple_sub`, `otp`).
+    /// namespaces: `email`, `otp`).
     pub fn index(&self, kind: &str, value: &str) -> Vec<u8> {
         let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.index_mac)
             .expect("any key length is valid");
