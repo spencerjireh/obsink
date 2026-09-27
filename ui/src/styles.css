@@ -720,6 +720,20 @@ select {
   font-size: 13px;
 }
 
+/* Spec §12.3: the fingerprint the approver reads off this device. */
+.approval-fingerprint {
+  display: block;
+  min-height: 1.5em;
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  font-family: var(--font-mono);
+  font-size: 28px;
+  letter-spacing: 0.25em;
+  text-align: center;
+}
+
 /* State line and dot (vault page header, list rows) */
 .state-line {
   display: flex;

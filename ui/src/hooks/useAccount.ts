@@ -1,5 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { AccountState, AuthCapabilities, InviteInfo, VaultUsage } from '../types'
+import type {
+  AccountState,
+  ApprovalRequest,
+  AuthCapabilities,
+  InviteInfo,
+  VaultUsage,
+} from '../types'
 import { useBackend } from '../backend'
 import { isInviteRequired, isUnauthorized, SESSION_EXPIRED, toCommandError } from '../lib/errors'
 
@@ -11,7 +17,10 @@ type Notify = (message: string) => void
 export function useAccount(notify: Notify) {
   const backend = useBackend()
   const [serverUrl, setServerUrl] = useState('')
-  const [account, setAccount] = useState<AccountState | null>(null)
+  const [account, setAccountState] = useState<AccountState | null>(null)
+  // Spec §12.3: this device's live approval request while it waits at the
+  // unlock step; null until the first poll registered one.
+  const [approval, setApproval] = useState<ApprovalRequest | null>(null)
   const [invites, setInvites] = useState<InviteInfo[]>([])
   // What `GET /` says about this server; null until it answered.
   const [capabilities, setCapabilities] = useState<AuthCapabilities | null>(null)
@@ -31,12 +40,20 @@ export function useAccount(notify: Notify) {
   const [raceNotice, setRaceNotice] = useState('')
   const notifyRef = useRef(notify)
   notifyRef.current = notify
+  const accountRef = useRef(account)
+  accountRef.current = account
+
+  // The fingerprint belongs to the locked step only: leaving it drops it.
+  const setAccount = useCallback((next: AccountState | null) => {
+    setAccountState(next)
+    if (next?.kind !== 'locked') setApproval(null)
+  }, [])
 
   const markExpired = useCallback(() => {
     setSessionExpired(true)
     setAccount({ kind: 'signed_out' })
     setInvites([])
-  }, [])
+  }, [setAccount])
 
   // Every failure lands here; callers outside the hook use it too.
   const fail = useCallback(
@@ -73,7 +90,7 @@ export function useAccount(notify: Notify) {
     } catch (error) {
       fail(error)
     }
-  }, [backend, fail, refreshInvites])
+  }, [backend, fail, refreshInvites, setAccount])
 
   const refreshCapabilities = useCallback(async () => {
     try {
@@ -251,6 +268,50 @@ export function useAccount(notify: Notify) {
     }
   }
 
+  // Spec §12.3: one tick of the waiting device's loop; the unlock form calls
+  // it every few seconds while the account is locked with a passphrase set.
+  // Not `withBusy`: a poll must not grey the form out. A lost session ends
+  // the loop; any other failure is left to the next tick.
+  const pollApproval = useCallback(async () => {
+    try {
+      const result = await backend.pollApproval()
+      // The step moved on while this poll was in flight (a passphrase
+      // unlock, a sign-out): its answer is stale.
+      if (accountRef.current?.kind !== 'locked') return
+      setAccount(result.account)
+      setApproval(result.account.kind === 'locked' ? result.approval : null)
+      if (result.account.kind === 'account') {
+        setRaceNotice('')
+        notifyRef.current('Unlocked.')
+        void refreshInvites()
+      }
+    } catch (error) {
+      if (isUnauthorized(toCommandError(error))) {
+        markExpired()
+        notifyRef.current(SESSION_EXPIRED)
+      }
+    }
+  }, [backend, markExpired, refreshInvites, setAccount])
+
+  // Spec §15.3: wrap the account key to a pending device once its
+  // fingerprint was typed. Returns whether it succeeded so the form knows
+  // to close; a mismatch is a plain failure notice and the form stays.
+  const approveDevice = async (deviceId: string, fingerprint: string): Promise<boolean> => {
+    const devices = account?.kind === 'account' ? account.devices : []
+    const name = devices.find((device) => device.id === deviceId)?.name ?? 'device'
+    setBusy(true)
+    try {
+      setAccount(await backend.approveDevice(deviceId, fingerprint))
+      notifyRef.current(`Approved ${name}.`)
+      return true
+    } catch (error) {
+      fail(error)
+      return false
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const signOut = () =>
     withBusy(async () => {
       try {
@@ -303,6 +364,11 @@ export function useAccount(notify: Notify) {
     raceNotice,
     setPassphrase,
     unlock,
+    // Spec §12.3: the fingerprint to show while waiting; null until
+    // registered, and always null once the account is not locked.
+    approval,
+    pollApproval,
+    approveDevice,
     inviteRequired: (capabilities?.invite_required ?? false) || inviteForced,
     inviteFocusAt,
     form: { authEmail, authCode, inviteCode, codeSent },

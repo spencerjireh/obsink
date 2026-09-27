@@ -2,6 +2,7 @@ import { createContext, useContext, type ReactNode } from 'react'
 import type {
   AccountState,
   ActivityEvent,
+  ApprovalRequest,
   AuthCapabilities,
   ConflictPreview,
   FilePreview,
@@ -83,6 +84,26 @@ export interface Backend {
   ): Promise<{ outcome: SetPassphraseOutcome; account: AccountState }>
   // Enter the passphrase on a device that does not hold the account key.
   unlock(passphrase: string): Promise<AccountState>
+  // Spec §12.3, the waiting device's side of device approval. Called every
+  // few seconds while the unlock step shows. When the account is `locked`
+  // with `has_key` and this device has no live request, it registers one
+  // (a fresh approval keypair; the secret stays on this device) and returns
+  // its fingerprint; while one is live it polls it; when the wrapped
+  // account key arrives it unwraps it, stores the key like `unlock` does,
+  // clears the request and returns the unlocked account. In every other
+  // state (signed out, unlocked, no passphrase set yet) it sends nothing
+  // and returns `{ approval: null, account }` unchanged. An expired request
+  // is replaced by a new one, so the fingerprint may change.
+  pollApproval(): Promise<{ approval: ApprovalRequest | null; account: AccountState }>
+  // Spec §12.3, the approver's side, from an unlocked device. Normalises
+  // `fingerprint` (whitespace and dashes dropped, uppercased) and compares
+  // it locally to the fingerprint of the pending device's public key. On a
+  // mismatch it rejects with `CommandError { kind: 'other', message:
+  // 'Fingerprint does not match. Check it on the other device.' }` and
+  // sends nothing. Otherwise it wraps the account key to that device, posts
+  // the blob and returns the refreshed account (the row stays pending until
+  // the other device picks the key up).
+  approveDevice(deviceId: string, fingerprint: string): Promise<AccountState>
   // Spec §6.1: the same account key under a new KEK; the current passphrase
   // must open the stored blob first.
   changePassphrase(current: string, next: string): Promise<void>

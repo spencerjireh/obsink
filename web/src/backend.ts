@@ -90,6 +90,9 @@ export class WebBackend implements Backend {
   getAccount = () => this.call<never>('getAccount')
   setPassphrase = (passphrase: string) => this.call<never>('setPassphrase', passphrase)
   unlock = (passphrase: string) => this.call<never>('unlock', passphrase)
+  pollApproval = () => this.call<never>('pollApproval')
+  approveDevice = (deviceId: string, fingerprint: string) =>
+    this.call<never>('approveDevice', deviceId, fingerprint)
   changePassphrase = (current: string, next: string) =>
     this.call<void>('changePassphrase', current, next)
   createInvite = () => this.call<never>('createInvite')

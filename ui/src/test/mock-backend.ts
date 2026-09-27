@@ -54,13 +54,15 @@ export function mockBackend(overrides: Partial<Backend> = {}): MockBackend {
     calls,
     getServerUrl: () => Promise.resolve('https://server.test'),
     getProtocol: () => Promise.resolve({ server: 3, client: 3 }),
-    getAuthCapabilities: () =>
-      Promise.resolve({ email: true, apple: false, invite_required: false }),
+    getAuthCapabilities: () => Promise.resolve({ email: true, invite_required: false }),
     authEmailStart: notImplemented('authEmailStart'),
     authEmailVerify: notImplemented('authEmailVerify'),
     getAccount: () => Promise.resolve(unlockedAccount()),
     setPassphrase: notImplemented('setPassphrase'),
     unlock: notImplemented('unlock'),
+    // No request by default: the poll reads the account and reports none.
+    pollApproval: () => backend.getAccount().then((account) => ({ approval: null, account })),
+    approveDevice: notImplemented('approveDevice'),
     changePassphrase: notImplemented('changePassphrase'),
     createInvite: notImplemented('createInvite'),
     listInvites: () => Promise.resolve([]),
