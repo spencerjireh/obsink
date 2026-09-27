@@ -1,10 +1,11 @@
 //! Secret storage for the CLI and desktop app (feature `keychain`), spec §6.3.
 //!
-//! Four kinds of entry share the `obsink` service: the vault key (account =
+//! Five kinds of entry share the `obsink` service: the vault key (account =
 //! vault ID, hex), the server bearer (`bearer:<url>`), the account key
-//! (`account:<user id>`, hex plus the server's `key_id`) and the device id
+//! (`account:<user id>`, hex plus the server's `key_id`), the device id
 //! (`device:<url>`, shared by the CLI and the desktop app so one Mac is one
-//! device). On macOS they live in the login keychain as generic-password
+//! device) and, while a device waits for approval, its approval secret
+//! (`approval:<user id>`, hex; spec §6.3). On macOS they live in the login keychain as generic-password
 //! items, written through the Security framework so the secret never appears
 //! on a process argv. `OBSINK_KEYRING_DIR` swaps the keychain for a directory
 //! of 0600 files (CI, harnesses).
@@ -133,6 +134,38 @@ pub fn delete_account_key(user_id: &str) {
     delete_secret(&account_key_account(user_id));
 }
 
+/// Keychain account for a pending approval's secret: `approval:<user id>`.
+pub fn approval_secret_account(user_id: &str) -> String {
+    format!("approval:{user_id}")
+}
+
+/// Keep the approval secret between polls (and across a restart) while the
+/// device waits for another one to approve it.
+pub fn save_approval_secret(user_id: &str, secret: &KeyBytes) -> io::Result<()> {
+    save_secret(&approval_secret_account(user_id), &hex::encode(secret))
+}
+
+/// The stored approval secret, or `None` when this device is not waiting.
+pub fn load_approval_secret(user_id: &str) -> io::Result<Option<KeyBytes>> {
+    let Some(value) = load_secret_opt(&approval_secret_account(user_id))? else {
+        return Ok(None);
+    };
+    let bytes =
+        hex::decode(value).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let secret: KeyBytes = bytes.try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "approval secret is not 32 bytes",
+        )
+    })?;
+    Ok(Some(secret))
+}
+
+/// Forget the approval secret: the device was approved, or gave up.
+pub fn delete_approval_secret(user_id: &str) {
+    delete_secret(&approval_secret_account(user_id));
+}
+
 /// This machine's device id for a server: `OBSINK_DEVICE_ID` when set, else
 /// the keychain entry, else a fresh id that is saved. Any keychain error other
 /// than "no entry" is propagated rather than papered over with a new id, so a
@@ -252,9 +285,10 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        account_key_account, bearer_account, delete_account_key, delete_secret, device_id_account,
-        keyring_file, load_account_key, load_bearer, load_or_create_device_id, load_secret,
-        save_account_key, save_secret, write_private, DEVICE_ID_ENV,
+        account_key_account, approval_secret_account, bearer_account, delete_account_key,
+        delete_approval_secret, delete_secret, device_id_account, keyring_file, load_account_key,
+        load_approval_secret, load_bearer, load_or_create_device_id, load_secret, save_account_key,
+        save_approval_secret, save_secret, write_private, DEVICE_ID_ENV,
     };
 
     #[test]
@@ -313,6 +347,20 @@ mod tests {
         );
         delete_account_key("usr_1");
         assert!(load_account_key("usr_1").is_err());
+
+        // The approval secret is filed under the user too, and absent by default.
+        assert_eq!(approval_secret_account("usr_1"), "approval:usr_1");
+        assert_eq!(load_approval_secret("usr_1").unwrap(), None);
+        let secret = [9u8; 32];
+        save_approval_secret("usr_1", &secret).unwrap();
+        assert_eq!(load_approval_secret("usr_1").unwrap(), Some(secret));
+        save_secret(&approval_secret_account("usr_1"), "abc").unwrap();
+        assert_eq!(
+            load_approval_secret("usr_1").unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        delete_approval_secret("usr_1");
+        assert_eq!(load_approval_secret("usr_1").unwrap(), None);
 
         // The device id is minted once and then reused; the env var overrides it.
         let first = load_or_create_device_id("https://elsewhere.test/").unwrap();

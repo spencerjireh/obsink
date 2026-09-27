@@ -11,6 +11,11 @@
 //! The server holds the account key and every vault key only wrapped
 //! (AES-256-GCM under a key it never has) plus a verifier that proves a
 //! rewrap request comes from a client holding the unwrapped account key.
+//!
+//! Device approval (spec §12.1) is the second way onto a device: a device
+//! without the account key makes an X25519 keypair, an unlocked device wraps
+//! the account key to that public key after the user has typed the pending
+//! device's fingerprint, and the server relays a blob it cannot open.
 
 use aes_gcm::{
     aead::{rand_core::RngCore, Aead, KeyInit, OsRng, Payload},
@@ -20,8 +25,9 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
+use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroize;
 
 pub type KeyBytes = [u8; 32];
@@ -39,6 +45,25 @@ pub const SALT_LEN: usize = 16;
 
 /// A wrapped 32-byte key: `[12-byte nonce][32-byte ciphertext][16-byte tag]`.
 pub const WRAPPED_KEY_LEN: usize = NONCE_LEN + 32 + TAG_LEN;
+
+/// An X25519 public key (the pending device's, and the approver's ephemeral one).
+pub const APPROVAL_PUBLIC_KEY_LEN: usize = 32;
+
+/// What `POST /auth/devices/{id}/approval` relays: the approver's ephemeral
+/// public key followed by the account key wrapped under the agreed key:
+/// `[32-byte sender public key][12-byte nonce][32-byte ciphertext][16-byte tag]`.
+pub const APPROVAL_BLOB_LEN: usize = APPROVAL_PUBLIC_KEY_LEN + WRAPPED_KEY_LEN;
+
+/// The 32 symbols a fingerprint is spelled in (the invite alphabet: no `0`,
+/// `O`, `1`, `I`), 5 bits each.
+pub const FINGERPRINT_ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+/// Symbols in the fingerprint the user types on the approving device: 8 of
+/// them are 40 bits. The single knob (decision 2026-09-27 on OBS-74).
+pub const APPROVAL_FINGERPRINT_LEN: usize = 8;
+
+const APPROVAL_FINGERPRINT_DOMAIN: &[u8] = b"obsink:v3:approval-fingerprint";
+const APPROVAL_WRAP_INFO: &[u8] = b"obsink:v3:device-approval";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -148,6 +173,10 @@ pub enum CryptoError {
     Encrypt,
     #[error("decryption failed")]
     Decrypt,
+    /// The fingerprint the user typed is not the one of the public key the
+    /// server relayed (spec §12.3): nothing is wrapped, nothing is sent.
+    #[error("fingerprint does not match")]
+    FingerprintMismatch,
 }
 
 /// The KEK: Argon2id over the passphrase. In v3 the salt is the 16 random
@@ -406,14 +435,390 @@ pub fn unwrap_vault_key(
     key
 }
 
+/// A pending device's approval keypair (spec §12.1). The secret lives in the
+/// keychain (`approval:<user id>`) between polls; the public key goes to the
+/// server; the fingerprint is what the user reads out.
+///
+/// `Debug` shows only the fingerprint; the secret is wiped on drop.
+#[derive(Clone)]
+pub struct ApprovalRequest {
+    secret: KeyBytes,
+    public: [u8; APPROVAL_PUBLIC_KEY_LEN],
+}
+
+impl std::fmt::Debug for ApprovalRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApprovalRequest")
+            .field("fingerprint", &self.fingerprint())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for ApprovalRequest {
+    fn drop(&mut self) {
+        self.secret.zeroize();
+    }
+}
+
+impl ApprovalRequest {
+    /// Rebuild the request from the stored secret (x25519-dalek 2 clamps at
+    /// use, so the bytes round-trip through the keychain unchanged).
+    pub fn from_secret(secret: &KeyBytes) -> Self {
+        let scalar = StaticSecret::from(*secret);
+        let public = PublicKey::from(&scalar).to_bytes();
+        ApprovalRequest {
+            secret: scalar.to_bytes(),
+            public,
+        }
+    }
+
+    /// The secret scalar, for the keychain.
+    pub fn secret_bytes(&self) -> &KeyBytes {
+        &self.secret
+    }
+
+    /// The public key `PUT /auth/approval` registers.
+    pub fn public_key(&self) -> &[u8; APPROVAL_PUBLIC_KEY_LEN] {
+        &self.public
+    }
+
+    /// What this device shows and the approver types.
+    pub fn fingerprint(&self) -> String {
+        approval_fingerprint(&self.public)
+    }
+}
+
+/// A fresh approval keypair from 32 random bytes.
+pub fn new_approval_request() -> ApprovalRequest {
+    let mut seed = new_key();
+    let request = ApprovalRequest::from_secret(&seed);
+    seed.zeroize();
+    request
+}
+
+/// The fingerprint of a pending device's public key: SHA-256 over
+/// `"obsink:v3:approval-fingerprint" || public key`, read MSB-first in 5-bit
+/// groups through [`FINGERPRINT_ALPHABET`], the first
+/// [`APPROVAL_FINGERPRINT_LEN`] symbols. Computed on both ends, never by the
+/// server.
+pub fn approval_fingerprint(public: &[u8; APPROVAL_PUBLIC_KEY_LEN]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(APPROVAL_FINGERPRINT_DOMAIN);
+    hasher.update(public);
+    let digest = hasher.finalize();
+    (0..APPROVAL_FINGERPRINT_LEN)
+        .map(|symbol| {
+            let first_bit = symbol * 5;
+            let index = (0..5).fold(0_usize, |acc, offset| {
+                let bit = first_bit + offset;
+                let set = (digest[bit / 8] >> (7 - bit % 8)) & 1;
+                (acc << 1) | usize::from(set)
+            });
+            char::from(FINGERPRINT_ALPHABET[index])
+        })
+        .collect()
+}
+
+/// What the user typed, in the shape [`approval_fingerprint`] produces:
+/// whitespace and `-` dropped, uppercase, `0` read as `O` (the alphabet has
+/// no zero).
+pub fn normalize_fingerprint(typed: &str) -> String {
+    typed
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .map(|c| match c.to_ascii_uppercase() {
+            '0' => 'O',
+            upper => upper,
+        })
+        .collect()
+}
+
+/// The key that wraps the account key between an approver and a pending
+/// device: HKDF-SHA256 of the X25519 shared secret with both public keys in
+/// the info, so a blob is bound to the pair that made it. An all-zero shared
+/// secret (a low-order peer key) is refused as `KeyDerivation`.
+fn approval_wrap_key(
+    own: &StaticSecret,
+    peer: &[u8; APPROVAL_PUBLIC_KEY_LEN],
+    sender: &[u8; APPROVAL_PUBLIC_KEY_LEN],
+    recipient: &[u8; APPROVAL_PUBLIC_KEY_LEN],
+) -> Result<KeyBytes, CryptoError> {
+    let shared = own.diffie_hellman(&PublicKey::from(*peer));
+    if !shared.was_contributory() {
+        return Err(CryptoError::KeyDerivation);
+    }
+    let mut info = Vec::with_capacity(APPROVAL_WRAP_INFO.len() + 2 * APPROVAL_PUBLIC_KEY_LEN);
+    info.extend_from_slice(APPROVAL_WRAP_INFO);
+    info.extend_from_slice(sender);
+    info.extend_from_slice(recipient);
+    // `SharedSecret` wipes itself on drop.
+    Ok(hkdf_subkey(shared.as_bytes(), &info))
+}
+
+fn approval_aad(user_id: &str, device_id: &str) -> String {
+    format!("{user_id}:{device_id}")
+}
+
+/// On an unlocked device: wrap the account key to a pending device's public
+/// key, only when `typed` is that key's fingerprint. Returns the
+/// [`APPROVAL_BLOB_LEN`]-byte blob `sender public key || wrapped account key`
+/// for `POST /auth/devices/{device_id}/approval`. A key of the wrong length
+/// is `InvalidBlob`; a wrong fingerprint is `FingerprintMismatch` and nothing
+/// is wrapped; a low-order key is `KeyDerivation`.
+pub fn approve_device(
+    account: &KeyBytes,
+    recipient_public: &[u8],
+    typed: &str,
+    user_id: &str,
+    device_id: &str,
+) -> Result<Vec<u8>, CryptoError> {
+    let recipient: [u8; APPROVAL_PUBLIC_KEY_LEN] = recipient_public
+        .try_into()
+        .map_err(|_| CryptoError::InvalidBlob)?;
+    if normalize_fingerprint(typed) != approval_fingerprint(&recipient) {
+        return Err(CryptoError::FingerprintMismatch);
+    }
+    let mut seed = new_key();
+    let sender = StaticSecret::from(seed);
+    seed.zeroize();
+    let sender_public = PublicKey::from(&sender).to_bytes();
+    let mut wrapping = approval_wrap_key(&sender, &recipient, &sender_public, &recipient)?;
+    let wrapped = wrap_key(
+        &wrapping,
+        account,
+        approval_aad(user_id, device_id).as_bytes(),
+    );
+    wrapping.zeroize();
+    let wrapped = wrapped?;
+    let mut blob = Vec::with_capacity(APPROVAL_BLOB_LEN);
+    blob.extend_from_slice(&sender_public);
+    blob.extend_from_slice(&wrapped);
+    Ok(blob)
+}
+
+/// On the pending device: open the relayed blob with the request's secret.
+/// A blob of the wrong length is `InvalidBlob`; a blob made for another
+/// request, user or device, or tampered with, is `Decrypt`.
+pub fn accept_approval(
+    request: &ApprovalRequest,
+    blob: &[u8],
+    user_id: &str,
+    device_id: &str,
+) -> Result<KeyBytes, CryptoError> {
+    if blob.len() != APPROVAL_BLOB_LEN {
+        return Err(CryptoError::InvalidBlob);
+    }
+    let (sender_public, wrapped) = blob.split_at(APPROVAL_PUBLIC_KEY_LEN);
+    let sender_public: [u8; APPROVAL_PUBLIC_KEY_LEN] = sender_public
+        .try_into()
+        .map_err(|_| CryptoError::InvalidBlob)?;
+    let own = StaticSecret::from(request.secret);
+    let mut wrapping = approval_wrap_key(&own, &sender_public, &sender_public, &request.public)?;
+    let key = unwrap_key(
+        &wrapping,
+        wrapped,
+        approval_aad(user_id, device_id).as_bytes(),
+    );
+    wrapping.zeroize();
+    key
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        account_verifier, content_hmac, create_account_key, decode_base64, decrypt, decrypt_path,
-        derive_key, derive_keys, encrypt, encrypt_path, new_key, new_salt, new_vault_id,
+        accept_approval, account_verifier, approval_fingerprint, approve_device, content_hmac,
+        create_account_key, decode_base64, decrypt, decrypt_path, derive_key, derive_keys, encrypt,
+        encrypt_path, new_approval_request, new_key, new_salt, new_vault_id, normalize_fingerprint,
         path_token, rewrap_account_key, unlock_account_key, unwrap_key, unwrap_vault_key,
-        vault_wrap_key, wrap_key, wrap_vault_key, CryptoError, PROTOCOL_VERSION, WRAPPED_KEY_LEN,
+        vault_wrap_key, wrap_key, wrap_vault_key, ApprovalRequest, CryptoError, APPROVAL_BLOB_LEN,
+        APPROVAL_FINGERPRINT_LEN, APPROVAL_PUBLIC_KEY_LEN, FINGERPRINT_ALPHABET, PROTOCOL_VERSION,
+        WRAPPED_KEY_LEN,
     };
+
+    #[test]
+    fn device_approval_round_trips_and_binds_its_context() {
+        let account = new_key();
+        let request = new_approval_request();
+        let typed = request.fingerprint();
+        assert_eq!(typed.len(), APPROVAL_FINGERPRINT_LEN);
+
+        let blob =
+            approve_device(&account, request.public_key(), &typed, "usr_1", "dev_2").unwrap();
+        assert_eq!(blob.len(), APPROVAL_BLOB_LEN);
+        assert_eq!(
+            accept_approval(&request, &blob, "usr_1", "dev_2").unwrap(),
+            account
+        );
+        // Two approvals of the same request use fresh ephemeral keys.
+        let again =
+            approve_device(&account, request.public_key(), &typed, "usr_1", "dev_2").unwrap();
+        assert_ne!(
+            again[..APPROVAL_PUBLIC_KEY_LEN],
+            blob[..APPROVAL_PUBLIC_KEY_LEN]
+        );
+
+        // Another request, user, device, or a flipped byte: the GCM tag fails.
+        assert!(matches!(
+            accept_approval(&new_approval_request(), &blob, "usr_1", "dev_2"),
+            Err(CryptoError::Decrypt)
+        ));
+        assert!(matches!(
+            accept_approval(&request, &blob, "usr_2", "dev_2"),
+            Err(CryptoError::Decrypt)
+        ));
+        assert!(matches!(
+            accept_approval(&request, &blob, "usr_1", "dev_3"),
+            Err(CryptoError::Decrypt)
+        ));
+        for index in [0, APPROVAL_PUBLIC_KEY_LEN + 5, APPROVAL_BLOB_LEN - 1] {
+            let mut tampered = blob.clone();
+            tampered[index] ^= 0x01;
+            let error = accept_approval(&request, &tampered, "usr_1", "dev_2").unwrap_err();
+            assert!(
+                matches!(error, CryptoError::Decrypt | CryptoError::KeyDerivation),
+                "byte {index}: {error:?}"
+            );
+        }
+        // A short blob is rejected before any agreement runs.
+        assert!(matches!(
+            accept_approval(&request, &blob[..APPROVAL_BLOB_LEN - 1], "usr_1", "dev_2"),
+            Err(CryptoError::InvalidBlob)
+        ));
+        assert!(matches!(
+            approve_device(&account, &blob[..31], &typed, "usr_1", "dev_2"),
+            Err(CryptoError::InvalidBlob)
+        ));
+    }
+
+    #[test]
+    fn a_wrong_fingerprint_wraps_nothing() {
+        let account = new_key();
+        let request = new_approval_request();
+        let right = request.fingerprint();
+        let mut wrong: Vec<char> = right.chars().collect();
+        wrong[3] = if wrong[3] == 'A' { 'B' } else { 'A' };
+        let wrong: String = wrong.into_iter().collect();
+        assert!(matches!(
+            approve_device(&account, request.public_key(), &wrong, "usr_1", "dev_2"),
+            Err(CryptoError::FingerprintMismatch)
+        ));
+        assert!(matches!(
+            approve_device(&account, request.public_key(), "", "usr_1", "dev_2"),
+            Err(CryptoError::FingerprintMismatch)
+        ));
+        // Typed sloppily but right: lowercase, spaced, dashed, zero for O.
+        let sloppy = format!(
+            " {}-{} ",
+            right[..4].to_ascii_lowercase(),
+            right[4..].replace('O', "0")
+        );
+        assert!(approve_device(&account, request.public_key(), &sloppy, "usr_1", "dev_2").is_ok());
+    }
+
+    #[test]
+    fn fingerprint_normalisation() {
+        assert_eq!(normalize_fingerprint(" ab-cd 0f\tgh "), "ABCDOFGH");
+        assert_eq!(normalize_fingerprint("ABCDEFGH"), "ABCDEFGH");
+        assert_eq!(normalize_fingerprint(""), "");
+        // Only `0` is folded; `1` stays what it is (and never matches).
+        assert_eq!(normalize_fingerprint("1o"), "1O");
+    }
+
+    #[test]
+    fn a_low_order_public_key_is_refused() {
+        let account = new_key();
+        let zero = [0u8; APPROVAL_PUBLIC_KEY_LEN];
+        // The fingerprint of the zero key is valid; the agreement is not.
+        assert!(matches!(
+            approve_device(
+                &account,
+                &zero,
+                &approval_fingerprint(&zero),
+                "usr_1",
+                "dev_2"
+            ),
+            Err(CryptoError::KeyDerivation)
+        ));
+        let request = new_approval_request();
+        let mut blob = vec![0u8; APPROVAL_BLOB_LEN];
+        blob[APPROVAL_PUBLIC_KEY_LEN..].copy_from_slice(&[1u8; WRAPPED_KEY_LEN]);
+        assert!(matches!(
+            accept_approval(&request, &blob, "usr_1", "dev_2"),
+            Err(CryptoError::KeyDerivation)
+        ));
+    }
+
+    #[test]
+    fn fingerprints_are_deterministic_and_alphabet_bound() {
+        let public = [0x5au8; APPROVAL_PUBLIC_KEY_LEN];
+        let a = approval_fingerprint(&public);
+        assert_eq!(a, approval_fingerprint(&public));
+        assert_eq!(a.len(), APPROVAL_FINGERPRINT_LEN);
+        assert!(a.bytes().all(|c| FINGERPRINT_ALPHABET.contains(&c)));
+        assert_ne!(a, approval_fingerprint(&[0x5bu8; APPROVAL_PUBLIC_KEY_LEN]));
+        // Pinned: the first 40 bits of SHA-256("obsink:v3:approval-fingerprint" || 0x5a*32),
+        // so every client spells the same key the same way.
+        let digest = {
+            use sha2::Digest;
+            let mut h = sha2::Sha256::new();
+            h.update(b"obsink:v3:approval-fingerprint");
+            h.update(public);
+            h.finalize()
+        };
+        let mut bits = String::new();
+        for byte in &digest[..5] {
+            bits.push_str(&format!("{byte:08b}"));
+        }
+        let expected: String = (0..APPROVAL_FINGERPRINT_LEN)
+            .map(|i| {
+                let index = usize::from_str_radix(&bits[i * 5..i * 5 + 5], 2).unwrap();
+                char::from(FINGERPRINT_ALPHABET[index])
+            })
+            .collect();
+        assert_eq!(a, expected);
+        assert_eq!(FINGERPRINT_ALPHABET.len(), 32);
+        assert!(!FINGERPRINT_ALPHABET.contains(&b'0'));
+        assert!(!FINGERPRINT_ALPHABET.contains(&b'O'));
+        assert!(!FINGERPRINT_ALPHABET.contains(&b'1'));
+        assert!(!FINGERPRINT_ALPHABET.contains(&b'I'));
+    }
+
+    #[test]
+    fn an_approval_request_restores_from_its_secret_and_redacts_debug() {
+        let request = new_approval_request();
+        let restored = ApprovalRequest::from_secret(request.secret_bytes());
+        assert_eq!(restored.secret_bytes(), request.secret_bytes());
+        assert_eq!(restored.public_key(), request.public_key());
+        assert_eq!(restored.fingerprint(), request.fingerprint());
+        assert_ne!(request.public_key(), new_approval_request().public_key());
+        // Any 32 bytes are a usable secret (clamped at use), and they come
+        // back as stored, so the keychain entry is the bytes themselves.
+        let seed = [0xffu8; 32];
+        let from_seed = ApprovalRequest::from_secret(&seed);
+        assert_eq!(from_seed.secret_bytes(), &seed);
+        let account = new_key();
+        let blob = approve_device(
+            &account,
+            from_seed.public_key(),
+            &from_seed.fingerprint(),
+            "usr_1",
+            "dev_2",
+        )
+        .unwrap();
+        assert_eq!(
+            accept_approval(&from_seed, &blob, "usr_1", "dev_2").unwrap(),
+            account
+        );
+
+        let printed = format!("{request:?}");
+        assert!(printed.contains(&request.fingerprint()));
+        assert!(!printed.contains(&hex::encode(request.secret_bytes())));
+        assert!(!printed.contains(&format!(
+            "{}, {}",
+            request.secret_bytes()[0],
+            request.secret_bytes()[1]
+        )));
+    }
 
     #[test]
     fn debug_output_carries_no_key_material() {

@@ -1,10 +1,12 @@
-//! Account sign-in, the account key, and devices against an ObSink server
-//! (spec §4.1, §6.1).
+//! Account sign-in, the account key, devices and device approval against an
+//! ObSink server (spec §4.1, §6.1, §12.1).
 //!
-//! The server offers two ways to obtain a session bearer: an emailed one-time
-//! code (all platforms) and Sign in with Apple (iOS). Every sign-in names the
-//! device (spec §4.1); the resulting token is stored by the client in the OS
-//! keychain and used as [`VaultConfig::bearer`](crate::VaultConfig).
+//! An emailed one-time code is the one way to obtain a session bearer (Sign
+//! in with Apple went away in 0.5). Every sign-in names the device (spec
+//! §4.1); the resulting token is stored by the client in the OS keychain and
+//! used as [`VaultConfig::bearer`](crate::VaultConfig). A signed-in device
+//! without the account key either enters the passphrase or waits for another
+//! device to approve it ([`AuthClient::register_approval`] and friends).
 
 use std::time::Duration;
 
@@ -13,7 +15,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    crypto::{decode_base64, AccountKeyMaterial, PROTOCOL_VERSION},
+    crypto::{
+        accept_approval, account_verifier, approve_device, decode_base64, encode_base64,
+        AccountKeyMaterial, ApprovalRequest, CryptoError, KeyBytes, APPROVAL_PUBLIC_KEY_LEN,
+        PROTOCOL_VERSION,
+    },
     server_url::normalize_server_url,
 };
 
@@ -27,6 +33,21 @@ pub enum AuthError {
     /// The server speaks another wire format: the client shows `Update ObSink`.
     #[error("this ObSink is too old for the server (protocol {server}, client {client})")]
     ProtocolMismatch { server: u32, client: u32 },
+    /// The typed fingerprint is not the pending device's: nothing was sent.
+    #[error("fingerprint does not match")]
+    Fingerprint,
+    /// Key material from the wire could not be decoded or opened.
+    #[error("{0}")]
+    Crypto(CryptoError),
+}
+
+impl From<CryptoError> for AuthError {
+    fn from(error: CryptoError) -> Self {
+        match error {
+            CryptoError::FingerprintMismatch => AuthError::Fingerprint,
+            other => AuthError::Crypto(other),
+        }
+    }
 }
 
 /// What sign-in methods a server offers (`GET /`).
@@ -111,6 +132,9 @@ pub enum SetKeysOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthMethods {
     pub email: bool,
+    /// Always `false` since 0.5 (Sign in with Apple was removed); kept so
+    /// the wire shape an older server or client speaks still parses.
+    #[serde(default)]
     pub apple: bool,
 }
 
@@ -211,6 +235,50 @@ pub struct MeDevice {
     /// The vaults this device holds.
     #[serde(default)]
     pub vault_ids: Vec<String>,
+    /// A live approval request from this device (spec §12.3); absent when
+    /// none is pending or the server predates approval.
+    #[serde(default)]
+    pub approval: Option<MeApproval>,
+}
+
+/// A device's pending approval request as `GET /auth/me` lists it: the
+/// public key the approver wraps to, when it was made and runs out, and
+/// whether an approver already answered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeApproval {
+    /// Base64 of the device's X25519 public key.
+    pub public_key: String,
+    pub requested: u64,
+    pub expires: u64,
+    #[serde(default)]
+    pub approved: bool,
+}
+
+/// What `PUT /auth/approval` answered: when the request runs out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalRegistered {
+    pub requested: u64,
+    pub expires: u64,
+}
+
+/// This device's own request as `GET /auth/approval` reports it; `wrapped`
+/// and the fields after it arrive once another device approved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalStatus {
+    /// Base64 of the registered public key.
+    pub public_key: String,
+    pub requested: u64,
+    pub expires: u64,
+    /// Base64 of the [`APPROVAL_BLOB_LEN`](crate::APPROVAL_BLOB_LEN)-byte blob.
+    #[serde(default)]
+    pub wrapped: Option<String>,
+    /// The account key's id, to store next to the key.
+    #[serde(default)]
+    pub key_id: Option<String>,
+    #[serde(default)]
+    pub approved_by: Option<String>,
+    #[serde(default)]
+    pub approved: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -281,37 +349,6 @@ impl AuthClient {
         parse(
             self.client
                 .post(self.url("auth/email/verify"))
-                .json(&body)
-                .send()
-                .await?,
-        )
-        .await
-    }
-
-    /// Exchange an Apple identity token (JWT from `ASAuthorizationAppleIDCredential`)
-    /// for a session. `email` is the credential's email, which Apple delivers
-    /// only on the first authorization; when the token itself carries no
-    /// email claim the server only honours the hint together with `code`, a
-    /// one-time code from `email_start` for that address (otherwise it answers
-    /// 403 `email verification required`).
-    pub async fn apple_sign_in(
-        &self,
-        identity_token: &str,
-        device: &Device,
-        email: Option<&str>,
-        code: Option<&str>,
-        invite_code: Option<&str>,
-    ) -> Result<Session, AuthError> {
-        let body = serde_json::json!({
-            "identity_token": identity_token,
-            "device": device,
-            "email": email,
-            "code": code,
-            "invite_code": invite_code,
-        });
-        parse(
-            self.client
-                .post(self.url("auth/apple"))
                 .json(&body)
                 .send()
                 .await?,
@@ -495,6 +532,127 @@ impl AuthClient {
         )
         .await?;
         Ok(body.invites)
+    }
+
+    /// Register this device's approval public key (`PUT /auth/approval`,
+    /// spec §12.1). Re-registering replaces a live request. The server
+    /// answers 400 while the account has no passphrase yet.
+    pub async fn register_approval(
+        &self,
+        token: &str,
+        public_key: &[u8; APPROVAL_PUBLIC_KEY_LEN],
+    ) -> Result<ApprovalRegistered, AuthError> {
+        parse(
+            self.client
+                .put(self.url("auth/approval"))
+                .bearer_auth(token)
+                .json(&serde_json::json!({ "public_key": encode_base64(public_key) }))
+                .send()
+                .await?,
+        )
+        .await
+    }
+
+    /// This device's live request, or `None` when there is none (never
+    /// registered, expired, or cleared).
+    pub async fn approval_status(&self, token: &str) -> Result<Option<ApprovalStatus>, AuthError> {
+        #[derive(Deserialize)]
+        struct Body {
+            approval: Option<ApprovalStatus>,
+        }
+        let body: Body = parse(
+            self.client
+                .get(self.url("auth/approval"))
+                .bearer_auth(token)
+                .send()
+                .await?,
+        )
+        .await?;
+        Ok(body.approval)
+    }
+
+    /// Drop this device's request (after the key was taken, or on `Use
+    /// passphrase instead`). Idempotent.
+    pub async fn clear_approval(&self, token: &str) -> Result<(), AuthError> {
+        expect_empty(
+            self.client
+                .delete(self.url("auth/approval"))
+                .bearer_auth(token)
+                .send()
+                .await?,
+        )
+        .await
+    }
+
+    /// Relay an approval blob to a pending device
+    /// (`POST /auth/devices/{device_id}/approval`). `verifier` is the account
+    /// verifier, which only a holder of the account key can compute.
+    pub async fn approve_device(
+        &self,
+        token: &str,
+        device_id: &str,
+        wrapped: &[u8],
+        verifier: &[u8; 32],
+    ) -> Result<(), AuthError> {
+        expect_empty(
+            self.client
+                .post(self.url(&format!("auth/devices/{device_id}/approval")))
+                .bearer_auth(token)
+                .json(&serde_json::json!({
+                    "wrapped": encode_base64(wrapped),
+                    "verifier": encode_base64(verifier),
+                }))
+                .send()
+                .await?,
+        )
+        .await
+    }
+
+    /// The approver's whole step (spec §12.3): check the typed fingerprint
+    /// against the relayed public key, wrap the account key to it, and post
+    /// the blob with the verifier. A wrong fingerprint is
+    /// [`AuthError::Fingerprint`] and nothing is sent.
+    pub async fn approve_with_key(
+        &self,
+        token: &str,
+        account: &KeyBytes,
+        user_id: &str,
+        device_id: &str,
+        public_key_b64: &str,
+        typed: &str,
+    ) -> Result<(), AuthError> {
+        let public_key = decode_base64(public_key_b64)?;
+        let wrapped = approve_device(account, &public_key, typed, user_id, device_id)?;
+        let verifier = account_verifier(account, user_id);
+        self.approve_device(token, device_id, &wrapped, &verifier)
+            .await
+    }
+
+    /// One poll of the pending device (spec §12.1 step 3-4): `None` while no
+    /// request is live or nobody has approved yet; otherwise the account key
+    /// and its `key_id`, with the request cleared on the server. A blob the
+    /// request cannot open is an error, not a retry.
+    pub async fn take_approved_key(
+        &self,
+        token: &str,
+        request: &ApprovalRequest,
+        user_id: &str,
+        device_id: &str,
+    ) -> Result<Option<(KeyBytes, String)>, AuthError> {
+        let Some(status) = self.approval_status(token).await? else {
+            return Ok(None);
+        };
+        let Some(wrapped) = status.wrapped else {
+            return Ok(None);
+        };
+        let key_id = status.key_id.ok_or_else(|| AuthError::Server {
+            status: StatusCode::OK,
+            message: "the approval carries no key id".to_string(),
+        })?;
+        let blob = decode_base64(&wrapped)?;
+        let key = accept_approval(request, &blob, user_id, device_id)?;
+        self.clear_approval(token).await?;
+        Ok(Some((key, key_id)))
     }
 }
 
@@ -819,5 +977,236 @@ mod tests {
         client.revoke_device("os_abc", "dev-2").await.unwrap();
         rename.assert_async().await;
         revoke.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn approval_register_status_clear_and_approve() {
+        let server = MockServer::start_async().await;
+        let request = crate::new_approval_request();
+        let public_b64 = crate::encode_base64(request.public_key());
+        let register = server
+            .mock_async(|when, then| {
+                when.method(PUT)
+                    .path("/auth/approval")
+                    .header("authorization", "Bearer os_abc")
+                    .json_body(serde_json::json!({ "public_key": public_b64 }));
+                then.status(201)
+                    .json_body(serde_json::json!({ "requested": 10, "expires": 610 }));
+            })
+            .await;
+        let status = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/auth/approval")
+                    .header("authorization", "Bearer os_abc");
+                then.status(200).json_body(serde_json::json!({ "approval": {
+                    "public_key": public_b64, "requested": 10, "expires": 610, "wrapped": null
+                }}));
+            })
+            .await;
+        let clear = server
+            .mock_async(|when, then| {
+                when.method(DELETE)
+                    .path("/auth/approval")
+                    .header("authorization", "Bearer os_abc");
+                then.status(204);
+            })
+            .await;
+        let approve = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/auth/devices/dev-2/approval")
+                    .header("authorization", "Bearer os_abc")
+                    .json_body(serde_json::json!({
+                        "wrapped": crate::encode_base64(&[7u8; 92]),
+                        "verifier": crate::encode_base64(&[8u8; 32]),
+                    }));
+                then.status(204);
+            })
+            .await;
+        let me = server
+            .mock_async(|when, then| {
+                when.method(GET).path("/auth/me");
+                then.status(200).json_body(serde_json::json!({
+                    "user": { "id": "usr_1", "email": "a@b.co", "created": 1 },
+                    "devices": [
+                        { "id": "dev-1", "name": "mac", "platform": "macos", "created": 1,
+                          "last_seen": 2, "current": true },
+                        { "id": "dev-2", "name": "phone", "platform": "ios", "created": 3,
+                          "last_seen": 3, "current": false,
+                          "approval": { "public_key": public_b64, "requested": 10, "expires": 610 } }
+                    ]
+                }));
+            })
+            .await;
+
+        let client = AuthClient::new(&server.base_url());
+        assert_eq!(
+            client
+                .register_approval("os_abc", request.public_key())
+                .await
+                .unwrap(),
+            super::ApprovalRegistered {
+                requested: 10,
+                expires: 610
+            }
+        );
+        let pending = client.approval_status("os_abc").await.unwrap().unwrap();
+        assert_eq!(pending.public_key, public_b64);
+        assert_eq!(pending.expires, 610);
+        assert!(pending.wrapped.is_none() && pending.key_id.is_none());
+        client.clear_approval("os_abc").await.unwrap();
+        client
+            .approve_device("os_abc", "dev-2", &[7u8; 92], &[8u8; 32])
+            .await
+            .unwrap();
+        let devices = client.me("os_abc").await.unwrap().devices;
+        assert!(devices[0].approval.is_none());
+        let approval = devices[1].approval.as_ref().unwrap();
+        assert_eq!(approval.public_key, public_b64);
+        assert!(!approval.approved);
+
+        register.assert_async().await;
+        status.assert_async().await;
+        clear.assert_async().await;
+        approve.assert_async().await;
+        me.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn approve_with_key_refuses_a_wrong_fingerprint_before_any_request() {
+        let server = MockServer::start_async().await;
+        let post = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/auth/devices/dev-2/approval");
+                then.status(204);
+            })
+            .await;
+        let account = crate::new_key();
+        let request = crate::new_approval_request();
+        let public_b64 = crate::encode_base64(request.public_key());
+        let client = AuthClient::new(&server.base_url());
+        let error = client
+            .approve_with_key(
+                "os_abc",
+                &account,
+                "usr_1",
+                "dev-2",
+                &public_b64,
+                "AAAAAAAA",
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AuthError::Fingerprint), "{error:?}");
+        assert_eq!(error.to_string(), "fingerprint does not match");
+        assert!(matches!(
+            client
+                .approve_with_key("os_abc", &account, "usr_1", "dev-2", "!!", "AAAAAAAA")
+                .await
+                .unwrap_err(),
+            AuthError::Crypto(crate::CryptoError::InvalidBlob)
+        ));
+        assert_eq!(post.hits_async().await, 0);
+
+        // The right one (typed loosely) posts a blob the request can open.
+        let typed = request.fingerprint().to_ascii_lowercase();
+        client
+            .approve_with_key("os_abc", &account, "usr_1", "dev-2", &public_b64, &typed)
+            .await
+            .unwrap();
+        assert_eq!(post.hits_async().await, 1);
+    }
+
+    #[tokio::test]
+    async fn take_approved_key_waits_then_unwraps_and_clears() {
+        let server = MockServer::start_async().await;
+        let account = crate::new_key();
+        let request = crate::new_approval_request();
+        let public_b64 = crate::encode_base64(request.public_key());
+        let client = AuthClient::new(&server.base_url());
+
+        let none = server
+            .mock_async(|when, then| {
+                when.method(GET).path("/auth/approval");
+                then.status(200)
+                    .json_body(serde_json::json!({ "approval": null }));
+            })
+            .await;
+        assert!(client
+            .take_approved_key("os_abc", &request, "usr_1", "dev-2")
+            .await
+            .unwrap()
+            .is_none());
+        none.delete_async().await;
+
+        let pending = server
+            .mock_async(|when, then| {
+                when.method(GET).path("/auth/approval");
+                then.status(200).json_body(serde_json::json!({ "approval": {
+                    "public_key": public_b64, "requested": 10, "expires": 610
+                }}));
+            })
+            .await;
+        assert!(client
+            .take_approved_key("os_abc", &request, "usr_1", "dev-2")
+            .await
+            .unwrap()
+            .is_none());
+        pending.delete_async().await;
+
+        let blob = crate::approve_device(
+            &account,
+            request.public_key(),
+            &request.fingerprint(),
+            "usr_1",
+            "dev-2",
+        )
+        .unwrap();
+        let approved = server
+            .mock_async(|when, then| {
+                when.method(GET).path("/auth/approval");
+                then.status(200).json_body(serde_json::json!({ "approval": {
+                    "public_key": public_b64, "requested": 10, "expires": 900,
+                    "wrapped": crate::encode_base64(&blob), "key_id": "key_1",
+                    "approved_by": "dev-1", "approved": 300
+                }}));
+            })
+            .await;
+        let clear = server
+            .mock_async(|when, then| {
+                when.method(DELETE).path("/auth/approval");
+                then.status(204);
+            })
+            .await;
+        let (key, key_id) = client
+            .take_approved_key("os_abc", &request, "usr_1", "dev-2")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(key, account);
+        assert_eq!(key_id, "key_1");
+        clear.assert_async().await;
+        approved.delete_async().await;
+
+        // A blob for another device (or a tampered one) is an error, and the
+        // request is left in place.
+        let foreign = server
+            .mock_async(|when, then| {
+                when.method(GET).path("/auth/approval");
+                then.status(200).json_body(serde_json::json!({ "approval": {
+                    "public_key": public_b64, "requested": 10, "expires": 900,
+                    "wrapped": crate::encode_base64(&blob), "key_id": "key_1"
+                }}));
+            })
+            .await;
+        assert!(matches!(
+            client
+                .take_approved_key("os_abc", &request, "usr_1", "dev-3")
+                .await
+                .unwrap_err(),
+            AuthError::Crypto(crate::CryptoError::Decrypt)
+        ));
+        assert_eq!(clear.hits_async().await, 1);
+        foreign.assert_async().await;
     }
 }

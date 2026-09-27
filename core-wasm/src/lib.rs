@@ -13,13 +13,14 @@
 use std::{collections::BTreeSet, time::Duration};
 
 use obsink_core::{
-    backoff_wait, checkpoint_manifest, chunk_uploads, conflict_copy_path, conflict_to_upload,
-    content_hmac, create_account_key, decode_base64, decrypt, decrypt_path, derive_key,
-    derive_keys, diff_manifests, effective_choice, encode_base64, encrypt, encrypt_path,
-    hash_cache_key_id, new_key, normalize_server_url, path_token, rewrap_account_key,
+    accept_approval, account_verifier, approval_fingerprint, approve_device, backoff_wait,
+    checkpoint_manifest, chunk_uploads, conflict_copy_path, conflict_to_upload, content_hmac,
+    create_account_key, decode_base64, decrypt, decrypt_path, derive_key, derive_keys,
+    diff_manifests, effective_choice, encode_base64, encrypt, encrypt_path, hash_cache_key_id,
+    new_approval_request, new_key, normalize_server_url, path_token, rewrap_account_key,
     unlock_account_key, unwrap_vault_key, wrap_vault_key, AccountKeyMaterial, Conflict,
     ConflictResolutionChoice, CryptoKeys, IgnoreRules, KeyBytes, Manifest, PollPacing,
-    DEFAULT_IGNORE, PROTOCOL_VERSION,
+    APPROVAL_PUBLIC_KEY_LEN, DEFAULT_IGNORE, PROTOCOL_VERSION,
 };
 use wasm_bindgen::prelude::*;
 use zeroize::Zeroize;
@@ -206,7 +207,27 @@ impl AccountKey {
 
     /// The base64 verifier for this account (what a rewrap must present).
     pub fn verifier(&self) -> String {
-        encode_base64(&obsink_core::account_verifier(&self.key, &self.user_id))
+        encode_base64(&account_verifier(&self.key, &self.user_id))
+    }
+
+    /// Approve a pending device (spec §12.3): only when `typed` is the
+    /// fingerprint of `public_key_b64` (the key `GET /auth/me` relayed), wrap
+    /// this account key to it. Returns the JSON body of
+    /// `POST /auth/devices/{device_id}/approval`: `{ wrapped, verifier }`
+    /// (base64). A wrong fingerprint is an error and nothing is wrapped.
+    #[wasm_bindgen(js_name = approveDevice)]
+    pub fn approve_device(
+        &self,
+        device_id: &str,
+        public_key_b64: &str,
+        typed: &str,
+    ) -> Result<String, JsError> {
+        let public_key = decode_base64(public_key_b64)?;
+        let wrapped = approve_device(&self.key, &public_key, typed, &self.user_id, device_id)?;
+        Ok(serde_json::to_string(&serde_json::json!({
+            "wrapped": encode_base64(&wrapped),
+            "verifier": self.verifier(),
+        }))?)
     }
 
     /// Wrap a vault key for this account: the `wrapped_key` of `POST /vaults`.
@@ -232,6 +253,71 @@ impl AccountKey {
     pub fn user_id(&self) -> String {
         self.user_id.clone()
     }
+}
+
+/// A pending device's approval keypair (spec §12.1). The worker keeps the
+/// handle (or its `secret()` bytes) while it polls; `free()` wipes the secret.
+#[wasm_bindgen]
+pub struct ApprovalRequest {
+    request: obsink_core::ApprovalRequest,
+}
+
+#[wasm_bindgen]
+impl ApprovalRequest {
+    /// A fresh keypair for `PUT /auth/approval`.
+    pub fn create() -> ApprovalRequest {
+        ApprovalRequest {
+            request: new_approval_request(),
+        }
+    }
+
+    /// Rebuild the handle from `secret()` bytes kept elsewhere.
+    #[wasm_bindgen(js_name = fromSecret)]
+    pub fn from_secret(secret: &[u8]) -> Result<ApprovalRequest, JsError> {
+        Ok(ApprovalRequest {
+            request: obsink_core::ApprovalRequest::from_secret(&key_bytes(secret)?),
+        })
+    }
+
+    /// The secret scalar, for the worker to keep alongside the handle.
+    pub fn secret(&self) -> Vec<u8> {
+        self.request.secret_bytes().to_vec()
+    }
+
+    /// Base64 of the public key `PUT /auth/approval` registers.
+    #[wasm_bindgen(js_name = publicKey)]
+    pub fn public_key(&self) -> String {
+        encode_base64(self.request.public_key())
+    }
+
+    /// The 8 symbols this device shows and the approver types.
+    pub fn fingerprint(&self) -> String {
+        self.request.fingerprint()
+    }
+
+    /// Open the blob `GET /auth/approval` returned once another device
+    /// approved: the raw account key, for [`AccountKey::from_bytes`]. A blob
+    /// made for another request, user or device is an error.
+    pub fn accept(
+        &self,
+        wrapped_b64: &str,
+        user_id: &str,
+        device_id: &str,
+    ) -> Result<Vec<u8>, JsError> {
+        let blob = decode_base64(wrapped_b64)?;
+        Ok(accept_approval(&self.request, &blob, user_id, device_id)?.to_vec())
+    }
+}
+
+/// The fingerprint of a base64 public key, as the pending device shows it.
+#[wasm_bindgen(js_name = approvalFingerprint)]
+pub fn approval_fingerprint_js(public_key_b64: &str) -> Result<String, JsError> {
+    let public_key = decode_base64(public_key_b64)?;
+    let public_key: [u8; APPROVAL_PUBLIC_KEY_LEN] = public_key
+        .as_slice()
+        .try_into()
+        .map_err(|_| JsError::new("public key must be 32 bytes"))?;
+    Ok(approval_fingerprint(&public_key))
 }
 
 /// `diff_manifests(base, local, remote)` over JSON manifests (keyed by real
@@ -428,6 +514,34 @@ mod tests {
             serde_json::from_str(&rewrapping.rewrap("another passphrase").unwrap()).unwrap();
         assert_eq!(rewrapped["verifier"], material["verifier"]);
         assert_ne!(rewrapped["salt"], material["salt"]);
+    }
+
+    #[test]
+    fn device_approval_round_trips_through_json() {
+        let account = AccountKey::create("correct horse battery", "usr_1").unwrap();
+        let request = ApprovalRequest::create();
+        let restored = ApprovalRequest::from_secret(&request.secret()).unwrap();
+        assert_eq!(restored.public_key(), request.public_key());
+        assert_eq!(restored.fingerprint(), request.fingerprint());
+        assert_eq!(request.fingerprint().len(), 8);
+        assert_eq!(
+            approval_fingerprint_js(&request.public_key()).unwrap(),
+            request.fingerprint()
+        );
+
+        let body: serde_json::Value = serde_json::from_str(
+            &account
+                .approve_device("dev_2", &request.public_key(), &request.fingerprint())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["verifier"].as_str().unwrap(), account.verifier());
+        let wrapped = body["wrapped"].as_str().unwrap();
+        assert_eq!(
+            restored.accept(wrapped, "usr_1", "dev_2").unwrap(),
+            account.bytes()
+        );
+        // (A wrong fingerprint, user or device is a JsError, covered in tests/node.rs.)
     }
 
     #[test]

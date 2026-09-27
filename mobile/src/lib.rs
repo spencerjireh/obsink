@@ -19,11 +19,12 @@ use std::{
 
 use obsink_core::{
     complete_sync, create_account_key, decode_base64, decrypt, derive_keys, diff_local_and_remote,
-    encode_base64, fetch_remote_manifest, load_local_state, new_key, new_vault_id,
-    normalize_server_url, prepare_sync, rewrap_account_key, ApiClient, ApiError, AuthClient,
-    AuthError, ConflictResolution, ConflictResolutionChoice, CreateVaultRequest, CryptoError,
-    Device, DevicePlatform, KeyBytes, ProgressEvent, ProgressSink, SetKeysOutcome, SyncActionKind,
-    SyncEngineError, SyncFailure, SyncPhase, SyncPlan, VaultConfig, VaultSummary, PROTOCOL_VERSION,
+    encode_base64, fetch_remote_manifest, load_local_state, new_approval_request, new_key,
+    new_vault_id, normalize_server_url, prepare_sync, rewrap_account_key, ApiClient, ApiError,
+    ApprovalRequest, AuthClient, AuthError, ConflictResolution, ConflictResolutionChoice,
+    CreateVaultRequest, CryptoError, Device, DevicePlatform, KeyBytes, ProgressEvent, ProgressSink,
+    SetKeysOutcome, SyncActionKind, SyncEngineError, SyncFailure, SyncPhase, SyncPlan, VaultConfig,
+    VaultSummary, APPROVAL_PUBLIC_KEY_LEN, PROTOCOL_VERSION,
 };
 
 /// Spec §6.1: the wrapped account key is the new exposure, so the passphrase
@@ -34,8 +35,8 @@ uniffi::setup_scaffolding!();
 
 /// Errors crossing the FFI. The host decides what to show from the variant,
 /// not from the text: `Unauthorized` opens sign-in, `Network` is retryable,
-/// `Server` carries the status for the two 403s that need a follow-up (invite
-/// code, Apple email verification).
+/// `Server` carries the status for the 403 that needs a follow-up (an invite
+/// code) and the 404/409 an approval can answer.
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum MobileError {
     /// Local failure (crypto, io, json) or a message with no better home.
@@ -96,8 +97,13 @@ fn from_auth(error: AuthError, kind: CallKind) -> MobileError {
         AuthError::ProtocolMismatch { server, client } => {
             MobileError::ProtocolMismatch { server, client }
         }
+        AuthError::Fingerprint => MobileError::sync(FINGERPRINT_MISMATCH),
+        AuthError::Crypto(error) => MobileError::sync(error),
     }
 }
+
+/// DESIGN.md §5: what the approving device shows on a wrong fingerprint.
+const FINGERPRINT_MISMATCH: &str = "Fingerprint does not match.";
 
 /// Every `ApiClient` call carries the bearer.
 fn from_api(error: ApiError) -> MobileError {
@@ -601,7 +607,6 @@ pub fn canonical_server_url(url: String) -> String {
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct MobileCapabilities {
     pub email: bool,
-    pub apple: bool,
     /// New accounts need an invite code once the server has any user.
     pub invite_required: bool,
     pub protocol: u32,
@@ -757,6 +762,22 @@ pub struct MobileDevice {
     pub last_seen: u64,
     pub current: bool,
     pub vault_ids: Vec<String>,
+    /// Set while the device waits for approval (spec §12.3).
+    pub approval: Option<MobileDeviceApproval>,
+}
+
+/// A device's live approval request, as listed for an approver. The host
+/// passes `public_key` back to [`auth_approve_device`] with what the user
+/// typed; it never shows or computes a fingerprint from it.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MobileDeviceApproval {
+    /// Base64 of the device's X25519 public key.
+    pub public_key: String,
+    pub requested: u64,
+    pub expires: u64,
+    /// Another device already answered; the pending one has not picked the
+    /// key up yet.
+    pub approved: bool,
 }
 
 #[uniffi::export]
@@ -765,7 +786,6 @@ pub fn auth_capabilities(server_url: String) -> Result<MobileCapabilities, Mobil
         .map_err(|error| from_auth(error, CallKind::SignIn))?;
     Ok(MobileCapabilities {
         email: caps.auth.email,
-        apple: caps.auth.apple,
         invite_required: caps.invite_required,
         protocol: caps.protocol,
     })
@@ -804,34 +824,6 @@ fn clean_invite(code: Option<&str>) -> Option<&str> {
     code.map(str::trim).filter(|code| !code.is_empty())
 }
 
-/// Exchange an Apple identity token (from `ASAuthorizationAppleIDCredential`)
-/// for a session. Pass the credential's email when Apple supplies it (first
-/// authorization only).
-#[uniffi::export]
-pub fn auth_apple(
-    server_url: String,
-    identity_token: String,
-    device: MobileDeviceIdentity,
-    email: Option<String>,
-    code: Option<String>,
-    invite_code: Option<String>,
-) -> Result<MobileSession, MobileError> {
-    let device = device.core();
-    let session = block_on(
-        AuthClient::new(&server_url).apple_sign_in(
-            &identity_token,
-            &device,
-            email.as_deref(),
-            code.as_deref()
-                .map(str::trim)
-                .filter(|code| !code.is_empty()),
-            clean_invite(invite_code.as_deref()),
-        ),
-    )
-    .map_err(|error| from_auth(error, CallKind::SignIn))?;
-    Ok(to_mobile_session(session))
-}
-
 #[uniffi::export]
 pub fn auth_me(server_url: String, token: String) -> Result<MobileAccount, MobileError> {
     let me = block_on(AuthClient::new(&server_url).me(&token))
@@ -853,6 +845,12 @@ pub fn auth_me(server_url: String, token: String) -> Result<MobileAccount, Mobil
                 last_seen: device.last_seen,
                 current: device.current,
                 vault_ids: device.vault_ids,
+                approval: device.approval.map(|approval| MobileDeviceApproval {
+                    public_key: approval.public_key,
+                    requested: approval.requested,
+                    expires: approval.expires,
+                    approved: approval.approved,
+                }),
             })
             .collect(),
         usage: me.usage.map(|usage| MobileUsage {
@@ -943,6 +941,175 @@ pub fn auth_unlock(
         key: key.to_vec(),
         key_id: blob.key_id,
     })
+}
+
+// --- Device approval (spec §12.1, §12.3) ---------------------------------------
+
+/// This phone's approval keypair while it waits for another device. The
+/// host keeps `secret` in the Keychain (`approval:<user id>`) so a relaunch
+/// resumes the same request, shows `fingerprint`, and registers
+/// `public_key`. `Debug` redacts the secret.
+#[derive(Clone, uniffi::Record)]
+pub struct MobileApprovalRequest {
+    pub secret: Vec<u8>,
+    /// Base64 of the X25519 public key.
+    pub public_key: String,
+    /// The 8 symbols the approver types.
+    pub fingerprint: String,
+}
+
+impl std::fmt::Debug for MobileApprovalRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MobileApprovalRequest")
+            .field("secret", &"..")
+            .field("public_key", &self.public_key)
+            .field("fingerprint", &self.fingerprint)
+            .finish()
+    }
+}
+
+impl From<ApprovalRequest> for MobileApprovalRequest {
+    fn from(request: ApprovalRequest) -> Self {
+        MobileApprovalRequest {
+            secret: request.secret_bytes().to_vec(),
+            public_key: encode_base64(request.public_key()),
+            fingerprint: request.fingerprint(),
+        }
+    }
+}
+
+/// One poll of `GET /auth/approval` from the waiting device.
+#[derive(Clone, uniffi::Enum)]
+pub enum MobileApprovalPoll {
+    /// No live request: it expired or was cleared; register again and show
+    /// the new fingerprint.
+    None,
+    /// Registered, nobody has approved yet.
+    Pending { expires: u64 },
+    /// Approved and picked up: the account key to store with `key_id`; the
+    /// request is cleared on the server.
+    Unlocked { key: Vec<u8>, key_id: String },
+}
+
+impl std::fmt::Debug for MobileApprovalPoll {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MobileApprovalPoll::None => f.write_str("None"),
+            MobileApprovalPoll::Pending { expires } => {
+                f.debug_struct("Pending").field("expires", expires).finish()
+            }
+            MobileApprovalPoll::Unlocked { key_id, .. } => f
+                .debug_struct("Unlocked")
+                .field("key", &"..")
+                .field("key_id", key_id)
+                .finish(),
+        }
+    }
+}
+
+/// A fresh approval keypair.
+#[uniffi::export]
+pub fn approval_new_request() -> MobileApprovalRequest {
+    new_approval_request().into()
+}
+
+/// The request behind a stored secret (after a relaunch).
+#[uniffi::export]
+pub fn approval_restore_request(secret: Vec<u8>) -> Result<MobileApprovalRequest, MobileError> {
+    Ok(ApprovalRequest::from_secret(&key_bytes(secret)?).into())
+}
+
+fn approval_public_key(public_key: Vec<u8>) -> Result<[u8; APPROVAL_PUBLIC_KEY_LEN], MobileError> {
+    public_key
+        .as_slice()
+        .try_into()
+        .map_err(|_| MobileError::InvalidKey {
+            length: public_key.len() as u64,
+        })
+}
+
+/// `PUT /auth/approval` with the request's public key (base64 as
+/// `MobileApprovalRequest::public_key` carries it). Returns when the request
+/// expires. The server answers 400 while the account has no passphrase.
+#[uniffi::export]
+pub fn auth_register_approval(
+    server_url: String,
+    token: String,
+    public_key: String,
+) -> Result<u64, MobileError> {
+    let public_key = approval_public_key(decode_base64(&public_key)?)?;
+    let registered = block_on(AuthClient::new(&server_url).register_approval(&token, &public_key))
+        .map_err(|error| from_auth(error, CallKind::Bearer))?;
+    Ok(registered.expires)
+}
+
+/// One poll from the waiting device: once a blob is there it is opened with
+/// `secret`, the request is cleared, and the key comes back as `Unlocked`.
+#[uniffi::export]
+pub fn auth_poll_approval(
+    server_url: String,
+    token: String,
+    secret: Vec<u8>,
+    user_id: String,
+    device_id: String,
+) -> Result<MobileApprovalPoll, MobileError> {
+    let request = ApprovalRequest::from_secret(&key_bytes(secret)?);
+    let auth = AuthClient::new(&server_url);
+    let Some(status) = block_on(auth.approval_status(&token))
+        .map_err(|error| from_auth(error, CallKind::Bearer))?
+    else {
+        return Ok(MobileApprovalPoll::None);
+    };
+    if status.wrapped.is_none() {
+        return Ok(MobileApprovalPoll::Pending {
+            expires: status.expires,
+        });
+    }
+    match block_on(auth.take_approved_key(&token, &request, &user_id, &device_id))
+        .map_err(|error| from_auth(error, CallKind::Bearer))?
+    {
+        Some((key, key_id)) => Ok(MobileApprovalPoll::Unlocked {
+            key: key.to_vec(),
+            key_id,
+        }),
+        // Cleared between the two calls.
+        None => Ok(MobileApprovalPoll::None),
+    }
+}
+
+/// `DELETE /auth/approval`: the user chose the passphrase instead, or signed
+/// out. Idempotent.
+#[uniffi::export]
+pub fn auth_cancel_approval(server_url: String, token: String) -> Result<(), MobileError> {
+    block_on(AuthClient::new(&server_url).clear_approval(&token))
+        .map_err(|error| from_auth(error, CallKind::Bearer))
+}
+
+/// The approver's step (spec §12.3) from an unlocked phone: `public_key` is
+/// the pending device's (`MobileDeviceApproval::public_key`),
+/// `typed_fingerprint` what the user entered. A mismatch is
+/// `MobileError::Sync { "Fingerprint does not match." }` and nothing is sent;
+/// a 404 means the request expired, a 409 that another device was first.
+#[uniffi::export]
+pub fn auth_approve_device(
+    server_url: String,
+    token: String,
+    user_id: String,
+    account_key: Vec<u8>,
+    device_id: String,
+    public_key: String,
+    typed_fingerprint: String,
+) -> Result<(), MobileError> {
+    let account_key = key_bytes(account_key)?;
+    block_on(AuthClient::new(&server_url).approve_with_key(
+        &token,
+        &account_key,
+        &user_id,
+        &device_id,
+        &public_key,
+        &typed_fingerprint,
+    ))
+    .map_err(|error| from_auth(error, CallKind::Bearer))
 }
 
 /// DESIGN.md §5 `Change passphrase`: the current passphrase must open the
@@ -1448,6 +1615,55 @@ mod tests {
         ));
         assert_eq!(mobile_protocol_version(), 3);
         assert!(new_device_id().starts_with("dev_"));
+    }
+
+    #[test]
+    fn approval_requests_restore_and_redact_and_a_mismatch_has_its_copy() {
+        let request = approval_new_request();
+        assert_eq!(request.secret.len(), 32);
+        assert_eq!(request.fingerprint.len(), 8);
+        let restored = approval_restore_request(request.secret.clone()).unwrap();
+        assert_eq!(restored.public_key, request.public_key);
+        assert_eq!(restored.fingerprint, request.fingerprint);
+        assert!(matches!(
+            approval_restore_request(vec![1, 2, 3]),
+            Err(MobileError::InvalidKey { length: 3 })
+        ));
+        let printed = format!("{request:?}");
+        assert!(printed.contains(&request.fingerprint));
+        assert!(!printed.contains(&format!("{}, {}", request.secret[0], request.secret[1])));
+        let printed = format!(
+            "{:?}",
+            MobileApprovalPoll::Unlocked {
+                key: vec![250, 251, 252],
+                key_id: "key_1".into()
+            }
+        );
+        assert!(printed.contains("key_1") && !printed.contains("250"));
+
+        assert!(matches!(
+            from_auth(AuthError::Fingerprint, CallKind::Bearer),
+            MobileError::Sync { message } if message == "Fingerprint does not match."
+        ));
+        assert!(matches!(
+            from_auth(AuthError::Crypto(CryptoError::Decrypt), CallKind::Bearer),
+            MobileError::Sync { .. }
+        ));
+        // A wrong fingerprint never reaches the network: the closed port
+        // would otherwise answer `Network`.
+        let account = new_vault_key();
+        assert!(matches!(
+            auth_approve_device(
+                "http://127.0.0.1:9".into(),
+                "os_abc".into(),
+                "usr_1".into(),
+                account,
+                "dev_2".into(),
+                request.public_key.clone(),
+                "AAAAAAAA".into(),
+            ),
+            Err(MobileError::Sync { message }) if message == "Fingerprint does not match."
+        ));
     }
 
     #[test]
