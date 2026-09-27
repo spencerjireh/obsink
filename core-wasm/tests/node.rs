@@ -4,10 +4,11 @@
 #![cfg(target_arch = "wasm32")]
 
 use obsink_core_wasm::{
-    backoff_wait_ms, checkpoint_manifest_json, chunk_uploads_json, conflict_copy_path_js,
-    conflict_to_upload_json, default_ignore, diff_manifests_json as diff_manifests,
-    effective_choice_json, new_vault_key, normalize_server_url_js, poll_interval_ms,
-    protocol_version, AccountKey, Ignore, VaultKeys,
+    approval_fingerprint_js, backoff_wait_ms, checkpoint_manifest_json, chunk_uploads_json,
+    conflict_copy_path_js, conflict_to_upload_json, default_ignore,
+    diff_manifests_json as diff_manifests, effective_choice_json, new_vault_key,
+    normalize_server_url_js, poll_interval_ms, protocol_version, AccountKey, ApprovalRequest,
+    Ignore, VaultKeys,
 };
 use wasm_bindgen_test::wasm_bindgen_test;
 
@@ -51,6 +52,52 @@ fn account_keys_unlock_and_wrap_vault_keys() {
     let note = keys.encrypt(b"note").unwrap();
     assert_eq!(keys.decrypt(&note).unwrap(), b"note");
     assert!(unlocked.material().is_err());
+}
+
+#[wasm_bindgen_test]
+fn device_approval_wraps_the_account_key_to_a_pending_device() {
+    let account = AccountKey::create("correct horse battery", "usr_1").unwrap();
+    let request = ApprovalRequest::create();
+    let fingerprint = request.fingerprint();
+    assert_eq!(fingerprint.len(), 8);
+    assert_eq!(
+        approval_fingerprint_js(&request.public_key()).unwrap(),
+        fingerprint
+    );
+    assert!(approval_fingerprint_js("!!").is_err());
+    assert!(ApprovalRequest::from_secret(&[0u8; 31]).is_err());
+
+    // A wrong fingerprint wraps nothing; a sloppy right one is accepted.
+    assert!(account
+        .approve_device("dev_2", &request.public_key(), "AAAAAAAA")
+        .is_err());
+    let sloppy = format!("{}-{}", &fingerprint[..4].to_lowercase(), &fingerprint[4..]);
+    let body: serde_json::Value = serde_json::from_str(
+        &account
+            .approve_device("dev_2", &request.public_key(), &sloppy)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["verifier"].as_str().unwrap(), account.verifier());
+    let wrapped = body["wrapped"].as_str().unwrap();
+
+    let restored = ApprovalRequest::from_secret(&request.secret()).unwrap();
+    assert_eq!(
+        restored.accept(wrapped, "usr_1", "dev_2").unwrap(),
+        account.bytes()
+    );
+    assert!(restored.accept(wrapped, "usr_2", "dev_2").is_err());
+    assert!(restored.accept(wrapped, "usr_1", "dev_3").is_err());
+    assert!(restored.accept("!!", "usr_1", "dev_2").is_err());
+    assert!(ApprovalRequest::create()
+        .accept(wrapped, "usr_1", "dev_2")
+        .is_err());
+    let unlocked = AccountKey::from_bytes(
+        &restored.accept(wrapped, "usr_1", "dev_2").unwrap(),
+        "usr_1",
+    )
+    .unwrap();
+    assert_eq!(unlocked.verifier(), account.verifier());
 }
 
 #[wasm_bindgen_test]

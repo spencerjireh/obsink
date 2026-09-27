@@ -1985,7 +1985,9 @@ impl From<AuthError> for CommandError {
             AuthError::Server { status, message } => Self::from_status(status.as_u16(), message),
             // The windows show `Update ObSink` from `get_protocol`; a call
             // that still gets here reports the same sentence.
-            error @ AuthError::ProtocolMismatch { .. } => Self::other(error.to_string()),
+            error @ (AuthError::ProtocolMismatch { .. }
+            | AuthError::Fingerprint
+            | AuthError::Crypto(_)) => Self::other(error.to_string()),
         }
     }
 }

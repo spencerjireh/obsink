@@ -19,6 +19,12 @@ thiserror = "1"
 tracing = "0.1"
 # Wipes the derived sub-keys on drop; already in the dependency tree via aes-gcm.
 zeroize = "1"
+# X25519 for device approval (spec §6.1): the ephemeral agreement that wraps the
+# account key to a pending device's public key. Pure Rust on every target
+# (wasm32, iOS); 2.x shares curve25519-dalek 4 / rand_core 0.6 / zeroize 1 with
+# the existing stack, so no second copy of any of them. `static_secrets` gives
+# `StaticSecret::from([u8; 32])` for a secret the keychain has to hold.
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 
 # Native only: the sync engine's filesystem walk, HTTP, the daemon, the watcher.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

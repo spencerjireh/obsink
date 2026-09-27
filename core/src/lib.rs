@@ -31,16 +31,19 @@ pub mod watcher;
 pub use api_client::{ApiClient, ApiError, ManifestFetch, TrashEntry, VersionInfo};
 #[cfg(not(target_arch = "wasm32"))]
 pub use auth::{
-    AccountKeyBlob, AuthClient, AuthError, AuthMethods, Capabilities, Device, DevicePlatform,
-    EmailStartResult, Invite, Me, MeDevice, MeUser, Session, SessionInfo, SetKeysOutcome, Usage,
-    UserInfo, VaultUsage,
+    AccountKeyBlob, ApprovalRegistered, ApprovalStatus, AuthClient, AuthError, AuthMethods,
+    Capabilities, Device, DevicePlatform, EmailStartResult, Invite, Me, MeApproval, MeDevice,
+    MeUser, Session, SessionInfo, SetKeysOutcome, Usage, UserInfo, VaultUsage,
 };
 pub use crypto::{
-    account_verifier, content_hmac, create_account_key, decode_base64, decrypt, decrypt_path,
-    derive_key, derive_keys, encode_base64, encrypt, encrypt_path, new_key, new_salt, new_vault_id,
-    path_token, rewrap_account_key, unlock_account_key, unwrap_key, unwrap_vault_key,
-    vault_wrap_key, wrap_key, wrap_vault_key, AccountKeyMaterial, CryptoError, CryptoKeys,
-    KeyBytes, PROTOCOL_VERSION, SALT_LEN, WRAPPED_KEY_LEN,
+    accept_approval, account_verifier, approval_fingerprint, approve_device, content_hmac,
+    create_account_key, decode_base64, decrypt, decrypt_path, derive_key, derive_keys,
+    encode_base64, encrypt, encrypt_path, new_approval_request, new_key, new_salt, new_vault_id,
+    normalize_fingerprint, path_token, rewrap_account_key, unlock_account_key, unwrap_key,
+    unwrap_vault_key, vault_wrap_key, wrap_key, wrap_vault_key, AccountKeyMaterial,
+    ApprovalRequest, CryptoError, CryptoKeys, KeyBytes, APPROVAL_BLOB_LEN,
+    APPROVAL_FINGERPRINT_LEN, APPROVAL_PUBLIC_KEY_LEN, FINGERPRINT_ALPHABET, PROTOCOL_VERSION,
+    SALT_LEN, WRAPPED_KEY_LEN,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use daemon::{
